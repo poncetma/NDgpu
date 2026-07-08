@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ndgpu"
+version = "0.1.0"
+description = "GPU-native multigroup neutron diffusion k-eigenvalue solver for reactor physics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Mario Poncet" }]
+keywords = ["neutron diffusion", "reactor physics", "GPU", "CUDA", "criticality", "k-eigenvalue"]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+cuda12 = ["cupy-cuda12x"]
+cuda11 = ["cupy-cuda11x"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["ndgpu*"]
