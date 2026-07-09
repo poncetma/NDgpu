@@ -75,6 +75,9 @@ _XS = {
     5: (0.222222, 0.010, 0.000, 0.020, 0.833333, 0.130, 0.135),  # rodded fuel
 }
 
+# Published 3D benchmark eigenvalue (IAEA Benchmark Problem 11-A2).
+K_REFERENCE = 1.02903
+
 
 def _material(mid: int) -> Material:
     tr1, a1, nsf1, s12, tr2, a2, nsf2 = _XS[mid]

@@ -59,6 +59,9 @@ _XS = {
     8: (0.231594061928, 0.0102940, 0.0064285, 0.017027, 0.905797101449, 0.0905100, 0.1091100),
 }
 
+# Published 2D eigenvalue for the BIBLIS configuration.
+K_REFERENCE = 1.0287
+
 
 def _material(mid: int) -> Material:
     tr1, a1, nsf1, s12, tr2, a2, nsf2 = _XS[mid]

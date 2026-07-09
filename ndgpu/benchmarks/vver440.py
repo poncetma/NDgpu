@@ -14,17 +14,19 @@ coordinates by `offset_to_axial`.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import numpy as np
 
+from ..hexraster import rasterize_hex_sites
 from ..materials import Kinetics, Material
 from ..tri import TriGrid
 
 HEX_PITCH = 14.7  # cm, flat-to-flat / centre-to-centre
-_SQRT3 = math.sqrt(3.0)
 VVER_KINETICS = Kinetics(velocities=[1.25e7, 2.5e5], beta=[0.0065], decay=[0.07841])
+
+# FEMFFUSION 2D diffusion reference eigenvalue for this core.
+K_REFERENCE = 1.00349
 
 # Row-staggered (offset) assembly map; "." is outside the core.
 _OFFSET = [
@@ -102,8 +104,8 @@ def _material1_bulk(factor: float) -> Material:
         sigma_s=[[0.0, s12], [0.0, 0.0]], chi=[1.0, 0.0])
 
 
-def _coarse_hex_map() -> np.ndarray:
-    """Correct hexagonal assembly map (R, C) -> material id (0 = void).
+def _hex_sites() -> dict:
+    """Assembly map as {(R, C) axial site: material id}.
 
     Each .xsec row is centred AND counter-sheared by -R/2 so the core is a true
     hexagon (not the sheared parallelogram the naive placement produces).
@@ -115,50 +117,13 @@ def _coarse_hex_map() -> np.ndarray:
         raw.append([vals[i] for i in range(nz[0], nz[-1] + 1)])
     W = max(len(r) for r in raw)
     NR = len(raw)
-    coarse = np.zeros((NR, W + 2 * NR), dtype=np.int64)
+    sites = {}
     for r, rowvals in enumerate(raw):
         start = (W - len(rowvals)) // 2 - r // 2 + NR
-        coarse[r, start:start + len(rowvals)] = rowvals
-    return coarse
-
-
-def _hex_round(cf, rf):
-    x, z = cf, rf
-    y = -x - z
-    rx, ry, rz = round(x), round(y), round(z)
-    dx, dy, dz = abs(rx - x), abs(ry - y), abs(rz - z)
-    if dx > dy and dx > dz:
-        rx = -ry - rz
-    elif dy > dz:
-        ry = -rx - rz
-    else:
-        rz = -rx - ry
-    return int(rx), int(rz)                      # (C, R)
-
-
-def _tri_material_map(coarse: np.ndarray, r: int):
-    """Body-fitted triangular material map (nrows, ncols, 2) at refinement r,
-    plus the triangle side length. Each hexagon -> 6 r^2 triangles."""
-    CR, CC = coarse.shape
-    RC = [(R, C) for R in range(CR) for C in range(CC) if coarse[R, C] > 0]
-    imin = min(R - C for R, C in RC); imax = max(R - C for R, C in RC)
-    jmin = min(R + 2 * C for R, C in RC); jmax = max(R + 2 * C for R, C in RC)
-    p = HEX_PITCH
-    h = p / (_SQRT3 * r)
-    ax = np.array([h * _SQRT3 / 2, h * 0.5]); bx = np.array([0.0, h])
-    i0 = r * imin - 2 * r; j0 = r * jmin - 2 * r
-    ni = r * imax + 2 * r - i0 + 1; nj = r * jmax + 2 * r - j0 + 1
-    out = np.zeros((ni, nj, 2), dtype=np.int64)
-    for a in range(ni):
-        for b in range(nj):
-            O = (i0 + a) * bx + (j0 + b) * ax
-            for k, f in ((0, 1.0 / 3.0), (1, 2.0 / 3.0)):
-                cx, cy = O + (ax + bx) * f
-                Rf = cy / (p * _SQRT3 / 2); Cf = cx / p - Rf / 2
-                C, R = _hex_round(Cf, Rf)
-                if 0 <= R < CR and 0 <= C < CC and coarse[R, C] > 0:
-                    out[a, b, k] = coarse[R, C]
-    return np.pad(out, ((1, 1), (1, 1), (0, 0))), h
+        for c, mid in enumerate(rowvals):
+            if mid > 0:
+                sites[(r, start + c)] = mid
+    return sites
 
 
 @dataclass
@@ -183,8 +148,8 @@ def build_vver440(refine: int = 1, perturbation: str = "none") -> Vver440Problem
     Use with TriDiffusionEigenSolver, or TransientSolver(..., group_operator=
     TriGroupOperator, eig_solver=TriDiffusionEigenSolver).
     """
-    coarse = _coarse_hex_map()
-    mmap, side = _tri_material_map(coarse, refine)
+    raster = rasterize_hex_sites(_hex_sites(), HEX_PITCH, refine)
+    mmap, side = raster.material_map, raster.side
     active = mmap > 0
     grid = TriGrid(shape=mmap.shape, side=side)
     void = Material(name="void", diffusion=[1.0, 1.0], sigma_a=[0.0, 0.0],

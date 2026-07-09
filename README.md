@@ -1,4 +1,4 @@
-# ndgpu — GPU-native neutron diffusion & SP3 solver
+# NDgpu — GPU-native neutron diffusion & SP3 solver
 
 Steady-state multigroup **k-eigenvalue** reactor physics (criticality) on 3D
 structured grids, running natively on CUDA GPUs via CuPy, with a NumPy CPU
@@ -46,6 +46,13 @@ float64 or float32.
 - **Cheap where it can be**: inner CG tolerances track the outer
   power-iteration residual and every solve is warm-started, so late outer
   iterations cost only a handful of stencil applications.
+- **Polynomial preconditioning for GPUs**: `precond_degree=m` swaps the
+  Jacobi preconditioner for a truncated Neumann series (I+N+…+Nᵐ)D⁻¹ — m
+  extra stencil applies per CG iteration (pure streaming, no reductions) in
+  exchange for ~2–3× fewer iterations, i.e. 2–3× fewer of the global dot
+  products that are the GPU's only synchronization points (E et al., NED 320
+  (2017) found degree-3 Neumann-PCG the fastest GPU solver for 2·10⁴–3·10⁶
+  cells). Default 0; on CPU it is roughly cost-neutral.
 - **One code path**: written against the NumPy API surface that CuPy mirrors;
   `device="cpu"|"gpu"|"auto"` picks the backend. All physics is validated on
   CPU and runs unchanged on GPU.
@@ -57,7 +64,21 @@ pip install -e .                 # CPU (NumPy)
 pip install -e .[cuda12]        # + CuPy for CUDA 12.x GPUs
 ```
 
-## Validation (all in `tests/`, run `pytest`)
+## Repository map
+
+| Directory | Contains |
+|---|---|
+| `ndgpu/` | the solver library (operators, solvers, grids, readers) |
+| `ndgpu/benchmarks/` | benchmark **problem definitions + published reference values** (importable: `build_twigl`, `twigl.P_REFERENCE`, …) |
+| `tests/verification/` | exact-mathematics checks: analytic solutions, convergence order, invariants, reader transcription |
+| `tests/validation/` | published reactor problems solved end-to-end vs their references (which live with the builders above) |
+| `examples/` | runnable demos; `speed_benchmark.py` is the CPU-vs-GPU performance harness |
+| `docs/` | theory & benchmarks report |
+| `dev-refs/` | third-party reference inputs used to derive data; never imported |
+
+See `tests/README.md` for the verification/validation taxonomy.
+
+## Verification & validation (run `pytest`)
 
 Checked against **exact analytic solutions**, not just self-consistency:
 
@@ -89,6 +110,52 @@ The residual is the homogenization + angular physics gap, not solver error
 (the solver's own discretization converges 2nd order). Max fuel-pin power
 2.57–2.59 vs ≈2.50 transport reference.
 
+### HP-MR heat-pipe microreactor (2D and 3D)
+
+`python examples/hpmr_2d.py [refine] [device]` — assembly-level radial model
+of the ANL/INL HP-MR reference microreactor (NEAMS VTB design: 30 TRISO fuel
+assemblies, central shutdown cell, Be reflector ring, 12 rotating B4C control
+drums) on the body-fitted triangular mesh, geometry decoded from the VTB
+Serpent model. Sweeps the drum angle and prints the worth curve
+(k 1.030 → 1.002, ≈ −2700 pcm fully inserted, at the placeholder two-group
+cross sections — swap in SPH-corrected sets via `build_hpmr2d(materials=…)`).
+
+`python examples/hpmr_3d.py [refine] [nz] [device]` — the same core extruded
+to full height as triangular *prisms* (160 cm fueled + 20 cm Be axial
+reflectors, drums running the full height, vacuum z faces): the tri lattice
+gains a trailing z axis (`TriGrid(shape=(rows, cols, 2, nz))`) and the
+operator two extra shifted multiply-adds, so the solve stays matrix-free on
+both backends. The tri-z scheme is validated against exact references in
+`tests/verification/test_tri_prisms.py`: k_∞ reproduced to 1e-9 with reflective faces, the
+analytic 1D-slab eigenvalue approached at exactly 2nd order in dz, and the
+extruded VVER-440 core with reflective z faces matching the 2D k to < 0.01 pcm.
+
+**Real cross sections.** `build_hpmr2d`/`build_hpmr3d` default to two-group
+placeholders, but `hpmr_endfb8_materials(xs_path)` builds the material set from
+the VTB's actual **11-group ENDF/B-8** Griffin library
+(`fullcore_xml_G11_endfb8_ss_tr.xml`): the pin-level fuel/moderator/graphite/
+heat-pipe cross sections are flat-flux-homogenized into the fuel assembly (from
+the Serpent pin lattice's volume fractions), with the Be reflector, drum body
+and B4C arc taken from the library directly. At this data the 3D core gives
+k ≈ 1.120 drums-out, 1.083 drums-in (≈ 3040 pcm drum worth). The ~9000 pcm
+excess over the transport reference (k ≈ 1.03) is the *homogenization bias* —
+the gap a superhomogenization (SPH) correction removes; pass per-group SPH
+factors (from a transport/FEMFFUSION reference) via `hpmr_endfb8_materials(...,
+sph_fuel=…)` or `volume_homogenize(..., sph_factors=…)`.
+
+### Griffin and FEMFFUSION cross-section files
+
+- `ndgpu.read_griffin_library` / `read_griffin_material` parse Griffin/YakXs
+  (ISOXML) multigroup libraries — the format the NEAMS Virtual Test Bed ships
+  reactor cross sections in — into `Material` lists, with `volume_homogenize`
+  for flat-flux region mixing and optional SPH factors. Conventions verified by
+  the `Total = Absorption + scatter-out` balance and the sink/source scattering
+  transpose.
+- `ndgpu.read_xsec` / `ndgpu.read_material_xml` parse FEMFFUSION's two-group
+  `.xsec` and multigroup XML material files (conventions verified against
+  FEMFFUSION's own parsers; round-trip validated on its VVER-440 and C5G7
+  examples).
+
 ## Transient (time-dependent) solver
 
 `TransientSolver` marches the multigroup diffusion equations in time with
@@ -116,7 +183,7 @@ point-kinetics reference:
 
 | Case | Check | Result |
 |---|---|---|
-| Uniform fissile step, bare core | flux shape fixed ⇒ exact point-kinetics ODE | < 0.2% over the transient |
+| Uniform +$0.50 absorption step, bare core | flux shape fixed ⇒ exact point-kinetics ODE (prompt jump to β/(β−ρ) resolved) | < 5e-4 over the transient |
 | **2D TWIGL** step (Σ_a2 drop) | P(0.1), P(0.5) vs literature 2.06, 2.13 | 2.061, 2.130 |
 | **2D TWIGL** ramp | P(0.1), P(0.5) vs literature 1.31, 2.11 | 1.308, 2.109 |
 | **3D Langenbuch (LMW)** rod-bank transient | peak power / time vs reference ≈1.6 @ ≈21 s | 1.61 @ 21 s |
@@ -126,8 +193,15 @@ point-kinetics reference:
 ## Benchmarks
 
 ```bash
-python examples/benchmark.py 64 128 192   # CPU vs GPU, verified against analytic k
+python examples/speed_benchmark.py 64 128 192   # CPU vs GPU, verified against analytic k
 ```
+
+On a GPU, `notebooks/colab_cpu_gpu_benchmarks.ipynb` times the identical solve
+CPU vs GPU across four reactor problems that span the solver's regimes — C5G7
+(2D Cartesian, 7 groups), IAEA-3D (masked 3D), VVER-440 (2D triangular) and the
+HP-MR microreactor (3D triangular prisms) — asserting the two backends return
+the same `k_eff` and charting the speed-up (which widens with mesh size and
+again with `dtype=float32`).
 
 ## Testing the GPU path without a local GPU
 
@@ -136,7 +210,8 @@ targets AMD). This repo's answer is architectural: the NumPy backend **is**
 the virtual GPU — CuPy mirrors NumPy semantics operation-for-operation, so
 the physics, indexing and convergence logic exercised by the CPU test suite
 is byte-for-byte the code that runs on the GPU. For real-hardware validation,
-run `notebooks/colab_gpu_benchmark.ipynb` on Google Colab's free T4 GPU.
+run `notebooks/colab_gpu_benchmark.ipynb` or
+`notebooks/colab_cpu_gpu_benchmarks.ipynb` on Google Colab's free T4 GPU.
 
 ## Roadmap
 

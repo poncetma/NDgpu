@@ -38,6 +38,10 @@ LANGENBUCH_KINETICS = Kinetics(
     decay=[0.0127, 0.0317, 0.115, 0.311, 1.4, 3.87],
 )
 
+# Literature reference: relative power peaks ~1.6x near t = 21 s
+# (bank-1 withdrawal), then falls as bank 2 inserts.
+PEAK_REFERENCE = (21.0, 1.6)
+
 # (sigma_tr, sigma_a, nu_sigma_f) per group; sigma_12 is the downscatter.
 _XS = {
     "reflector":       dict(tr=[0.20397003, 1.26261670], sa=[0.00266057, 0.04936351],

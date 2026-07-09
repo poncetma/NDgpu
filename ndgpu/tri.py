@@ -1,4 +1,5 @@
-"""Body-fitted triangular finite-volume mesh for hexagonal cores.
+"""Body-fitted triangular finite-volume mesh for hexagonal cores (2D or
+extruded 3D prisms).
 
 A pointy-top hexagon subdivides *exactly* into 6 r^2 equilateral triangles, so
 a triangular mesh refines a hex-assembly core with no staircase at assembly or
@@ -8,6 +9,13 @@ structured: cells are stored on an (nrows, ncols, 2) array where the last index
 selects the down (0) and up (1) triangle of each rhombus, and every interior
 triangle couples to three neighbours at fixed offsets -- so the operator is
 again a handful of shifted multiply-adds and reuses the power-iteration solver.
+
+Extruded reactors (any 2D cross-section swept vertically -- the geometry of
+prismatic microreactor cores) add a trailing z axis: shape (nrows, ncols, 2,
+nz) with uniform layer height dz. The in-plane stencil broadcasts over z
+unchanged; the z coupling is the Cartesian one (hm(D) / dz^2), and the z faces
+take their boundary condition from the ``bc`` spec's z axis (in-plane
+boundaries are governed by the active mask's ``mask_bc``, as in 2D).
 
 For equilateral triangles of side h: shared-edge length h, centroid spacing
 h/sqrt(3), area (sqrt(3)/4) h^2, giving an interior face coupling w = 4 D / h^2
@@ -20,9 +28,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-import numpy as np
 
-from .operator import BC_VACUUM, face_alpha, normalize_bc
+from .operator import (BC_VACUUM, face_alpha, harmonic_mean, normalize_bc,
+                       robin_face_term)
 from .solver import DiffusionEigenSolver
 
 _SQRT3 = math.sqrt(3.0)
@@ -30,26 +38,38 @@ _SQRT3 = math.sqrt(3.0)
 
 @dataclass(frozen=True)
 class TriGrid:
-    """Triangular lattice: shape (nrows, ncols, 2) (last axis = down/up), side h."""
+    """Triangular lattice: shape (nrows, ncols, 2) (2D; axis 2 = down/up
+    triangle) or (nrows, ncols, 2, nz) (extruded prisms), side h. ``height``
+    is the slab thickness in 2D and the total z extent in 3D."""
 
     shape: tuple
     side: float            # triangle edge length h, cm
-    height: float = 1.0    # slab thickness (2D), cm
+    height: float = 1.0    # slab thickness (2D) / total z extent (3D), cm
 
     def __post_init__(self):
-        if len(self.shape) != 3 or self.shape[2] != 2:
-            raise ValueError("tri shape must be (nrows, ncols, 2)")
-        if self.side <= 0:
-            raise ValueError("side must be positive")
+        if len(self.shape) not in (3, 4) or self.shape[2] != 2:
+            raise ValueError("tri shape must be (nrows, ncols, 2[, nz])")
+        if self.side <= 0 or self.height <= 0:
+            raise ValueError("side and height must be positive")
+
+    @property
+    def nz(self) -> int:
+        return self.shape[3] if len(self.shape) == 4 else 1
+
+    @property
+    def dz(self) -> float:
+        return self.height / self.nz
 
     @property
     def n_cells(self) -> int:
-        r, c, _ = self.shape
-        return r * c * 2
+        n = 1
+        for s in self.shape:
+            n *= s
+        return n
 
     @property
     def cell_volume(self) -> float:
-        return (_SQRT3 / 4.0) * self.side**2 * self.height
+        return (_SQRT3 / 4.0) * self.side**2 * self.dz
 
 
 class TriGroupOperator:
@@ -63,16 +83,16 @@ class TriGroupOperator:
 
     def __init__(self, xp, grid: TriGrid, D, removal, bc=BC_VACUUM, active=None,
                  mask_bc=BC_VACUUM):
-        normalize_bc(bc)
+        bc = normalize_bc(bc)  # only the z faces read bc; in-plane uses mask_bc
         self.xp = xp
         self.shape = grid.shape
-        h = grid.side
+        h, dz = grid.side, grid.dz
         kf = 4.0 / (h * h)
         alpha_edge = face_alpha(mask_bc)
 
-        def hm(Da, Db):
-            return 2.0 * Da * Db / (Da + Db)
-
+        # In-plane boundary term: same derivation as robin_face_term, with the
+        # triangle edge length h, cell area (sqrt(3)/4) h^2 and centre-to-edge
+        # distance h/(2 sqrt(3)), giving 8 D alpha / (h (h alpha + 2 sqrt(3) D)).
         def robin(Dface, alpha):
             if alpha == 0.0:
                 return xp.zeros_like(Dface)
@@ -80,10 +100,12 @@ class TriGroupOperator:
                 return 8.0 * Dface / (h * h)
             return 8.0 * Dface * alpha / (h * (h * alpha + 2.0 * _SQRT3 * Dface))
 
-        Dd, Du = D[:, :, 0], D[:, :, 1]                       # down, up sublattices
-        w_hyp = hm(Dd, Du) * kf                               # down(i,j)-up(i,j)
-        w_v = hm(Dd[1:, :], Du[:-1, :]) * kf                  # down(i,j)-up(i-1,j)
-        w_h = hm(Dd[:, 1:], Du[:, :-1]) * kf                  # down(i,j)-up(i,j-1)
+        Dd, Du = D[:, :, 0], D[:, :, 1]                # down, up sublattices
+        w_hyp = harmonic_mean(Dd, Du) * kf             # down(i,j)-up(i,j)
+        w_v = harmonic_mean(Dd[1:, :], Du[:-1, :]) * kf   # down(i,j)-up(i-1,j)
+        w_h = harmonic_mean(Dd[:, 1:], Du[:, :-1]) * kf   # down(i,j)-up(i,j-1)
+        wz = (harmonic_mean(D[..., :-1], D[..., 1:]) / dz**2   # axial neighbour
+              if len(grid.shape) == 4 and grid.shape[3] > 1 else None)
 
         act = None
         if active is not None:
@@ -94,12 +116,16 @@ class TriGroupOperator:
             w_hyp = xp.where(ad & au, w_hyp, 0.0)
             w_v = xp.where(ad[1:, :] & au[:-1, :], w_v, 0.0)
             w_h = xp.where(ad[:, 1:] & au[:, :-1], w_h, 0.0)
-        self.w_hyp, self.w_v, self.w_h = w_hyp, w_v, w_h
+            if wz is not None:
+                wz = xp.where(act[..., :-1] & act[..., 1:], wz, 0.0)
+        self.w_hyp, self.w_v, self.w_h, self.wz = w_hyp, w_v, w_h, wz
 
         diag = removal.copy()
         diag[:, :, 0] += w_hyp; diag[:, :, 1] += w_hyp
         diag[1:, :, 0] += w_v;  diag[:-1, :, 1] += w_v
         diag[:, 1:, 0] += w_h;  diag[:, :-1, 1] += w_h
+        if wz is not None:
+            diag[..., :-1] += wz; diag[..., 1:] += wz
 
         # Robin faces: an active cell whose neighbour across an edge is inactive
         # (or off-array, via the required void border). Each triangle has three
@@ -123,6 +149,18 @@ class TriGroupOperator:
             add((slice(None), slice(1, None), 0), ad[:, 1:], au[:, :-1], Dd[:, 1:])
             add((slice(None), slice(0, -1), 1), au[:, :-1], ad[:, 1:], Du[:, :-1])
 
+        # z boundary faces (extruded grids) use the bc spec's z axis.
+        if len(grid.shape) == 4:
+            for alpha, sl in ((face_alpha(bc[2][0]), (Ellipsis, 0)),
+                              (face_alpha(bc[2][1]), (Ellipsis, -1))):
+                if alpha == 0.0:
+                    continue
+                term = robin_face_term(xp, D[sl], dz, alpha)
+                if act is not None:
+                    term = xp.where(act[sl], term, 0.0)
+                diag[sl] += term
+
+        if act is not None:
             diag = xp.where(act, diag, 1.0)
 
         self.diag = diag
@@ -137,6 +175,9 @@ class TriGroupOperator:
         out[:-1, :, 1] -= w_v * phi[1:, :, 0]
         out[:, 1:, 0] -= w_h * phi[:, :-1, 1]
         out[:, :-1, 1] -= w_h * phi[:, 1:, 0]
+        if self.wz is not None:
+            out[..., :-1] -= self.wz * phi[..., 1:]
+            out[..., 1:] -= self.wz * phi[..., :-1]
         return out
 
 

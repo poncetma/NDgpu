@@ -30,7 +30,7 @@ import numpy as np
 
 from .backend import asnumpy, device_name, get_backend, synchronize
 from .grid import Grid
-from .linalg import pcg
+from .linalg import neumann_preconditioner, pcg
 from .materials import Material
 from .operator import BC_VACUUM, BC_ZERO_FLUX, GroupOperator, SP3GroupOperator
 
@@ -132,11 +132,18 @@ class _PowerIterationSolver:
     device       : "auto" | "gpu" | "cpu"
     dtype        : floating dtype for the solve (float64 default; float32
                    roughly doubles GPU throughput at ~1e-6 k accuracy).
+    precond_degree : degree of the Neumann-polynomial preconditioner for the
+                   inner CG (0 = plain Jacobi, the default). Each degree adds
+                   one stencil apply per CG iteration but cuts the iteration
+                   count -- and with it the global reductions that are the
+                   GPU's only synchronization points. Degree 2-3 is a good
+                   setting (cf. E et al., NED 320 (2017), where degree-3
+                   Neumann-PCG was the fastest GPU solver for 2e4-3e6 cells).
     """
 
     def __init__(self, grid: Grid, materials, material_map=None,
                  bc: str = BC_ZERO_FLUX, device: str = "auto", dtype=np.float64,
-                 active=None, mask_bc=BC_VACUUM):
+                 active=None, mask_bc=BC_VACUUM, precond_degree: int = 0):
         self.grid = grid
         self.xp = xp = get_backend(device)
         self.device = device_name(xp)
@@ -154,6 +161,9 @@ class _PowerIterationSolver:
         self.sigma_s = f.sigma_s
 
         self._build_operators(grid, f.diffusion, f.sigma_t, f.removal, bc)
+        self.preconds = [neumann_preconditioner(op.apply, op.inv_diag,
+                                                int(precond_degree))
+                         for op in self.ops]
 
     # ---- hooks implemented by the angular approximation -------------------
     def _build_operators(self, grid, diffusion, sigma_t, removal, bc):
@@ -210,7 +220,8 @@ class _PowerIterationSolver:
                     if gf != g and s is not None:
                         q0 += s * self._phi(state[gf])
                 state[g], n_it = pcg(self.ops[g].apply, self._rhs(g, q0), state[g],
-                                     self.ops[g].inv_diag, xp, rtol=rtol)
+                                     self.ops[g].inv_diag, xp, rtol=rtol,
+                                     precond=self.preconds[g])
                 inner_total += n_it
 
             fsrc_new = self._fission_source(state)

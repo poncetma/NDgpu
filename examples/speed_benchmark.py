@@ -3,7 +3,7 @@
 On a CUDA-less machine this reports CPU numbers only. Every solve is verified
 against the analytic k_eff so the speed numbers are for *correct* solves.
 
-Usage: python examples/benchmark.py [sizes...]   e.g. python examples/benchmark.py 64 128 192
+Usage: python examples/speed_benchmark.py [sizes...]   e.g. python examples/speed_benchmark.py 64 128 192
 """
 
 import sys

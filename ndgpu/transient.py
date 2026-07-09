@@ -35,13 +35,13 @@ when the returned objects change identity.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
 from .backend import asnumpy, device_name, get_backend, synchronize
 from .grid import Grid
-from .linalg import pcg
+from .linalg import neumann_preconditioner, pcg
 from .materials import Kinetics
 from .operator import BC_VACUUM, BC_ZERO_FLUX, GroupOperator
 from .solver import DiffusionEigenSolver, Fields, Result
@@ -88,7 +88,8 @@ class TransientSolver:
     def __init__(self, grid: Grid, problem_at, kinetics: Kinetics,
                  bc=BC_ZERO_FLUX, device: str = "auto", dtype=np.float64,
                  active=None, mask_bc=BC_VACUUM,
-                 group_operator=GroupOperator, eig_solver=DiffusionEigenSolver):
+                 group_operator=GroupOperator, eig_solver=DiffusionEigenSolver,
+                 precond_degree: int = 0):
         self.grid = grid
         self.problem_at = problem_at
         self.kinetics = kinetics
@@ -99,6 +100,7 @@ class TransientSolver:
         # or hex (HexGroupOperator/HexDiffusionEigenSolver) pair share signatures.
         self.group_operator = group_operator
         self.eig_solver = eig_solver
+        self.precond_degree = int(precond_degree)
         self.xp = get_backend(device)
         self.device = device_name(self.xp)
         self.dtype = np.dtype(dtype)
@@ -155,6 +157,8 @@ class TransientSolver:
                              fields.removal[g] + inv_vdt[g], bc=self.bc,
                              active=self.active, mask_bc=self.mask_bc)
                for g in range(G)]
+        preconds = [neumann_preconditioner(op.apply, op.inv_diag,
+                                           self.precond_degree) for op in ops]
         last = (mats, mmap)
 
         times = [0.0]
@@ -170,6 +174,9 @@ class TransientSolver:
                                      fields.removal[g] + inv_vdt[g], bc=self.bc,
                                      active=self.active, mask_bc=self.mask_bc)
                        for g in range(G)]
+                preconds = [neumann_preconditioner(op.apply, op.inv_diag,
+                                                   self.precond_degree)
+                            for op in ops]
                 last = (mats, mmap)
 
             phi_old = [p.copy() for p in phi]
@@ -199,7 +206,8 @@ class TransientSolver:
                         if gf != g and s is not None:
                             q += s * phi[gf]
                     phi[g], n_it = pcg(ops[g].apply, q, phi[g],
-                                       ops[g].inv_diag, xp, rtol=rtol)
+                                       ops[g].inv_diag, xp, rtol=rtol,
+                                       precond=preconds[g])
                     inner_total += n_it
                 G_S = fields.fission_source(phi) / k0
                 delta = G_S - S

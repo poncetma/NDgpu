@@ -22,7 +22,6 @@ def geometric_buckling_box(size) -> float:
 
 def k_from_buckling(material: Material, buckling: float) -> float:
     """Exact multigroup k_eff of a bare homogeneous reactor with buckling B^2."""
-    G = material.n_groups
     M = np.diag(material.diffusion * buckling + material.removal)
     off = material.sigma_s.T.copy()  # in-scatter: M[g, g'] -= sigma_s[g'->g]
     np.fill_diagonal(off, 0.0)

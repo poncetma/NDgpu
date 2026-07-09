@@ -24,8 +24,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .backend import get_backend
-from .operator import BC_VACUUM, face_alpha, normalize_bc
+from .operator import (BC_VACUUM, face_alpha, harmonic_mean, normalize_bc,
+                       robin_face_term)
 from .solver import DiffusionEigenSolver
 
 
@@ -90,9 +90,9 @@ class HexGroupOperator:
         kf = 2.0 / (3.0 * p * p)          # in-plane geometric factor
         alpha_edge = face_alpha(mask_bc)  # in-plane core-surface / edge law
 
-        def hm(Da, Db):
-            return 2.0 * Da * Db / (Da + Db)
-
+        # In-plane boundary term: same derivation as robin_face_term, with the
+        # hex face area p/sqrt(3), cell area (sqrt(3)/2) p^2 and centre-to-face
+        # distance p/2, giving 4 D alpha / (3 p (p alpha + 2 D)).
         def robin_plane(Dface, alpha):
             if alpha == 0.0:
                 return xp.zeros_like(Dface)
@@ -100,18 +100,11 @@ class HexGroupOperator:
                 return 4.0 * Dface / (3.0 * p * p)
             return 4.0 * Dface * alpha / (3.0 * p * (p * alpha + 2.0 * Dface))
 
-        def robin_z(Dface, alpha):
-            if alpha == 0.0:
-                return xp.zeros_like(Dface)
-            if math.isinf(alpha):
-                return 2.0 * Dface / dz**2
-            return 2.0 * Dface * alpha / (dz * (dz * alpha + 2.0 * Dface))
-
         # In-plane couplings for the three axial directions.
-        wA = hm(D[:, :-1, :], D[:, 1:, :]) * kf          # (r,c)-(r,c+1)
-        wB = hm(D[:-1, :, :], D[1:, :, :]) * kf          # (r,c)-(r+1,c)
-        wC = hm(D[:-1, 1:, :], D[1:, :-1, :]) * kf       # (r,c+1)-(r+1,c)
-        wz = (hm(D[:, :, :-1], D[:, :, 1:]) / dz**2
+        wA = harmonic_mean(D[:, :-1, :], D[:, 1:, :]) * kf     # (r,c)-(r,c+1)
+        wB = harmonic_mean(D[:-1, :, :], D[1:, :, :]) * kf     # (r,c)-(r+1,c)
+        wC = harmonic_mean(D[:-1, 1:, :], D[1:, :-1, :]) * kf  # (r,c+1)-(r+1,c)
+        wz = (harmonic_mean(D[:, :, :-1], D[:, :, 1:]) / dz**2
               if grid.shape[2] > 1 else None)
 
         act = None
@@ -169,7 +162,7 @@ class HexGroupOperator:
                               (face_alpha(bc[2][1]), (slice(None), slice(None), -1))):
                 if alpha == 0.0:
                     continue
-                term = robin_z(D[sl], alpha)
+                term = robin_face_term(xp, D[sl], dz, alpha)
                 if act is not None:
                     term = xp.where(act[sl], term, 0.0)
                 diag[sl] += term

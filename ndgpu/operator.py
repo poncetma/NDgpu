@@ -87,6 +87,37 @@ def normalize_bc(bc):
     return ((faces[0], faces[1]), (faces[2], faces[3]), (faces[4], faces[5]))
 
 
+def harmonic_mean(Da, Db):
+    """Face diffusion coefficient between two cells with piecewise-constant D.
+
+    Requiring the two-point flux to be continuous across the shared face gives
+    the harmonic mean 2*Da*Db/(Da + Db): exact for piecewise-constant D, and
+    it correctly chokes transport at an interface where either D vanishes
+    (the arithmetic mean would leak through strong absorbers).
+    """
+    return 2.0 * Da * Db / (Da + Db)
+
+
+def robin_face_term(xp, Dface, d, alpha):
+    """Boundary-face contribution to the operator diagonal, per unit volume,
+    for a face perpendicular to a cell axis with centre-to-face distance d/2.
+
+    The Robin law J_net = alpha * phi_s relates the outward current to the
+    surface flux. Coupling the cell centre to the surface with the two-point
+    current J = (2D/d)(phi_c - phi_s) and eliminating phi_s gives
+
+        leakage / volume = 2 D alpha / (d (d alpha + 2 D)).
+
+    alpha -> inf recovers the zero-flux Dirichlet term 2D/d^2; alpha = 0
+    (reflective) contributes nothing; alpha = 1/2 is the Marshak vacuum.
+    """
+    if alpha == 0.0:
+        return xp.zeros_like(Dface)
+    if math.isinf(alpha):
+        return 2.0 * Dface / d**2
+    return 2.0 * Dface * alpha / (d * (d * alpha + 2.0 * Dface))
+
+
 class GroupOperator:
     """A_g = -div(D_g grad .) + Sigma_r,g  on a uniform structured grid.
 
@@ -108,24 +139,13 @@ class GroupOperator:
         self.shape = grid.shape
         dx, dy, dz = grid.spacing
 
-        # Robin boundary diagonal per unit volume for the law J_net = alpha*phi.
-        # Couple the cell center to the surface flux by the two-point diffusion
-        # current J = (2D/d)(phi_c - phi_s) and eliminate phi_s via J = alpha*phi_s:
-        #   leakage/volume = (1/d) * alpha*(2D/d) / (alpha + 2D/d)
-        #                  = 2 D alpha / (d (d alpha + 2 D)).
-        # alpha -> inf recovers the zero-flux Dirichlet term 2D/d^2; alpha = 0
-        # (reflective) contributes nothing.
         def robin(Dface, d, alpha):
-            if alpha == 0.0:
-                return xp.zeros_like(Dface)
-            if math.isinf(alpha):
-                return 2.0 * Dface / d**2
-            return 2.0 * Dface * alpha / (d * (d * alpha + 2.0 * Dface))
+            return robin_face_term(xp, Dface, d, alpha)
 
         # Interior face couplings (harmonic mean of the two adjacent cells).
         # wx[i] couples cells i and i+1 along x; shape (nx-1, ny, nz).
         def face(Da, Db, d):
-            return 2.0 * Da * Db / ((Da + Db) * d * d)
+            return harmonic_mean(Da, Db) / (d * d)
 
         self.wx = face(D[:-1, :, :], D[1:, :, :], dx)
         self.wy = face(D[:, :-1, :], D[:, 1:, :], dy)

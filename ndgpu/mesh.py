@@ -19,13 +19,12 @@ structured solvers enjoy. Power iteration drives the outer fission source.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import splu
 
-from .materials import Material
 
 _VACUUM_ALPHA = 0.5
 
@@ -129,7 +128,6 @@ class UnstructuredDiffusionSolver:
         self.cm = np.asarray(cell_material)
         self.alpha = float(alpha_boundary)
         self.G = self.mats[0].n_groups
-        A = mesh.area
         self.D = [np.array([self.mats[m].diffusion[g] for m in self.cm]) for g in range(self.G)]
         self.removal = [np.array([self.mats[m].removal[g] for m in self.cm]) for g in range(self.G)]
         self.nsf = [np.array([self.mats[m].nu_sigma_f[g] for m in self.cm]) for g in range(self.G)]

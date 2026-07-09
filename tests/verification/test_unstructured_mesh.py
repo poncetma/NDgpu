@@ -1,17 +1,17 @@
-"""Unstructured finite-volume solver on a Gmsh-style mesh.
+"""Unstructured finite-volume solver: cross-solver equivalence and exact
+invariants.
 
-Validated two ways: (1) on a Cartesian grid of quads the unstructured FV must
-reproduce the structured Cartesian solver on the same mesh, and (2) the VVER-440
-Gmsh mesh (when a FEMFFUSION checkout is available) matches its diffusion k.
+On a Cartesian grid of quads the unstructured FV must reproduce the
+structured Cartesian solver (same discretization, same mesh), and reflective
+boundaries must give k = k_inf regardless of geometry. The VVER-440 Gmsh-mesh
+validation lives in tests/validation/test_vver440.py.
 """
-
-import os
 
 import numpy as np
 import pytest
 
 from ndgpu import DiffusionEigenSolver, Grid, ONE_GROUP_DEMO
-from ndgpu.mesh import UnstructuredDiffusionSolver, assemble_mesh, read_gmsh
+from ndgpu.mesh import UnstructuredDiffusionSolver, assemble_mesh
 
 
 def _cartesian_quad_mesh(n, L):
@@ -52,16 +52,3 @@ def test_unstructured_reflective_is_kinf():
                                       alpha_boundary=0.0).solve(tol_k=1e-10)
     from ndgpu import k_infinite
     assert res.k_eff == pytest.approx(k_infinite(ONE_GROUP_DEMO), abs=1e-6)
-
-
-_MSH = os.path.expanduser(
-    "~/claude-tests/FEMFFUSION/examples/2D_VVER440/VVER440.msh")
-
-
-@pytest.mark.skipif(not os.path.exists(_MSH), reason="FEMFFUSION VVER440.msh not present")
-def test_vver440_msh_matches_femffusion():
-    from ndgpu.benchmarks.vver440 import build_vver440_msh
-    mesh, mats, cm, alpha = build_vver440_msh(_MSH)
-    assert mesh.n_cells == 1263
-    res = UnstructuredDiffusionSolver(mesh, mats, cm, alpha).solve(tol_k=1e-7)
-    assert res.k_eff == pytest.approx(1.00349, abs=1e-3)   # FEMFFUSION FE3 diffusion

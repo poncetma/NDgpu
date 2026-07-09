@@ -26,6 +26,11 @@ from ..materials import Kinetics, Material
 
 TWIGL_KINETICS = Kinetics(velocities=[1.0e7, 2.0e5], beta=[0.0075], decay=[0.08])
 
+# Published quarter-core references (Hageman & Yasinsky via FEMFFUSION):
+# initial eigenvalue and relative power at t = 0.1 s / 0.5 s.
+K_REFERENCE = 0.91321
+P_REFERENCE = {"step": {0.1: 2.06, 0.5: 2.13}, "ramp": {0.1: 1.31, 0.5: 2.11}}
+
 _SEED = dict(
     diffusion=1.0 / (3.0 * np.array([0.238095, 0.83333])),
     sigma_a=[0.010, 0.150],
