@@ -4,10 +4,12 @@ Full-height model of the ANL/INL heat-pipe microreactor: the 2D radial core
 extruded to 200 cm as triangular prisms (160 cm fueled + 20 cm Be axial
 reflectors, drums and their B4C arcs running the full height, vacuum z faces).
 
-    python examples/hpmr_3d.py [refine] [nz] [device]
+    python examples/hpmr_3d.py [refine] [nz] [absorber] [device]
 
-Cross sections are placeholders; swap in SPH-corrected FEMFFUSION sets via
-ndgpu.femffusion + build_hpmr3d(materials=...).
+absorber (default "polar") selects the drum B4C-arc treatment: "polar"
+volume-mixes the exact polar area fraction (smooth, mesh-convergent worth) and
+"raster" stamps whole cells. Cross sections are placeholders; swap in
+SPH-corrected FEMFFUSION sets via ndgpu.femffusion + build_hpmr3d(materials=...).
 """
 
 import sys
@@ -20,14 +22,16 @@ from ndgpu.tri import TriDiffusionEigenSolver
 
 refine = int(sys.argv[1]) if len(sys.argv) > 1 else 4
 nz = int(sys.argv[2]) if len(sys.argv) > 2 else 20
-device = sys.argv[3] if len(sys.argv) > 3 else "cpu"
+absorber = sys.argv[3] if len(sys.argv) > 3 else "polar"
+device = sys.argv[4] if len(sys.argv) > 4 else "cpu"
 
 
 def solve(angle):
-    p = build_hpmr3d(refine=refine, nz=nz, drum_angle_deg=angle)
+    p = build_hpmr3d(refine=refine, nz=nz, drum_angle_deg=angle, absorber=absorber)
     res = TriDiffusionEigenSolver(p.grid, p.materials, p.material_map,
-                                  active=p.active, mask_bc=p.mask_bc,
-                                  bc=p.bc, device=device).solve(
+                                  active=p.active, mask_bc=p.mask_bc, bc=p.bc,
+                                  mix_material=p.mix_material,
+                                  mix_weight=p.mix_weight, device=device).solve(
         tol_k=1e-7, tol_source=1e-6)
     if not res.converged:
         raise SystemExit(f"not converged at {angle} deg: {res}")
@@ -36,7 +40,7 @@ def solve(angle):
 
 p, r_out = solve(0.0)
 print(f"HP-MR 3D, refine={refine}, nz={nz} (dz={p.grid.dz:g} cm), "
-      f"{p.grid.n_cells} cells, device={device}\n")
+      f"{p.grid.n_cells} cells, absorber={absorber!r}, device={device}\n")
 print(f"drums out (0°):   k_eff = {r_out.k_eff:.5f}   [{r_out.solve_seconds:.1f} s]")
 _, r_in = solve(180.0)
 worth = (1 / r_in.k_eff - 1 / r_out.k_eff) * 1e5

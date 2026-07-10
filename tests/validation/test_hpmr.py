@@ -119,6 +119,40 @@ def test_polar_worth_curve_smoother_than_raster():
     assert polar_steps.max() < raster_steps.max()
 
 
+def test_3d_polar_absorber_extrudes_from_2d():
+    from ndgpu.benchmarks.hpmr import build_hpmr3d
+    p2 = build_hpmr2d(refine=4, drum_angle_deg=120.0, absorber="polar")
+    p3 = build_hpmr3d(refine=4, nz=10, drum_angle_deg=120.0, absorber="polar")
+    assert p3.mix_material is not None
+    assert p3.mix_material.shape == p3.material_map.shape
+    mw = p3.mix_weight
+    # drums run the full height, so the mix is z-invariant and every layer is
+    # exactly the 2D mix.
+    assert np.all(mw == mw[..., :1])
+    assert np.array_equal(mw[..., 0], p2.mix_weight)
+    assert np.array_equal(p3.mix_material[..., 0], p2.mix_material)
+
+
+def test_3d_polar_worth_resolved_at_coarse_mesh():
+    # At refine 4 the raster under-resolves the drum worth (~1950 pcm); the
+    # polar mix recovers the bulk of it (~2650 pcm) even on this coarse mesh.
+    from ndgpu.benchmarks.hpmr import build_hpmr3d
+
+    def k3(ang):
+        p = build_hpmr3d(refine=4, nz=10, drum_angle_deg=ang, absorber="polar")
+        r = TriDiffusionEigenSolver(p.grid, p.materials, p.material_map,
+                                    active=p.active, mask_bc=p.mask_bc, bc=p.bc,
+                                    mix_material=p.mix_material,
+                                    mix_weight=p.mix_weight, device="cpu").solve(
+            tol_k=1e-6, tol_source=1e-5)
+        assert r.converged
+        return r.k_eff
+
+    k_out, k_in = k3(0.0), k3(180.0)
+    assert k_out > k_in
+    assert (1 / k_in - 1 / k_out) * 1e5 > 2000   # above the raster's coarse value
+
+
 def test_3d_geometry_counts():
     from ndgpu.benchmarks.hpmr import AXIAL_REFLECTOR, build_hpmr3d
     r, nz = 4, 10

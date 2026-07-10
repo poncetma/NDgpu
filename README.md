@@ -132,8 +132,8 @@ from a much better coarse-mesh value, and runs below the raster's refine floor
 (the 1 cm annulus is represented even when it is thinner than a triangle). Both
 agree at fine mesh (~2720 pcm), so the polar treatment is unbiased.
 
-`python examples/hpmr_3d.py [refine] [nz] [device]` — the same core extruded
-to full height as triangular *prisms* (160 cm fueled + 20 cm Be axial
+`python examples/hpmr_3d.py [refine] [nz] [absorber] [device]` — the same core
+extruded to full height as triangular *prisms* (160 cm fueled + 20 cm Be axial
 reflectors, drums running the full height, vacuum z faces): the tri lattice
 gains a trailing z axis (`TriGrid(shape=(rows, cols, 2, nz))`) and the
 operator two extra shifted multiply-adds, so the solve stays matrix-free on
@@ -141,6 +141,10 @@ both backends. The tri-z scheme is validated against exact references in
 `tests/verification/test_tri_prisms.py`: k_∞ reproduced to 1e-9 with reflective faces, the
 analytic 1D-slab eigenvalue approached at exactly 2nd order in dz, and the
 extruded VVER-440 core with reflective z faces matching the 2D k to < 0.01 pcm.
+`build_hpmr3d(..., absorber="polar")` carries the drum-arc volume-mixing (below)
+into 3D — the arc runs the full height, so the 2D `mix_material`/`mix_weight`
+simply extrude over the z-layers; at refine 4 the polar drum worth is ~2650 pcm
+vs the raster's under-resolved ~1950.
 
 **Real cross sections.** `build_hpmr2d`/`build_hpmr3d` default to two-group
 placeholders, but `hpmr_endfb8_materials(xs_path)` builds the material set from

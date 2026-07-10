@@ -338,7 +338,8 @@ def build_hpmr2d(refine: int = 4, drum_angle_deg=0.0,
 
 
 def build_hpmr3d(refine: int = 4, nz: int = 20, drum_angle_deg=0.0,
-                 materials: list | None = None) -> HpmrProblem:
+                 materials: list | None = None,
+                 absorber: str = "raster", samples: int = 10) -> HpmrProblem:
     """Assemble the 3D HP-MR: the 2D radial core extruded to 200 cm.
 
     The fueled length is 160 cm with 20 cm beryllium axial reflectors above
@@ -346,19 +347,23 @@ def build_hpmr3d(refine: int = 4, nz: int = 20, drum_angle_deg=0.0,
     radial Be ring and the drums -- including their B4C arcs -- run the full
     height, as in the VTB Serpent model. Vacuum on both z faces.
 
-    refine, drum_angle_deg : as in :func:`build_hpmr2d`.
+    refine, drum_angle_deg, absorber, samples : as in :func:`build_hpmr2d`.
+    Because the drums (arc included) run the full height, the ``"polar"``
+    absorber volume-mixing is the same in every axial layer, so the 2D
+    ``mix_material``/``mix_weight`` are simply extruded over z.
     nz        : number of uniform axial layers over the 200 cm height; must be
                 a multiple of 10 so layer boundaries fall on the 20/180 cm
                 core-reflector interfaces (nz=20 -> dz=10 cm).
     materials : optional replacement list ordered as MATERIAL_NAMES_3D.
 
     Use with TriDiffusionEigenSolver, passing ``bc=p.bc`` for the vacuum z
-    faces::
+    faces (and the mix arrays for absorber="polar")::
 
-        p = build_hpmr3d(refine=4, nz=20)
+        p = build_hpmr3d(refine=4, nz=20, absorber="polar")
         res = TriDiffusionEigenSolver(p.grid, p.materials, p.material_map,
                                       active=p.active, mask_bc=p.mask_bc,
-                                      bc=p.bc).solve()
+                                      bc=p.bc, mix_material=p.mix_material,
+                                      mix_weight=p.mix_weight).solve()
     """
     if nz % 10 != 0:
         raise ValueError("nz must be a multiple of 10 so layer boundaries "
@@ -370,8 +375,16 @@ def build_hpmr3d(refine: int = 4, nz: int = 20, drum_angle_deg=0.0,
     if len(mats) != len(MATERIAL_NAMES_3D):
         raise ValueError(f"expected {len(MATERIAL_NAMES_3D)} materials "
                          f"({', '.join(MATERIAL_NAMES_3D)}), got {len(mats)}")
-    p2d = build_hpmr2d(refine=refine, drum_angle_deg=angles)
-    mmap = np.repeat(p2d.material_map[..., None], nz, axis=3)
+    p2d = build_hpmr2d(refine=refine, drum_angle_deg=angles,
+                       absorber=absorber, samples=samples)
+
+    def extrude(a):
+        return None if a is None else np.repeat(a[..., None], nz, axis=3)
+
+    mmap = extrude(p2d.material_map)
+    mix_material = extrude(p2d.mix_material)
+    mix_weight = extrude(p2d.mix_weight)
+
     dz = TOTAL_HEIGHT / nz
     zc = (np.arange(nz) + 0.5) * dz
     refl = (zc < AXIAL_REFLECTOR_HEIGHT) | (zc > TOTAL_HEIGHT - AXIAL_REFLECTOR_HEIGHT)
@@ -381,4 +394,5 @@ def build_hpmr3d(refine: int = 4, nz: int = 20, drum_angle_deg=0.0,
     return HpmrProblem(grid=grid, materials=mats, material_map=mmap,
                        active=mmap > 0, mask_bc="vacuum",
                        bc=("reflective", "reflective", "vacuum"),
-                       kinetics=HPMR_KINETICS, drum_angle_deg=np.array(angles))
+                       kinetics=HPMR_KINETICS, drum_angle_deg=np.array(angles),
+                       mix_material=mix_material, mix_weight=mix_weight)
