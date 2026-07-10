@@ -16,6 +16,8 @@ from .hex import HexDiffusionEigenSolver, HexGrid, offset_to_axial
 from .materials import Kinetics, Material, ONE_GROUP_DEMO, PWR_TWO_GROUP
 from .perturbation import first_order_reactivity
 from .solver import DiffusionEigenSolver, Result, SP3EigenSolver
+from .sph import (SphResult, flux_weighted_homogenize, region_average,
+                  sph_correct)
 from .tri import TriDiffusionEigenSolver, TriGrid, TriSP3EigenSolver
 from .transient import TransientResult, TransientSolver
 
@@ -48,6 +50,10 @@ __all__ = [
     "k_from_buckling",
     "k_infinite",
     "first_order_reactivity",
+    "flux_weighted_homogenize",
+    "region_average",
+    "sph_correct",
+    "SphResult",
     "read_material_xml",
     "read_xsec",
     "read_griffin_library",

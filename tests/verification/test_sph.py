@@ -11,8 +11,9 @@ their own tests here.
 
 import numpy as np
 
-from ndgpu import Grid, Material, PWR_TWO_GROUP, SP3EigenSolver
-from ndgpu.sph import flux_weighted_homogenize
+from ndgpu import (DiffusionEigenSolver, Grid, Material, PWR_TWO_GROUP,
+                   SP3EigenSolver, flux_weighted_homogenize, region_average,
+                   sph_correct)
 
 
 def _reference():
@@ -72,3 +73,52 @@ def test_homogenized_region_is_a_valid_material():
         assert np.isclose(m.chi.sum(), 1.0)
     # region 0 is fuel-dominated (fissile), region 1 is the poison half
     assert hmats[0].is_fissile
+
+
+def _reflective_assembly():
+    # A heterogeneous assembly with a central absorber cluster (an intra-assembly
+    # gradient), reflective -- the SPH *generation* geometry, where matching the
+    # region reaction rates is equivalent to matching k_inf.
+    poison = Material(name="poison", diffusion=[1.15, 0.55], sigma_a=[0.009, 0.12],
+                      nu_sigma_f=[0, 0], sigma_s=[[0, 0.03], [0, 0]])
+    mats = [PWR_TWO_GROUP, poison]
+    n = 32
+    grid = Grid(shape=(n, n, 1), size=(40.0, 40.0, 1.0))
+    dV = (40.0 / n) ** 2
+    mmap = np.zeros((n, n, 1), dtype=np.int64)
+    c = n // 2
+    for di in range(-3, 4):
+        for dj in range(-3, 4):
+            if abs(di) + abs(dj) <= 3:
+                mmap[c + di, c + dj, 0] = 1
+    ii, jj = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
+    rr = np.sqrt((ii - c + 0.5) ** 2 + (jj - c + 0.5) ** 2)
+    region = np.digitize(rr, [6, 12]).reshape(n, n, 1).astype(np.int64)   # 3 rings
+    return grid, mats, mmap, region, dV
+
+
+def test_sph_correction_preserves_the_sp3_eigenvalue():
+    # Full pipeline: SP3 reference -> flux-weighted homogenize -> SPH-correct so
+    # the coarse diffusion reproduces the SP3 k_inf. The mu*Phi = phi_ref
+    # condition preserves the region reaction rates, hence the eigenvalue.
+    grid, mats, mmap, region, dV = _reflective_assembly()
+    ref = SP3EigenSolver(grid, mats, material_map=mmap, bc="reflective",
+                         device="cpu").solve(tol_k=1e-9, tol_source=1e-8)
+    hmats, rflux, _ = flux_weighted_homogenize(ref.flux_numpy, mats, mmap, region,
+                                               cell_volume=dV)
+
+    def coarse_solve(materials):
+        res = DiffusionEigenSolver(grid, materials, material_map=region,
+                                   bc="reflective", device="cpu"
+                                   ).solve(tol_k=1e-10, tol_source=1e-9)
+        return region_average(res.flux_numpy, region), res.k_eff
+
+    k_homog = coarse_solve(hmats)[1]
+    out = sph_correct(hmats, region, rflux, coarse_solve, tol=1e-9)
+
+    assert out.converged
+    err_homog = abs(k_homog - ref.k_eff) * 1e5
+    err_sph = abs(out.k_eff - ref.k_eff) * 1e5
+    assert err_homog > 20.0                      # homogenization alone has real error
+    assert err_sph < 0.5                          # SPH restores the reference k
+    assert np.allclose(out.factors, 1.0, atol=0.15)   # well-homogenized: factors near 1

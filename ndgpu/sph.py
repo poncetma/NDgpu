@@ -23,6 +23,8 @@ diffusion.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from .materials import Material
@@ -119,3 +121,88 @@ def flux_weighted_homogenize(flux, materials, material_map, region_map,
             chi=(chi if np.isclose(chi.sum(), 1.0) else np.array([1.0] + [0.0] * (G - 1))),
             total=sigma_t))
     return mats_out, region_flux, region_volume
+
+
+def region_average(flux, region_map):
+    """Volume-average scalar flux per coarse region, (R, G).
+
+    flux : (G, *shape) scalar flux; region_map : (*shape) region index. Assumes
+    equal cell volumes (uniform grid), matching :func:`flux_weighted_homogenize`.
+    """
+    n = np.asarray(region_map).reshape(-1)
+    R = int(n.max()) + 1
+    f = np.asarray(flux).reshape(np.asarray(flux).shape[0], -1)
+    return np.array([[f[g][n == i].mean() for g in range(f.shape[0])] for i in range(R)])
+
+
+def _scale_material(mat, mu):
+    """Multiply every cross section of `mat` by mu[g], and D by 1/mu[g].
+
+    Scaling the transport cross section 1/(3D) by mu is D -> D/mu. Multiplying
+    *all* cross sections (removal, scatter, production, transport) by the SPH
+    factor is what makes the corrected reaction rate mu * Sigma * Phi reproduce
+    the reference rate once mu * Phi == phi_ref.
+    """
+    mu = np.asarray(mu, dtype=float)
+    return Material(name=mat.name + "-sph", diffusion=mat.diffusion / mu,
+                    sigma_a=mat.sigma_a * mu, nu_sigma_f=mat.nu_sigma_f * mu,
+                    sigma_s=mat.sigma_s * mu[:, None], chi=mat.chi,
+                    total=(mat.sigma_t * mu))
+
+
+@dataclass
+class SphResult:
+    corrected_materials: list        # R Materials with SPH-corrected cross sections
+    factors: np.ndarray              # (R, G) SPH factors mu
+    k_eff: float                     # eigenvalue of the corrected coarse solve
+    iterations: int
+    converged: bool
+
+
+def sph_correct(homogenized_materials, region_map, reference_region_flux, solve,
+                max_iter=200, tol=1e-8, relax=1.0) -> SphResult:
+    """Solve for the SPH factors that make a coarse solve reproduce the reference.
+
+    The superhomogenization factor mu_{i,g} multiplies every cross section of
+    region i, group g (and divides its diffusion coefficient) so that the
+    corrected coarse reaction rate reproduces the reference: the defining
+    condition is ``mu_{i,g} * Phi_{i,g} == phi_ref_{i,g}`` (not Phi == phi_ref),
+    which preserves the region reaction rates and hence the eigenvalue on the
+    generation geometry. The fixed point ``mu <- phi_ref / Phi(mu)`` is iterated
+    to convergence; fluxes are normalized to a common total each step so only
+    the shape matters.
+
+    homogenized_materials : R Materials (e.g. from
+        :func:`flux_weighted_homogenize`), indexed by region.
+    region_map            : (*shape) region index; the coarse material map.
+    reference_region_flux : (R, G) reference region fluxes (the second return of
+        :func:`flux_weighted_homogenize`).
+    solve                 : callable(materials) -> (region_flux (R, G), k_eff),
+        running the coarse diffusion solve with the given per-region materials
+        (the caller wires up grid, geometry and boundary conditions).
+    relax                 : optional under-relaxation in (0, 1] on log(mu);
+        1.0 is the plain fixed point (stable for well-homogenized generation
+        problems).
+    """
+    R = len(homogenized_materials)
+    ref = np.asarray(reference_region_flux, dtype=float)
+    ref_n = ref / ref.sum()
+    mu = np.ones_like(ref)
+    k = float("nan")
+    converged = False
+    for it in range(1, max_iter + 1):
+        region_flux, k = solve([_scale_material(homogenized_materials[i], mu[i])
+                                for i in range(R)])
+        phi = np.asarray(region_flux, dtype=float)
+        mu_new = ref_n / (phi / phi.sum())
+        if relax != 1.0:
+            mu_new = mu ** (1.0 - relax) * mu_new ** relax
+        err = np.abs(mu_new / mu - 1.0).max()
+        mu = mu_new
+        if err < tol:
+            converged = True
+            break
+    corrected = [_scale_material(homogenized_materials[i], mu[i]) for i in range(R)]
+    return SphResult(corrected_materials=corrected, factors=mu, k_eff=k,
+                     iterations=it, converged=converged)
+
