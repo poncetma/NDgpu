@@ -265,6 +265,87 @@ def absorber_fraction_map(raster: TriRaster, drum_angle_deg, samples: int = 10):
     return frac
 
 
+def hpmr_locally_refined_mesh(refine: int = 3, drum_angle_deg=0.0,
+                              refine_drums: bool = True, band_margin: float = 1.5,
+                              materials=None):
+    """Locally-refined 2D HP-MR triangular finite-volume mesh.
+
+    Coarse triangular lattice everywhere; each coarse cell whose centroid lies
+    in the annular band the drum B4C arc occupies (radius in
+    [DRUM_ABSORBER_INNER - band_margin, DRUM_RADIUS + band_margin] of any drum)
+    is split one level into four sub-triangles, resolving the absorber directly
+    at the fine scale -- no volume mixing needed there -- at a fraction of the
+    cells a globally fine mesh would cost. The full radial band is refined (all
+    azimuths), so the same mesh serves any drum rotation. The coarse-to-fine
+    interface is a 2:1 hanging node, handled conservatively by
+    :func:`ndgpu.mesh.assemble_mesh`.
+
+    Returns ``(mesh, cell_material, materials, alpha_boundary)`` for
+    :class:`ndgpu.mesh.UnstructuredDiffusionSolver`. With ``refine_drums=False``
+    the mesh is uniform (the coarse-baseline / global-fine reference).
+    """
+    from ..mesh import assemble_mesh
+
+    angles = np.broadcast_to(np.asarray(drum_angle_deg, dtype=float),
+                             (len(_DRUM_SITES),))
+    mats = _placeholder_materials() if materials is None else list(materials)
+    raster = hpmr_raster(refine, angles, paint_absorber=False)   # drums = DRUM_BE
+    mm = raster.material_map
+    drum_xy, arc_az = _drum_geometry(angles)
+    drum_xy = np.asarray(drum_xy)
+    arc_half = math.radians(DRUM_ARC_HALF_DEG)
+    lo, hi = DRUM_ABSORBER_INNER - band_margin, DRUM_RADIUS + band_margin
+
+    def absorber_material(cc):
+        """DRUM_ABSORBER if the point is in a drum's arc, else DRUM_BE."""
+        d2 = (drum_xy[:, 0] - cc[0]) ** 2 + (drum_xy[:, 1] - cc[1]) ** 2
+        d = int(d2.argmin()); rr = math.sqrt(d2[d])
+        if DRUM_ABSORBER_INNER < rr <= DRUM_RADIUS:
+            dphi = (math.atan2(cc[1] - drum_xy[d, 1], cc[0] - drum_xy[d, 0])
+                    - arc_az[d] + math.pi) % (2 * math.pi) - math.pi
+            if abs(dphi) <= arc_half:
+                return DRUM_ABSORBER
+        return DRUM_BE
+
+    node_at, coords = {}, []
+    def node(p):
+        k = (round(float(p[0]), 6), round(float(p[1]), 6))
+        i = node_at.get(k)
+        if i is None:
+            i = len(coords); node_at[k] = i; coords.append([float(p[0]), float(p[1])])
+        return i
+
+    cells, cmat = [], []
+    ni, nj, _ = mm.shape
+    for a in range(ni):
+        for b in range(nj):
+            for t in (0, 1):
+                if mm[a, b, t] == 0:
+                    continue
+                V = raster.cell_vertices(a, b, t)
+                cc = V.mean(0)
+                base = int(mm[a, b, t])
+                # material by centroid: absorber arc overlaid on drum-body cells,
+                # everything else its lattice material (raster). Refinement only
+                # changes the *resolution* at which this is sampled.
+                mat_of = (lambda p: absorber_material(p)) if base == DRUM_BE \
+                    else (lambda p: base)
+                rmin = math.sqrt(float(((drum_xy - cc) ** 2).sum(1).min()))
+                if refine_drums and lo <= rmin <= hi:
+                    M = [(V[i] + V[(i + 1) % 3]) / 2 for i in range(3)]
+                    subs = [(V[0], M[0], M[2]), (M[0], V[1], M[1]),
+                            (M[2], M[1], V[2]), (M[0], M[1], M[2])]
+                    for tri in subs:
+                        cells.append(tuple(node(p) for p in tri))
+                        cmat.append(mat_of(np.mean(tri, 0)))
+                else:
+                    cells.append(tuple(node(p) for p in V))
+                    cmat.append(mat_of(cc))
+
+    mesh = assemble_mesh(np.array(coords), cells, cmat)
+    return mesh, np.array(cmat), mats, 0.5
+
+
 @dataclass
 class HpmrProblem:
     grid: TriGrid

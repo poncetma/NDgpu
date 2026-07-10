@@ -74,6 +74,15 @@ def assemble_mesh(coords, cells, tags) -> Mesh:
     coords : (n_nodes, 2) node coordinates. cells : list of node-index tuples.
     tags   : one integer per cell (material/assembly id). A face is a boundary
     face when only one cell borders it.
+
+    Nonconforming (locally-refined) interfaces are supported: a one-cell edge
+    (i, j) whose midpoint is itself a mesh node m, with the half-edges (i, m)
+    and (m, j) each owned by another cell, is a coarse edge meeting two fine
+    cells across a 2:1 hanging node. It is split into two interior faces
+    coupling the coarse cell to each fine cell (each carrying its half-edge
+    length) -- the standard conservative two-point-flux treatment. Purely
+    conforming meshes are unaffected (their one-cell edges have no midpoint
+    node, so they stay boundary faces).
     """
     coords = np.asarray(coords, dtype=float)
     cells = [tuple(c) for c in cells]
@@ -89,13 +98,42 @@ def assemble_mesh(coords, cells, tags) -> Mesh:
         m = len(ns)
         for a in range(m):
             edge_cells[tuple(sorted((ns[a], ns[(a + 1) % m])))].append(c)
-    faces, bfaces = [], []
+
+    # Node lookup by (rounded) coordinate, over nodes actually used by cells,
+    # for detecting a hanging-node midpoint on a one-cell edge.
+    def key(p):
+        return (round(float(p[0]), 6), round(float(p[1]), 6))
+    used = {n for ns in cells for n in ns}
+    node_at = {key(coords[n]): n for n in used}
+    one_cell = {e: lst[0] for e, lst in edge_cells.items() if len(lst) == 1}
+
+    def dist(a, b):
+        return float(np.hypot(*(centroid[a] - centroid[b])))
+
+    faces, bfaces, consumed = [], [], set()
+    for e, ci in one_cell.items():
+        if e in consumed:
+            continue
+        a, b = e
+        mnode = node_at.get(key(0.5 * (coords[a] + coords[b])))
+        if mnode is None or mnode in (a, b):
+            continue
+        e1, e2 = tuple(sorted((a, mnode))), tuple(sorted((mnode, b)))
+        if e1 in one_cell and e2 in one_cell:      # coarse edge over two fine cells
+            for half in (e1, e2):
+                cj = one_cell[half]
+                L = float(np.hypot(*(coords[half[0]] - coords[half[1]])))
+                faces.append((ci, cj, L, dist(ci, cj)))
+            consumed.update((e, e1, e2))
+
     for e, lst in edge_cells.items():
+        if e in consumed:
+            continue
         p0, p1 = coords[e[0]], coords[e[1]]
         L = float(np.hypot(*(p1 - p0)))
         if len(lst) == 2:
             i, j = lst
-            faces.append((i, j, L, float(np.hypot(*(centroid[i] - centroid[j])))))
+            faces.append((i, j, L, dist(i, j)))
         else:
             i = lst[0]
             db = float(np.hypot(*(centroid[i] - 0.5 * (p0 + p1))))
