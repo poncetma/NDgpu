@@ -14,6 +14,7 @@ from .griffin_xs import (read_library as read_griffin_library,
 from .grid import Grid
 from .hex import HexDiffusionEigenSolver, HexGrid, offset_to_axial
 from .materials import Kinetics, Material, ONE_GROUP_DEMO, PWR_TWO_GROUP
+from .perturbation import first_order_reactivity
 from .solver import DiffusionEigenSolver, Result, SP3EigenSolver
 from .transient import TransientResult, TransientSolver
 
@@ -42,6 +43,7 @@ __all__ = [
     "k_bare_box",
     "k_from_buckling",
     "k_infinite",
+    "first_order_reactivity",
     "read_material_xml",
     "read_xsec",
     "read_griffin_library",
