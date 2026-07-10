@@ -170,7 +170,8 @@ class UnstructuredDiffusionSolver:
         self.removal = [np.array([self.mats[m].removal[g] for m in self.cm]) for g in range(self.G)]
         self.nsf = [np.array([self.mats[m].nu_sigma_f[g] for m in self.cm]) for g in range(self.G)]
         self.chi = [np.array([self.mats[m].chi[g] for m in self.cm]) for g in range(self.G)]
-        # downscatter g'->g (g' < g), no upscatter
+        # scattering g'->g for every off-diagonal pair (both down- and
+        # up-scatter); lagged one outer iteration through the group source.
         self.scat = {}
         for gf in range(self.G):
             for gt in range(self.G):

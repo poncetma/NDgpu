@@ -39,6 +39,30 @@ def test_local_refinement_adds_fine_cells_in_the_band():
     assert int((c1 == 5).sum()) >= int((c0 == 5).sum())   # >= absorber cells resolved
 
 
+def test_hanging_node_refinement_is_consistent():
+    # Consistency of the 2:1 coupling: in a homogeneous medium with vacuum
+    # boundaries (so the flux has real curvature and leakage), the locally
+    # refined k must converge toward an independent globally fine reference as
+    # the base resolution rises. A broken hanging-node coefficient would either
+    # not converge or converge to the wrong limit (an O(1) inconsistency);
+    # instead the error shrinks monotonically and stays small. (The band
+    # refinement itself buys no accuracy here -- there is no feature to resolve
+    # -- so this isolates the interface treatment, not the refinement's payoff.)
+    fuel = _placeholder_materials()[1]
+    homog = [fuel] * 6
+
+    def k(refine, refine_drums):
+        mesh, cm, _, alpha = hpmr_locally_refined_mesh(
+            refine=refine, drum_angle_deg=90.0, refine_drums=refine_drums, materials=homog)
+        return UnstructuredDiffusionSolver(mesh, homog, cm, alpha).solve(tol_k=1e-9).k_eff
+
+    k_ref = k(8, False)                                    # fine uniform reference
+    err = [abs(k(r, True) - k_ref) * 1e5 for r in (2, 3, 4)]   # pcm
+    assert err[0] < 40.0                                   # no O(1) inconsistency
+    assert err[2] < err[1] < err[0]                        # converging, monotone
+    assert err[2] < 15.0                                   # approaching the true k
+
+
 def test_local_refine_gives_negative_drum_worth():
     def k(angle):
         mesh, cm, mats, alpha = hpmr_locally_refined_mesh(
