@@ -1,1 +1,14 @@
-./dist
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Build/venv
+build/
+*.egg
+.venv/
+venv/
+
+# Note: dist/ndgpu-src.zip is a tracked deliverable (uploaded to Colab), so
+# dist/ is intentionally NOT ignored.
