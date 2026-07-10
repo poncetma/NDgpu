@@ -167,22 +167,32 @@ def _placeholder_materials(three_d: bool = False) -> list:
     return mats
 
 
-def hpmr_raster(refine: int, drum_angle_deg) -> TriRaster:
+def _drum_geometry(drum_angle_deg):
+    """(drum centres, per-drum absorber-arc centre azimuths) at these angles."""
+    drum_xy = [hex_site_xy(R, C, PITCH) for R, C in _DRUM_SITES]
+    arc_az = [math.atan2(y, x) + math.radians(a)          # outward + rotation
+              for (x, y), a in zip(drum_xy, drum_angle_deg)]
+    return drum_xy, arc_az
+
+
+def hpmr_raster(refine: int, drum_angle_deg, paint_absorber: bool = True) -> TriRaster:
     """Rasterize the radial core (see :mod:`ndgpu.hexraster`).
 
     drum_angle_deg : per-drum absorber rotation (12,); 0 = arc facing radially
     outward (withdrawn), 180 = facing the core centre (inserted).
+    paint_absorber : if True (default) the B4C arc is stamped by centroid
+    (staircase); if False the drum cells stay drum-body Be, for the polar
+    volume-mixing path (see :func:`absorber_fraction_map`).
     """
     site_mat = {(0, 0): CENTRAL}
     site_mat.update({s: FUEL for s in _FUEL_SITES})
     site_mat.update({s: BE_REFLECTOR for s in _BE_SITES})
     site_mat.update({s: DRUM_BE for s in _DRUM_SITES})
+    if not paint_absorber:
+        return rasterize_hex_sites(site_mat, PITCH, refine)
 
     drum_index = {s: d for d, s in enumerate(_DRUM_SITES)}
-    drum_xy = [hex_site_xy(R, C, PITCH) for R, C in _DRUM_SITES]
-    # Absorber arc centre azimuth: outward site azimuth plus the drum angle.
-    arc_az = [math.atan2(y, x) + math.radians(a)
-              for (x, y), a in zip(drum_xy, drum_angle_deg)]
+    drum_xy, arc_az = _drum_geometry(drum_angle_deg)
     arc_half = math.radians(DRUM_ARC_HALF_DEG)
 
     def paint(cx, cy, site, mid):
@@ -203,6 +213,58 @@ def hpmr_raster(refine: int, drum_angle_deg) -> TriRaster:
     return rasterize_hex_sites(site_mat, PITCH, refine, paint=paint)
 
 
+def absorber_fraction_map(raster: TriRaster, drum_angle_deg, samples: int = 10):
+    """Per-cell B4C area fraction of each drum's absorber arc.
+
+    The absorber is a polar region -- an annular sector r in
+    [DRUM_ABSORBER_INNER, DRUM_RADIUS], azimuth within +-DRUM_ARC_HALF_DEG of
+    the (rotated) arc centre. For every triangle within reach of a drum, the
+    fraction of the cell area covered by that region is estimated by
+    barycentric sub-sampling. Unlike the centroid raster this is *exact in the
+    limit* and, crucially, non-zero for cells the thin (1 cm) annulus only
+    partly crosses -- so the arc is represented (diluted) even when it is
+    thinner than a triangle, and the fraction varies smoothly as the drum
+    rotates. Feed the result as ``mix_weight`` with ``mix_material`` =
+    DRUM_ABSORBER to volume-mix the absorber into the drum-body cells.
+
+    samples : barycentric sub-sampling order; (samples+1)(samples+2)/2 points
+    per cell (10 -> 66). Higher = finer area/rotation resolution.
+    """
+    mmap = raster.material_map
+    ni, nj, _ = mmap.shape
+    frac = np.zeros((ni, nj, 2), dtype=float)
+    drum_xy, arc_az = _drum_geometry(drum_angle_deg)
+    drum_xy = np.asarray(drum_xy)
+    arc_az = np.asarray(arc_az)
+    arc_half = math.radians(DRUM_ARC_HALF_DEG)
+    reach2 = (DRUM_RADIUS + raster.side) ** 2
+
+    n = samples
+    bary = np.array([(i / n, j / n, (n - i - j) / n)
+                     for i in range(n + 1) for j in range(n + 1 - i)])  # (S, 3)
+
+    for a in range(ni):
+        for b in range(nj):
+            for t in (0, 1):
+                if mmap[a, b, t] == 0:
+                    continue
+                V = raster.cell_vertices(a, b, t)          # (3, 2)
+                cx, cy = V.mean(0)
+                d2 = (drum_xy[:, 0] - cx) ** 2 + (drum_xy[:, 1] - cy) ** 2
+                d = int(d2.argmin())
+                if d2[d] > reach2:
+                    continue
+                pts = bary @ V                              # (S, 2)
+                dx = pts[:, 0] - drum_xy[d, 0]
+                dy = pts[:, 1] - drum_xy[d, 1]
+                rr = np.hypot(dx, dy)
+                dphi = (np.arctan2(dy, dx) - arc_az[d] + np.pi) % (2 * np.pi) - np.pi
+                inside = ((rr > DRUM_ABSORBER_INNER) & (rr <= DRUM_RADIUS)
+                          & (np.abs(dphi) <= arc_half))
+                frac[a, b, t] = inside.mean()
+    return frac
+
+
 @dataclass
 class HpmrProblem:
     grid: TriGrid
@@ -213,41 +275,66 @@ class HpmrProblem:
     bc: object = "reflective"   # z faces only (2D grids ignore it)
     kinetics: object = None
     drum_angle_deg: np.ndarray = None
+    mix_material: np.ndarray = None   # polar absorber volume-mixing (optional)
+    mix_weight: np.ndarray = None
 
 
 def build_hpmr2d(refine: int = 4, drum_angle_deg=0.0,
-                 materials: list | None = None) -> HpmrProblem:
+                 materials: list | None = None,
+                 absorber: str = "raster", samples: int = 10) -> HpmrProblem:
     """Assemble the 2D HP-MR core on a body-fitted triangular mesh.
 
     refine         : triangles per hex = 6 refine^2; also sets the drum-arc
-                     rasterization fidelity (>= 4 recommended).
+                     rasterization fidelity (>= 4 recommended for "raster").
     drum_angle_deg : absorber-arc rotation, scalar or one value per drum (12).
                      0 = arc outward (withdrawn), 180 = arc toward the core.
     materials      : optional replacement list ordered as MATERIAL_NAMES
                      (e.g. SPH-corrected sets read via ndgpu.femffusion).
+    absorber       : "raster" (centroid staircase, one material per cell) or
+                     "polar" (exact polar area fraction volume-mixed into the
+                     drum cells; sets ``mix_material``/``mix_weight`` on the
+                     problem -- pass them to the solver). The polar path
+                     represents the arc's area and rotation smoothly and works
+                     below the raster's refine>=4 floor.
+    samples        : sub-sampling order for the polar area fractions.
 
     Use with TriDiffusionEigenSolver, e.g.::
 
-        p = build_hpmr2d(refine=4, drum_angle_deg=180.0)
+        p = build_hpmr2d(refine=6, drum_angle_deg=120.0, absorber="polar")
         res = TriDiffusionEigenSolver(p.grid, p.materials, p.material_map,
-                                      active=p.active, mask_bc=p.mask_bc).solve()
+                                      active=p.active, mask_bc=p.mask_bc,
+                                      mix_material=p.mix_material,
+                                      mix_weight=p.mix_weight).solve()
     """
-    if refine < 4:
-        raise ValueError("refine >= 4 required: below that the 1 cm B4C "
-                         "annulus is thinner than a triangle and no absorber "
-                         "is rasterized at all (>= 6 for drum-worth studies)")
+    if absorber == "raster" and refine < 4:
+        raise ValueError("refine >= 4 required for absorber='raster': below "
+                         "that the 1 cm B4C annulus is thinner than a triangle "
+                         "and no absorber is rasterized (use absorber='polar', "
+                         "which volume-mixes the arc at any refinement)")
     angles = np.broadcast_to(np.asarray(drum_angle_deg, dtype=float),
                              (len(_DRUM_SITES),))
     mats = _placeholder_materials() if materials is None else list(materials)
     if len(mats) != len(MATERIAL_NAMES):
         raise ValueError(f"expected {len(MATERIAL_NAMES)} materials "
                          f"({', '.join(MATERIAL_NAMES)}), got {len(mats)}")
-    raster = hpmr_raster(refine, angles)
+
+    mix_material = mix_weight = None
+    if absorber == "raster":
+        raster = hpmr_raster(refine, angles)
+    elif absorber == "polar":
+        raster = hpmr_raster(refine, angles, paint_absorber=False)
+        frac = absorber_fraction_map(raster, angles, samples=samples)
+        mix_weight = frac
+        mix_material = np.where(frac > 0.0, DRUM_ABSORBER, -1).astype(np.int64)
+    else:
+        raise ValueError(f"absorber must be 'raster' or 'polar', got {absorber!r}")
+
     mmap, side = raster.material_map, raster.side
     return HpmrProblem(grid=TriGrid(shape=mmap.shape, side=side),
                        materials=mats, material_map=mmap, active=mmap > 0,
                        mask_bc="vacuum", kinetics=HPMR_KINETICS,
-                       drum_angle_deg=np.array(angles))
+                       drum_angle_deg=np.array(angles),
+                       mix_material=mix_material, mix_weight=mix_weight)
 
 
 def build_hpmr3d(refine: int = 4, nz: int = 20, drum_angle_deg=0.0,

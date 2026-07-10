@@ -72,6 +72,53 @@ def test_k_stable_under_refinement():
     assert abs(_k(4, 0.0) - _k(6, 0.0)) < 1e-3
 
 
+def _k_polar(refine, drum_angle_deg, samples=10):
+    p = build_hpmr2d(refine=refine, drum_angle_deg=drum_angle_deg,
+                     absorber="polar", samples=samples)
+    res = TriDiffusionEigenSolver(p.grid, p.materials, p.material_map,
+                                  active=p.active, mask_bc=p.mask_bc,
+                                  mix_material=p.mix_material,
+                                  mix_weight=p.mix_weight, device="cpu").solve(**TOL)
+    assert res.converged
+    return res.k_eff
+
+
+def test_polar_builds_below_raster_floor():
+    # The volume-mixing path represents the arc as an area fraction, so it works
+    # below the raster's refine>=4 floor (where the annulus is sub-cell).
+    p = build_hpmr2d(refine=2, drum_angle_deg=120.0, absorber="polar")
+    assert p.mix_material is not None and p.mix_weight is not None
+    assert p.mix_material.shape == p.material_map.shape
+    w = p.mix_weight
+    assert w.min() >= 0.0 and w.max() <= 1.0
+    assert int((w > 0).sum()) >= 12            # absorber present on every drum
+    # weight>0 exactly where a mix material is set
+    assert np.array_equal((w > 0), (p.mix_material == DRUM_ABSORBER))
+
+
+def test_polar_worth_ordering_and_symmetry():
+    k0, k90, k180 = (_k_polar(4, a) for a in (0.0, 90.0, 180.0))
+    assert k0 > k90 > k180                     # arcs toward core = negative worth
+    assert (1 / k180 - 1 / k0) * 1e5 > 500
+    a, b = np.zeros(12), np.zeros(12)
+    a[0], b[3] = 180.0, 180.0                  # a drum and its diametral opposite
+    assert _k_polar(4, a) == pytest.approx(_k_polar(4, b), abs=1e-9)
+
+
+def test_polar_worth_curve_smoother_than_raster():
+    # Sweep the drum angle finely at a coarse mesh, where the raster staircases:
+    # some adjacent angles flip no cells (dead steps) while others jump. The
+    # polar area fraction changes every step, so its largest single-step
+    # reactivity jump is smaller than the raster's.
+    angles = np.arange(80.0, 141.0, 10.0)      # 60 deg sweep, steepest region
+    def worth(fn):
+        k = np.array([fn(4, a) for a in angles])
+        return (1.0 / k - 1.0 / k[0]) * 1e5
+    raster_steps = np.abs(np.diff(worth(_k)))
+    polar_steps = np.abs(np.diff(worth(_k_polar)))
+    assert polar_steps.max() < raster_steps.max()
+
+
 def test_3d_geometry_counts():
     from ndgpu.benchmarks.hpmr import AXIAL_REFLECTOR, build_hpmr3d
     r, nz = 4, 10

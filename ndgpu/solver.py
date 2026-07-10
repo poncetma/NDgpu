@@ -68,7 +68,8 @@ class Fields:
     nu_sigma_f, chi, removal, diffusion, sigma_t, sigma_s.
     """
 
-    def __init__(self, xp, grid, materials, material_map, dtype):
+    def __init__(self, xp, grid, materials, material_map, dtype,
+                 mix_material=None, mix_weight=None):
         mats = [materials] if isinstance(materials, Material) else list(materials)
         G = mats[0].n_groups
         if any(m.n_groups != G for m in mats):
@@ -76,30 +77,63 @@ class Fields:
         self.n_groups = G
         self.fissile = any(m.is_fissile for m in mats)
 
+        # Optional per-cell two-material blend on top of the base integer map:
+        # cell XS = (1 - w) * base + w * mix, for a per-cell mix material and
+        # weight w (sentinel mix_material < 0 = no blend). This is the volume-
+        # mixing homogenization used for a partially-present material -- e.g. a
+        # control-drum absorber arc that covers a fraction w of the cell, or a
+        # partially-inserted rod tip. Cross sections blend linearly (exact
+        # reaction-rate averaging under a flat flux); the diffusion coefficient
+        # blends *harmonically* (i.e. its transport cross section 1/(3D)
+        # volume-averages), so a trace of a strong absorber correctly chokes
+        # the cell. Non-blended cells stay bit-identical to the pure-index map.
+        mix = mix_material is not None
         if material_map is None:
             if len(mats) > 1:
                 raise ValueError("material_map is required with multiple materials")
-            lookup = lambda table: xp.full(grid.shape, float(table[0]), dtype=dtype)
+            if mix:
+                raise ValueError("mixing requires an explicit material_map")
+            lin = lambda table: xp.full(grid.shape, float(table[0]), dtype=dtype)
+            harm = lin
         else:
             mmap = xp.asarray(np.asarray(material_map))
             if mmap.shape != grid.shape:
                 raise ValueError(f"material_map shape {mmap.shape} != grid shape {grid.shape}")
             if int(mmap.min()) < 0 or int(mmap.max()) >= len(mats):
                 raise ValueError("material_map indexes outside the materials list")
-            lookup = lambda table: xp.asarray(table, dtype=dtype)[mmap]
+            if mix:
+                mm2 = xp.asarray(np.asarray(mix_material))
+                w = xp.asarray(np.asarray(mix_weight), dtype=dtype)
+                if mm2.shape != grid.shape or w.shape != grid.shape:
+                    raise ValueError("mix_material/mix_weight shape must match grid")
+                if int(mm2.max()) >= len(mats):
+                    raise ValueError("mix_material indexes outside the materials list")
+                active_mix = mm2 >= 0
+                mm2c = xp.where(active_mix, mm2, 0)
 
-        def per_group(attr):
+            def blend(table, combine):
+                dev = xp.asarray(table, dtype=dtype)
+                base = dev[mmap]
+                if mix:
+                    base = xp.where(active_mix, combine(base, dev[mm2c], w), base)
+                return base
+
+            lin = lambda table: blend(table, lambda b, o, wt: (1.0 - wt) * b + wt * o)
+            harm = lambda table: blend(table, lambda b, o, wt: 1.0 / ((1.0 - wt) / b + wt / o))
+
+        def per_group(attr, lookup=None):
+            lookup = lookup or lin
             table = np.array([getattr(m, attr) for m in mats])  # (M, G)
             return [lookup(table[:, g]) for g in range(G)]
 
         self.nu_sigma_f = per_group("nu_sigma_f")
         self.chi = per_group("chi")
         self.removal = per_group("removal")
-        self.diffusion = per_group("diffusion")
+        self.diffusion = per_group("diffusion", lookup=harm)
         self.sigma_t = per_group("sigma_t")
 
         sig_s = np.array([m.sigma_s for m in mats])  # (M, G, G)
-        self.sigma_s = [[lookup(sig_s[:, gf, gt]) if np.any(sig_s[:, gf, gt]) else None
+        self.sigma_s = [[lin(sig_s[:, gf, gt]) if np.any(sig_s[:, gf, gt]) else None
                          for gt in range(G)] for gf in range(G)]
 
     def fission_source(self, phi_by_group):
@@ -143,7 +177,8 @@ class _PowerIterationSolver:
 
     def __init__(self, grid: Grid, materials, material_map=None,
                  bc: str = BC_ZERO_FLUX, device: str = "auto", dtype=np.float64,
-                 active=None, mask_bc=BC_VACUUM, precond_degree: int = 0):
+                 active=None, mask_bc=BC_VACUUM, precond_degree: int = 0,
+                 mix_material=None, mix_weight=None):
         self.grid = grid
         self.xp = xp = get_backend(device)
         self.device = device_name(xp)
@@ -151,7 +186,8 @@ class _PowerIterationSolver:
         self.active = active
         self.mask_bc = mask_bc
 
-        f = Fields(xp, grid, materials, material_map, self.dtype)
+        f = Fields(xp, grid, materials, material_map, self.dtype,
+                   mix_material=mix_material, mix_weight=mix_weight)
         if not f.fissile:
             raise ValueError("no fissile material: k-eigenvalue problem is undefined")
         self.fields = f

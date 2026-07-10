@@ -112,13 +112,25 @@ The residual is the homogenization + angular physics gap, not solver error
 
 ### HP-MR heat-pipe microreactor (2D and 3D)
 
-`python examples/hpmr_2d.py [refine] [device]` — assembly-level radial model
-of the ANL/INL HP-MR reference microreactor (NEAMS VTB design: 30 TRISO fuel
-assemblies, central shutdown cell, Be reflector ring, 12 rotating B4C control
-drums) on the body-fitted triangular mesh, geometry decoded from the VTB
-Serpent model. Sweeps the drum angle and prints the worth curve
+`python examples/hpmr_2d.py [refine] [absorber] [device]` — assembly-level
+radial model of the ANL/INL HP-MR reference microreactor (NEAMS VTB design: 30
+TRISO fuel assemblies, central shutdown cell, Be reflector ring, 12 rotating
+B4C control drums) on the body-fitted triangular mesh, geometry decoded from
+the VTB Serpent model. Sweeps the drum angle and prints the worth curve
 (k 1.030 → 1.002, ≈ −2700 pcm fully inserted, at the placeholder two-group
 cross sections — swap in SPH-corrected sets via `build_hpmr2d(materials=…)`).
+
+The curved B4C absorber arc is the one non-hex feature, and
+`build_hpmr2d(..., absorber=…)` offers two treatments. `"raster"` stamps whole
+cells by centroid — a staircase whose worth-vs-angle curve has dead steps and
+486-pcm cliffs, and whose drum worth needs refine ≥ 6 to settle. `"polar"`
+volume-mixes each cell's **exact polar area fraction** of the arc (harmonic for
+D, linear for the reaction cross sections) via the solver's `mix_material` /
+`mix_weight` hook — the same partial-volume idea as control-rod-tip mixing.
+It gives a smooth worth-vs-angle curve (max step 145 vs 486 pcm), converges
+from a much better coarse-mesh value, and runs below the raster's refine floor
+(the 1 cm annulus is represented even when it is thinner than a triangle). Both
+agree at fine mesh (~2720 pcm), so the polar treatment is unbiased.
 
 `python examples/hpmr_3d.py [refine] [nz] [device]` — the same core extruded
 to full height as triangular *prisms* (160 cm fueled + 20 cm Be axial
