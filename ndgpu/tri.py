@@ -29,9 +29,9 @@ import math
 from dataclasses import dataclass
 
 
-from .operator import (BC_VACUUM, face_alpha, harmonic_mean, normalize_bc,
-                       robin_face_term)
-from .solver import DiffusionEigenSolver
+from .operator import (BC_VACUUM, SP3GroupOperator, face_alpha, harmonic_mean,
+                       normalize_bc, robin_face_term)
+from .solver import DiffusionEigenSolver, SP3EigenSolver
 
 _SQRT3 = math.sqrt(3.0)
 
@@ -187,4 +187,23 @@ class TriDiffusionEigenSolver(DiffusionEigenSolver):
     def _build_operators(self, grid, diffusion, sigma_t, removal, bc):
         self.ops = [TriGroupOperator(self.xp, grid, diffusion[g], removal[g], bc=bc,
                                      active=self.active, mask_bc=self.mask_bc)
+                    for g in range(self.n_groups)]
+
+
+class TriSP3EigenSolver(SP3EigenSolver):
+    """Multigroup simplified-P3 k-eigenvalue solver on the triangular mesh.
+
+    SP3 on the body-fitted hex/triangular geometry: the same angular block as
+    the Cartesian :class:`~ndgpu.SP3EigenSolver`, with the in-plane leakage of
+    both SP3 moments discretized by :class:`TriGroupOperator`. It captures the
+    transport effects (steep gradients at strong absorbers and small cores)
+    that triangular diffusion misses -- e.g. it serves as the transport
+    reference for SPH homogenization on the HP-MR core. Same interface and ~2x
+    the per-group work of :class:`TriDiffusionEigenSolver`; the scalar flux is
+    phi0 = Phi1 - 2 phi2 (moment state carried internally)."""
+
+    def _build_operators(self, grid, diffusion, sigma_t, removal, bc):
+        self.ops = [SP3GroupOperator(self.xp, grid, diffusion[g], sigma_t[g],
+                                     removal[g], bc=bc, active=self.active,
+                                     mask_bc=self.mask_bc, op_cls=TriGroupOperator)
                     for g in range(self.n_groups)]

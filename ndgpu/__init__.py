@@ -16,6 +16,7 @@ from .hex import HexDiffusionEigenSolver, HexGrid, offset_to_axial
 from .materials import Kinetics, Material, ONE_GROUP_DEMO, PWR_TWO_GROUP
 from .perturbation import first_order_reactivity
 from .solver import DiffusionEigenSolver, Result, SP3EigenSolver
+from .tri import TriDiffusionEigenSolver, TriGrid, TriSP3EigenSolver
 from .transient import TransientResult, TransientSolver
 
 __version__ = "0.1.0"
@@ -23,6 +24,9 @@ __version__ = "0.1.0"
 __all__ = [
     "DiffusionEigenSolver",
     "SP3EigenSolver",
+    "TriDiffusionEigenSolver",
+    "TriSP3EigenSolver",
+    "TriGrid",
     "HexDiffusionEigenSolver",
     "TransientSolver",
     "TransientResult",

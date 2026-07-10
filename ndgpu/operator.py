@@ -246,16 +246,25 @@ class SP3GroupOperator:
     phi = 0 on the surface for both moments (a good approximation whenever the
     physical vacuum boundary sits behind a reflector; Marshak vacuum
     conditions, which couple the moments at the boundary, are not implemented).
+
+    The spatial discretization of both moment operators is supplied by
+    ``op_cls`` (default :class:`GroupOperator`, the structured Cartesian
+    stencil). Passing a compatible operator -- e.g. the triangular
+    ``TriGroupOperator`` -- yields SP3 on that geometry with no change to the
+    angular block: the SP3 coupling only cares that ``op_cls`` exposes
+    ``apply`` and ``inv_diag`` and accepts (xp, grid, D, removal, bc, active,
+    mask_bc).
     """
 
     def __init__(self, xp, grid, D1, sigma_t, removal, bc=BC_ZERO_FLUX,
-                 active=None, mask_bc=BC_VACUUM):
+                 active=None, mask_bc=BC_VACUUM, op_cls=None):
         self.xp = xp
-        self.moment1 = GroupOperator(xp, grid, D1, removal, bc=bc,
-                                     active=active, mask_bc=mask_bc)
+        op_cls = op_cls or GroupOperator
+        self.moment1 = op_cls(xp, grid, D1, removal, bc=bc,
+                              active=active, mask_bc=mask_bc)
         D2 = 9.0 / (35.0 * sigma_t)
-        self.moment2 = GroupOperator(xp, grid, D2, sigma_t + 0.8 * removal, bc=bc,
-                                     active=active, mask_bc=mask_bc)
+        self.moment2 = op_cls(xp, grid, D2, sigma_t + 0.8 * removal, bc=bc,
+                              active=active, mask_bc=mask_bc)
         self.coupling = 2.0 * removal
         self.inv_diag = xp.stack([self.moment1.inv_diag, self.moment2.inv_diag / 5.0])
 
