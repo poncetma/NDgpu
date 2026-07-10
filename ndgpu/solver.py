@@ -17,6 +17,12 @@ The inner CG tolerance is adapted to the outer residual, so early outers are
 cheap and the final ones are tight; combined with warm starts, late outer
 iterations cost only a handful of stencil applications.
 
+The same outer loop solves the adjoint (importance) problem via
+``solve(adjoint=True)``: the leakage+removal operator is self-adjoint, so only
+the fission (chi <-> nu_sigma_f) and scattering (group-index transpose)
+couplings flip. The adjoint flux weights first-order perturbation theory and
+adjoint kinetics parameters.
+
 Everything — fluxes, coupling coefficients, sources — lives on the device for
 the entire solve; only per-iteration convergence scalars cross the PCIe bus.
 """
@@ -218,23 +224,47 @@ class _PowerIterationSolver:
         raise NotImplementedError
 
     # -----------------------------------------------------------------------
-    def _fission_source(self, state):
-        src = self.nu_sigma_f[0] * self._phi(state[0])
+    def _fission_source(self, state, weight):
+        """Sum_g weight[g] * phi0_g -- the field that drives the outer loop.
+
+        Forward: weight = nu_sigma_f (fission neutron production per cell).
+        Adjoint: weight = chi (the transpose of F distributes production by
+        nu_sigma_f and collects it against chi, so the driving field is the
+        chi-weighted importance).
+        """
+        src = weight[0] * self._phi(state[0])
         for g in range(1, self.n_groups):
-            src += self.nu_sigma_f[g] * self._phi(state[g])
+            src += weight[g] * self._phi(state[g])
         return src
 
     def solve(self, tol_k: float = 1e-7, tol_source: float = 1e-6,
               max_outer: int = 2000, inner_rtol_floor: float = 1e-10,
-              k_guess: float = 1.0, verbose: bool = False) -> Result:
+              k_guess: float = 1.0, verbose: bool = False,
+              adjoint: bool = False) -> Result:
         """Run power iteration until |dk| < tol_k and the relative L2 change of
-        the normalized fission source < tol_source."""
+        the normalized fission source < tol_source.
+
+        adjoint : solve the adjoint (importance) k-eigenproblem M* phi* =
+        (1/k) F* phi* instead of the forward one. The within-group operator
+        (leakage + removal) is self-adjoint, so only the two energy couplings
+        transpose: fission swaps the production weight nu_sigma_f and the
+        emission spectrum chi, and scattering swaps its group indices
+        (sigma_s[g'->g] becomes sigma_s[g->g']). The dominant eigenvalue is
+        identical to the forward k; the eigenvector is the adjoint flux, used
+        for adjoint-weighted kinetics and first-order perturbation theory.
+        """
         xp, G = self.xp, self.n_groups
         synchronize(xp)
         t0 = time.perf_counter()
 
+        # Fission couples groups as F[g,g'] = chi_g * nu_sigma_f_g'. Its
+        # transpose F* moves chi to the production weight and nu_sigma_f to the
+        # emission spectrum; scattering transposes independently (below).
+        prod = self.chi if adjoint else self.nu_sigma_f
+        emit = self.nu_sigma_f if adjoint else self.chi
+
         state = self._initial_state()
-        fsrc = self._fission_source(state)
+        fsrc = self._fission_source(state, prod)
         total = xp.sum(fsrc)
         if float(total) <= 0:
             raise RuntimeError("initial fission source is zero")
@@ -250,9 +280,11 @@ class _PowerIterationSolver:
             rtol = min(1e-3, max(0.1 * src_err, inner_rtol_floor, 0.01 * tol_source))
 
             for g in range(G):
-                q0 = (self.chi[g] / k) * fsrc
+                q0 = (emit[g] / k) * fsrc
                 for gf in range(G):
-                    s = self.sigma_s[gf][g]
+                    # forward: in-scatter g'->g uses sigma_s[g'][g];
+                    # adjoint transposes to sigma_s[g][g'].
+                    s = self.sigma_s[g][gf] if adjoint else self.sigma_s[gf][g]
                     if gf != g and s is not None:
                         q0 += s * self._phi(state[gf])
                 state[g], n_it = pcg(self.ops[g].apply, self._rhs(g, q0), state[g],
@@ -260,7 +292,7 @@ class _PowerIterationSolver:
                                      precond=self.preconds[g])
                 inner_total += n_it
 
-            fsrc_new = self._fission_source(state)
+            fsrc_new = self._fission_source(state, prod)
             total_new = xp.sum(fsrc_new)
             k_new = k * float(total_new / total)
 
