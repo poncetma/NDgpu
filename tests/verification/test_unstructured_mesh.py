@@ -45,6 +45,28 @@ def test_unstructured_matches_structured_on_quads():
     assert k_u == pytest.approx(k_s, abs=2e-4)
 
 
+def test_unstructured_matches_tri_on_hpmr_staircase():
+    # The two HP-MR paths -- structured triangular lattice (TriDiffusionEigenSolver)
+    # and the assembled unstructured mesh (UnstructuredDiffusionSolver) -- rasterize
+    # the SAME triangles with the same centroid-painted absorber, so they must
+    # produce the same k. This ties the general-geometry solver to the fast
+    # structured one on the geometry that actually matters, drums in and out.
+    from ndgpu.benchmarks.hpmr import build_hpmr2d, hpmr_locally_refined_mesh
+    from ndgpu.tri import TriDiffusionEigenSolver
+
+    for angle in (0.0, 120.0):
+        p = build_hpmr2d(refine=4, drum_angle_deg=angle, absorber="raster")
+        k_tri = TriDiffusionEigenSolver(
+            p.grid, p.materials, p.material_map, active=p.active, mask_bc=p.mask_bc
+        ).solve(tol_k=1e-9, tol_source=1e-8).k_eff
+
+        mesh, cm, mats, alpha = hpmr_locally_refined_mesh(
+            refine=4, drum_angle_deg=angle, refine_drums=False)
+        k_mesh = UnstructuredDiffusionSolver(mesh, mats, cm, alpha).solve(tol_k=1e-9).k_eff
+
+        assert k_tri == pytest.approx(k_mesh, abs=1e-6), (angle, k_tri, k_mesh)
+
+
 def test_unstructured_reflective_is_kinf():
     # Reflective (alpha=0) on all faces -> k = k_inf, independent of geometry.
     mesh = _cartesian_quad_mesh(10, 50.0)
