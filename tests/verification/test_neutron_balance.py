@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from ndgpu import DiffusionEigenSolver, Grid, Material, PWR_TWO_GROUP
+from ndgpu.mesh import assemble_mesh_3d, UnstructuredDiffusionSolver
 
 
 def _balance(solver, res):
@@ -51,6 +52,51 @@ def test_balance_homogeneous_bare_box():
     res = solver.solve(tol_k=1e-10, tol_source=1e-9)
     assert res.converged
     _assert_balanced(solver, res)
+
+
+def _hex_grid(n, L):
+    dx = L / n
+    nid, coords = {}, []
+
+    def gid(i, j, k):
+        if (i, j, k) not in nid:
+            nid[(i, j, k)] = len(coords); coords.append((i * dx, j * dx, k * dx))
+        return nid[(i, j, k)]
+
+    cells = [(gid(i, j, k), gid(i + 1, j, k), gid(i + 1, j + 1, k), gid(i, j + 1, k),
+              gid(i, j, k + 1), gid(i + 1, j, k + 1), gid(i + 1, j + 1, k + 1), gid(i, j + 1, k + 1))
+             for i in range(n) for j in range(n) for k in range(n)]
+    return assemble_mesh_3d(coords, cells, [0] * len(cells))
+
+
+def test_mesh_solver_neutron_balance_3d():
+    # The same global invariant for the unstructured 3D mesh solver, computed
+    # independently of the structured solver it is usually cross-checked against:
+    # production and absorption from the cross sections and the volume-integrated
+    # flux, leakage read out of the mesh operator (apply minus the removal*volume
+    # diagonal telescopes to the boundary current). This is the mesh solver's own
+    # conservation check -- it does not lean on any other solver being correct.
+    mesh = _hex_grid(16, 80.0)
+    mats, cm = [PWR_TWO_GROUP], np.zeros(mesh.n_cells, int)
+    solver = UnstructuredDiffusionSolver(mesh, mats, cm, alpha_boundary=0.5, device="cpu")
+    res = solver.solve(tol_k=1e-10, tol_source=1e-9)
+    assert res.converged
+
+    G, vol = solver.G, solver.area
+    phi = [res.flux[g] for g in range(G)]
+    nsf = [np.array([mats[m].nu_sigma_f[g] for m in cm]) for g in range(G)]
+    sigma_a = [np.array([mats[m].sigma_a[g] for m in cm]) for g in range(G)]
+    removal = [np.array([mats[m].removal[g] for m in cm]) for g in range(G)]
+
+    production = float(sum((nsf[g] * phi[g] * vol).sum() for g in range(G)))
+    absorption = float(sum((sigma_a[g] * phi[g] * vol).sum() for g in range(G)))
+    leakage = float(sum((solver.ops[g].apply(phi[g]) - removal[g] * vol * phi[g]).sum()
+                        for g in range(G)))
+
+    prod_over_k = production / res.k_eff
+    rel = abs(prod_over_k - (absorption + leakage)) / prod_over_k
+    assert rel < 1e-8, f"production/k={prod_over_k:.6g} vs abs+leak={absorption+leakage:.6g} (rel {rel:.1e})"
+    assert 0.0 < leakage < prod_over_k               # a bare box leaks, but not everything
 
 
 def test_balance_reflected_core_has_small_leakage():
