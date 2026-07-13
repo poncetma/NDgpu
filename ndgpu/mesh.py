@@ -11,13 +11,15 @@ The scheme is a cell-centred two-point-flux finite volume: for a face shared by
 cells i and j, the coupling is D_face * L_face / d(centroid_i, centroid_j) with
 D_face the harmonic mean of the cell diffusion coefficients; boundary faces get
 the Robin/albedo term (vacuum alpha = 1/2). The connectivity is irregular, but
-the within-group operator is still applied matrix-free: the off-diagonal
-coupling is a gather over face-neighbour cells scattered back with a segment sum
-(``bincount``, which both NumPy and CuPy provide), so the same code path runs on
-CPU or GPU and the solve reuses the structured solvers' Jacobi/Neumann-PCG. This
-puts the general-geometry track on the GPU alongside the structured lattices,
-rather than the earlier SciPy sparse direct factorisation. Power iteration drives
-the outer fission source.
+the within-group operator is still applied matrix-free as a pure *gather*: the
+faces are stored as a row-wise ELLPACK adjacency (each cell's neighbours padded
+to the maximum degree), and the apply reads each cell's neighbour fluxes and
+combines them with per-slot weights -- no scatter, hence no GPU atomics, and a
+coalesced write, the same access pattern that makes the structured stencils fast
+on CUDA. The single NumPy/CuPy code path runs on CPU or GPU and reuses the
+structured solvers' Jacobi/Neumann-PCG, putting the general-geometry track on the
+GPU alongside the structured lattices rather than the earlier SciPy sparse direct
+factorisation. Power iteration drives the outer fission source.
 """
 
 from __future__ import annotations
@@ -159,37 +161,64 @@ class MeshResult:
     inner_iterations: int = 0
 
 
+def _build_ell(face_i, face_j, n):
+    """Row-wise (ELLPACK) adjacency from a symmetric face list.
+
+    Each interior face (i, j) couples both endpoints, so it appears once in row
+    i (neighbour j) and once in row j (neighbour i). The rows are padded to the
+    maximum cell degree K and stored column-major, (K, n): ``nbr[s, c]`` is the
+    s-th neighbour cell of c and ``fidx[s, c]`` the face feeding that slot (-1 on
+    padding). Padding neighbours point at the cell itself with a zero weight, so
+    they are inert. This lets the operator apply be a *gather* (read each
+    neighbour's flux) with a coalesced write, instead of a *scatter* (atomic adds
+    on the GPU) -- the same access pattern that makes the structured stencils
+    fast on CUDA.
+    """
+    nf = face_i.size
+    owner = np.concatenate([face_i, face_j])
+    neigh = np.concatenate([face_j, face_i])
+    fidx = np.concatenate([np.arange(nf), np.arange(nf)]).astype(np.int64)
+    deg = np.bincount(owner, minlength=n)
+    K = max(int(deg.max()) if nf else 0, 1)
+    offset = np.zeros(n, dtype=np.int64)
+    if n:
+        offset[1:] = np.cumsum(deg)[:-1]
+    order = np.argsort(owner, kind="stable")
+    owner_s = owner[order]
+    slot = np.arange(owner.size) - offset[owner_s]           # 0..deg-1 within each row
+    nbr = np.tile(np.arange(n, dtype=np.int64), (K, 1))      # (K, n), self-padded
+    fmap = np.full((K, n), -1, dtype=np.int64)
+    if nf:
+        nbr[slot, owner_s] = neigh[order]
+        fmap[slot, owner_s] = fidx[order]
+    return nbr, fmap
+
+
 class _MeshGroupOperator:
     """Matrix-free within-group FV operator on an unstructured mesh.
 
     Exposes the same ``apply`` / ``inv_diag`` interface as the structured
     :class:`~ndgpu.operator.GroupOperator`, so it drops straight into the shared
-    Jacobi/Neumann-PCG. The connectivity is an explicit face list rather than a
-    shifted stencil: ``apply`` gathers the neighbour flux across every face and
-    scatters the ``-w * phi_neighbour`` coupling back onto both endpoints with a
-    segment sum (``bincount``). The assembled operator -- volume-integrated
-    harmonic-mean two-point-flux leakage, plus removal and the Robin boundary
-    term on the diagonal -- is symmetric and diagonally dominant, hence SPD, so
-    CG converges.
+    Jacobi/Neumann-PCG. The connectivity is an explicit ELLPACK adjacency
+    (:func:`_build_ell`) rather than a shifted stencil, but the apply is still a
+    pure *gather*: for every cell read its neighbours' flux and combine with the
+    per-slot weights, ``A phi = diag*phi - sum_s w[s]*phi[nbr[s]]``. No scatter,
+    so no GPU atomics and the write is coalesced. The assembled operator --
+    volume-integrated harmonic-mean two-point-flux leakage, plus removal and the
+    Robin boundary term on the diagonal -- is symmetric and diagonally dominant,
+    hence SPD, so CG converges.
     """
 
-    def __init__(self, xp, n_cells, face_i, face_j, face_w, diag):
+    def __init__(self, xp, nbr, w_ell, diag):
         self.xp = xp
-        self.n = n_cells
-        self.face_i = face_i          # (n_faces,) int, both device-resident
-        self.face_j = face_j
-        self.face_w = face_w          # (n_faces,) harmonic-mean D * L / d
-        self.diag = diag              # (n_cells,) assembled diagonal
+        self.nbr = nbr                # (K, n) int32 neighbour cell per slot
+        self.w_ell = w_ell            # (K, n) coupling weight per slot (0 on padding)
+        self.diag = diag              # (n,) assembled diagonal
         self.inv_diag = 1.0 / diag    # Jacobi preconditioner
 
     def apply(self, phi):
-        xp, n = self.xp, self.n
-        out = self.diag * phi
-        out = out - xp.bincount(self.face_i, weights=self.face_w * phi[self.face_j],
-                                minlength=n)
-        out = out - xp.bincount(self.face_j, weights=self.face_w * phi[self.face_i],
-                                minlength=n)
-        return out
+        gathered = phi[self.nbr]                      # (K, n) neighbour flux
+        return self.diag * phi - (self.w_ell * gathered).sum(axis=0)
 
 
 class UnstructuredDiffusionSolver:
@@ -231,11 +260,18 @@ class UnstructuredDiffusionSolver:
         bL = np.array([b[1] for b in mesh.bfaces], dtype=dtype)
         bd = np.array([b[2] for b in mesh.bfaces], dtype=dtype)
 
+        # ELLPACK adjacency (geometry, shared across groups); moved to device once.
+        nbr, fmap = _build_ell(fi, fj, n)
+        nbr_dev = xp.asarray(nbr.astype(np.int32))
+        fpad = np.where(fmap >= 0, fmap, 0)                    # safe index for padding
+
         self.ops = []
         for g in range(G):
             Dg = D[g]
             Di, Dj = Dg[fi], Dg[fj]
-            face_w = 2.0 * Di * Dj / (Di + Dj) * fL / fd          # harmonic-mean coupling
+            face_w = 2.0 * Di * Dj / (Di + Dj) * fL / fd       # harmonic-mean coupling
+            # per-slot weights (0 where padded); diag from the same face weights.
+            w_ell = np.where(fmap >= 0, face_w[fpad], 0.0).astype(dtype)
             diag = removal[g] * area
             diag = diag + np.bincount(fi, weights=face_w, minlength=n)
             diag = diag + np.bincount(fj, weights=face_w, minlength=n)
@@ -243,8 +279,7 @@ class UnstructuredDiffusionSolver:
                 bw = self.alpha * Dg[bi] * bL / (bd * self.alpha + Dg[bi])
                 diag = diag + np.bincount(bi, weights=bw, minlength=n)
             self.ops.append(_MeshGroupOperator(
-                xp, n, xp.asarray(fi), xp.asarray(fj), xp.asarray(face_w),
-                xp.asarray(diag)))
+                xp, nbr_dev, xp.asarray(w_ell), xp.asarray(diag)))
         self.preconds = [neumann_preconditioner(op.apply, op.inv_diag,
                                                  int(precond_degree))
                          for op in self.ops]
