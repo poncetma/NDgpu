@@ -122,3 +122,52 @@ def test_sph_correction_preserves_the_sp3_eigenvalue():
     assert err_homog > 20.0                      # homogenization alone has real error
     assert err_sph < 0.5                          # SPH restores the reference k
     assert np.allclose(out.factors, 1.0, atol=0.15)   # well-homogenized: factors near 1
+
+
+def _leaky_colorset():
+    # fuel | poisoned-fuel stripe | fuel, vacuum on the x ends (net leakage),
+    # reflective y. Three column homogenization regions. Unlike the reflective
+    # assembly this has genuine inter-region current, which is what makes the
+    # naive SPH fixed point oscillate and what SPH cannot fully absorb.
+    poison = Material(name="poison", diffusion=[1.15, 0.55], sigma_a=[0.009, 0.12],
+                      nu_sigma_f=[0, 0], sigma_s=[[0, 0.03], [0, 0]])
+    mats = [PWR_TWO_GROUP, poison]
+    n = 36
+    grid = Grid(shape=(n, 12, 1), size=(90.0, 30.0, 1.0))
+    dV = (90.0 / n) * (30.0 / 12)
+    mmap = np.zeros((n, 12, 1), dtype=np.int64)
+    mmap[n // 3:2 * n // 3, 4:8, :] = 1
+    region = np.zeros((n, 12, 1), dtype=np.int64)
+    region[n // 3:2 * n // 3, :, :] = 1
+    region[2 * n // 3:, :, :] = 2
+    return grid, mats, mmap, region, dV, ("vacuum", "reflective", "reflective")
+
+
+def test_sph_converges_and_improves_k_on_a_leaky_colorset():
+    # On a leaky problem the plain fixed point oscillates; Anderson converges it.
+    # SPH then greatly reduces the homogenization error, but -- unlike the
+    # reflective case -- it does NOT reach the reference: a single per-region
+    # factor matches reaction rates, not interface currents, so a leaky transport
+    # eigenvalue is only approached (exactness there needs discontinuity factors,
+    # or per-assembly reflective generation as real lattice codes do).
+    grid, mats, mmap, region, dV, bc = _leaky_colorset()
+    ref = SP3EigenSolver(grid, mats, material_map=mmap, bc=bc,
+                         device="cpu").solve(tol_k=1e-9, tol_source=1e-8)
+    hmats, rflux, _ = flux_weighted_homogenize(ref.flux_numpy, mats, mmap, region,
+                                               cell_volume=dV)
+
+    def coarse_solve(materials):
+        res = DiffusionEigenSolver(grid, materials, material_map=region, bc=bc,
+                                   device="cpu").solve(tol_k=1e-10, tol_source=1e-9)
+        return region_average(res.flux_numpy, region), res.k_eff
+
+    k_homog = coarse_solve(hmats)[1]
+    out = sph_correct(hmats, region, rflux, coarse_solve, tol=1e-9, depth=5)
+
+    err_homog = abs(k_homog - ref.k_eff) * 1e5
+    err_sph = abs(out.k_eff - ref.k_eff) * 1e5
+    assert out.converged                              # Anderson tames the oscillation
+    assert out.iterations < 40                        # and does so quickly
+    assert err_homog > 100.0                          # homogenization is well off
+    assert err_sph < 0.25 * err_homog                 # SPH more than 4x closer
+    assert err_sph > 1.0                              # but a leaky floor remains

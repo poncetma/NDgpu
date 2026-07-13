@@ -159,8 +159,27 @@ class SphResult:
     converged: bool
 
 
+def _anderson_step(X, F, beta):
+    """One Anderson-acceleration update from a history of iterates and residuals.
+
+    X : list of past log-factor vectors x_k (flattened). F : list of residuals
+    f_k = g(x_k) - x_k. Returns the next iterate: the least-squares mixture of
+    the history that minimizes the combined residual, damped by beta. With a
+    single point this is plain relaxed fixed-point x + beta*f.
+    """
+    m = len(F)
+    fk = F[-1]
+    if m == 1:
+        return X[-1] + beta * fk
+    # least squares over residual differences (unconstrained form, Walker-Ni)
+    dF = np.column_stack([F[i + 1] - F[i] for i in range(m - 1)])   # (n, m-1)
+    dX = np.column_stack([X[i + 1] - X[i] for i in range(m - 1)])
+    gamma, *_ = np.linalg.lstsq(dF, fk, rcond=None)
+    return X[-1] + beta * fk - (dX + beta * dF) @ gamma
+
+
 def sph_correct(homogenized_materials, region_map, reference_region_flux, solve,
-                max_iter=200, tol=1e-8, relax=1.0) -> SphResult:
+                max_iter=200, tol=1e-8, relax=1.0, depth=5) -> SphResult:
     """Solve for the SPH factors that make a coarse solve reproduce the reference.
 
     The superhomogenization factor mu_{i,g} multiplies every cross section of
@@ -169,8 +188,14 @@ def sph_correct(homogenized_materials, region_map, reference_region_flux, solve,
     condition is ``mu_{i,g} * Phi_{i,g} == phi_ref_{i,g}`` (not Phi == phi_ref),
     which preserves the region reaction rates and hence the eigenvalue on the
     generation geometry. The fixed point ``mu <- phi_ref / Phi(mu)`` is iterated
-    to convergence; fluxes are normalized to a common total each step so only
-    the shape matters.
+    to convergence in log(mu) space; fluxes are normalized to a common total each
+    step so only the shape matters.
+
+    For a reflective single assembly the plain fixed point converges. On a leaky
+    colorset or whole core the fixed point oscillates (a region whose flux dips
+    gets its absorption scaled up, dipping it further), so the iteration is
+    Anderson-accelerated over a short history of log-factor residuals; set
+    ``depth=1`` to recover the plain (optionally relaxed) fixed point.
 
     homogenized_materials : R Materials (e.g. from
         :func:`flux_weighted_homogenize`), indexed by region.
@@ -180,28 +205,34 @@ def sph_correct(homogenized_materials, region_map, reference_region_flux, solve,
     solve                 : callable(materials) -> (region_flux (R, G), k_eff),
         running the coarse diffusion solve with the given per-region materials
         (the caller wires up grid, geometry and boundary conditions).
-    relax                 : optional under-relaxation in (0, 1] on log(mu);
-        1.0 is the plain fixed point (stable for well-homogenized generation
-        problems).
+    relax                 : damping beta in (0, 1] on the log(mu) update; 1.0 is
+        undamped. depth : Anderson history length (1 disables acceleration).
     """
     R = len(homogenized_materials)
     ref = np.asarray(reference_region_flux, dtype=float)
-    ref_n = ref / ref.sum()
-    mu = np.ones_like(ref)
+    ln_ref_n = np.log(ref / ref.sum())
+    shape = ref.shape
+    x = np.zeros(ref.size)                            # x = log(mu), start mu = 1
+    X, F = [], []
     k = float("nan")
     converged = False
     for it in range(1, max_iter + 1):
+        mu = np.exp(x).reshape(shape)
         region_flux, k = solve([_scale_material(homogenized_materials[i], mu[i])
                                 for i in range(R)])
         phi = np.asarray(region_flux, dtype=float)
-        mu_new = ref_n / (phi / phi.sum())
-        if relax != 1.0:
-            mu_new = mu ** (1.0 - relax) * mu_new ** relax
-        err = np.abs(mu_new / mu - 1.0).max()
-        mu = mu_new
+        ln_phi_n = np.log(phi / phi.sum()).reshape(-1)
+        g = ln_ref_n.reshape(-1) - ln_phi_n           # g(x): the fixed-point map
+        f = g - x                                     # residual
+        err = np.abs(np.expm1(f)).max()               # |mu_new/mu - 1|
         if err < tol:
             converged = True
             break
+        X.append(x); F.append(f)
+        if len(F) > depth:
+            X.pop(0); F.pop(0)
+        x = _anderson_step(X, F, relax)
+    mu = np.exp(x).reshape(shape)
     corrected = [_scale_material(homogenized_materials[i], mu[i]) for i in range(R)]
     return SphResult(corrected_materials=corrected, factors=mu, k_eff=k,
                      iterations=it, converged=converged)
