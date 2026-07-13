@@ -110,11 +110,28 @@ NDgpu reactor solution
 ```
 
 `Model` accepts 1-D, 2-D or 3-D `size`/`cells`, `method="diffusion"` or `"sp3"`,
-per-face boundary names (`"vacuum"`, `"reflective"`, `"zero-flux"`, or an albedo),
-and returns the raw `k_eff`, `flux`, and balance fractions as plain values. For
-full control (unstructured meshes, triangular lattices, transients, adjoint) use
-the solver classes directly — see `examples/`. Runnable: `examples/bare_reactor.py`,
-`examples/reflected_core.py`.
+`adjoint=True` for the importance solve, and per-face boundary names (`"vacuum"`,
+`"reflective"`, `"zero-flux"`, or an albedo). Two sibling builders reach the other
+geometry backends with the same report:
+
+| Builder | Geometry | Examples |
+|---|---|---|
+| `ndgpu.Model` | structured Cartesian (1/2/3-D), diffusion/SP3, adjoint | `bare_reactor.py`, `reflected_core.py`, `adjoint_importance.py` |
+| `ndgpu.MeshModel` | arbitrary unstructured mesh (Gmsh or assembled), 2/3-D | `unstructured_mesh.py` |
+| `ndgpu.HexLattice` | hexagonal assembly lattice on the triangular solver, diffusion/SP3 | `hex_lattice.py` |
+
+```python
+# unstructured mesh: paint by tag, centroid box, or a predicate on the centroid
+ndgpu.MeshModel("core.msh").fill(reflector).assign(fuel, tag=1).set_boundary("vacuum").run()
+
+# hexagonal lattice on the body-fitted triangular solver
+(ndgpu.HexLattice(pitch=20, refine=4)
+ .set_site((0, 0), fuel).set_site((1, 0), reflector)
+ .set_boundary("vacuum").run(method="sp3"))
+```
+
+All three return raw `k_eff`, `flux`, and balance fractions as plain values. For
+transients, SPH, or the lower-level knobs, use the solver classes directly.
 
 ## Repository map
 

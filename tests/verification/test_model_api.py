@@ -10,8 +10,11 @@ human-readable summary.
 import numpy as np
 import pytest
 
-from ndgpu import (DiffusionEigenSolver, Grid, Material, Model, ONE_GROUP_DEMO,
-                   PWR_TWO_GROUP, k_bare_box)
+from ndgpu import (DiffusionEigenSolver, Grid, HexLattice, Material, MeshModel,
+                   Model, ONE_GROUP_DEMO, PWR_TWO_GROUP, k_bare_box)
+from ndgpu.mesh import UnstructuredDiffusionSolver, assemble_mesh_3d
+from ndgpu.hexraster import rasterize_hex_sites
+from ndgpu.tri import TriDiffusionEigenSolver, TriGrid
 
 _REFLECTOR = Material(name="reflector", diffusion=[1.13, 0.16], sigma_a=[0.0004, 0.0197],
                       nu_sigma_f=[0.0, 0.0], sigma_s=[[0.0, 0.0494], [0.0, 0.0]])
@@ -106,3 +109,103 @@ def test_helpful_errors():
     with pytest.raises(ValueError):
         (Model(size=(10.0,), cells=(4,)).fill(ONE_GROUP_DEMO)  # mixed group counts
          .add_box(_FUEL, x=(0, 5)).run())
+
+
+# --- structured adjoint --------------------------------------------------
+def test_adjoint_run_matches_forward_eigenvalue():
+    build = lambda: Model(size=(90.0, 90.0, 90.0), cells=(16, 16, 16)).fill(_FUEL).set_boundary("vacuum")
+    fwd = build().run(**TOL)
+    adj = build().run(adjoint=True, **TOL)
+    assert adj.adjoint and not fwd.adjoint
+    assert adj.k_eff == pytest.approx(fwd.k_eff, abs=1e-6)
+    text = adj.summary()
+    assert "adjoint" in text and "importance" in text
+    assert "where the fission neutrons go" not in text   # physical balance suppressed
+
+
+# --- unstructured MeshModel ----------------------------------------------
+def _hex_mesh(n, L):
+    dx = L / n
+    nid, coords = {}, []
+
+    def gid(i, j, k):
+        if (i, j, k) not in nid:
+            nid[(i, j, k)] = len(coords); coords.append((i * dx, j * dx, k * dx))
+        return nid[(i, j, k)]
+
+    cells = [(gid(i, j, k), gid(i + 1, j, k), gid(i + 1, j + 1, k), gid(i, j + 1, k),
+              gid(i, j, k + 1), gid(i + 1, j, k + 1), gid(i + 1, j + 1, k + 1), gid(i, j + 1, k + 1))
+             for i in range(n) for j in range(n) for k in range(n)]
+    return assemble_mesh_3d(coords, cells, [0] * len(cells))
+
+
+def test_meshmodel_reproduces_low_level_solver():
+    # The mesh wrapper only wires up the solver; it must give the identical k as
+    # calling UnstructuredDiffusionSolver by hand on the same painted mesh.
+    mesh = _hex_mesh(12, 120.0)
+    mm = (MeshModel(mesh).fill(_REFLECTOR)
+          .add_box(_FUEL, x=(30, 90), y=(30, 90), z=(30, 90)).set_boundary("vacuum"))
+    k_model = mm.run(**TOL).k_eff
+
+    cm = np.zeros(mesh.n_cells, np.int64)
+    c = mesh.centroid
+    sel = ((c[:, 0] >= 30) & (c[:, 0] <= 90) & (c[:, 1] >= 30) & (c[:, 1] <= 90)
+           & (c[:, 2] >= 30) & (c[:, 2] <= 90))
+    cm[sel] = 1
+    k_low = UnstructuredDiffusionSolver(mesh, [_REFLECTOR, _FUEL], cm,
+                                        alpha_boundary=0.5).solve(**TOL).k_eff
+    assert k_model == pytest.approx(k_low, rel=0, abs=1e-9)
+
+
+def test_meshmodel_assign_by_tag_and_balance():
+    # Tag half the cells; assign() by tag must paint exactly those, and the
+    # volume-weighted balance and per-material report must be consistent.
+    dx = 10.0
+    nid, coords, cells, tags = {}, [], [], []
+
+    def gid(i, j, k):
+        if (i, j, k) not in nid:
+            nid[(i, j, k)] = len(coords); coords.append((i * dx, j * dx, k * dx))
+        return nid[(i, j, k)]
+
+    for i in range(8):
+        for j in range(4):
+            for k in range(4):
+                cells.append((gid(i, j, k), gid(i + 1, j, k), gid(i + 1, j + 1, k), gid(i, j + 1, k),
+                              gid(i, j, k + 1), gid(i + 1, j, k + 1), gid(i + 1, j + 1, k + 1), gid(i, j + 1, k + 1)))
+                tags.append(1 if i < 4 else 2)          # left half tag 1, right half tag 2
+    mesh = assemble_mesh_3d(coords, cells, tags)
+    mm = MeshModel(mesh).fill(_REFLECTOR).assign(_FUEL, tag=1).set_boundary("vacuum")
+    res = mm.run(**TOL)
+    assert res.absorbed_fraction + res.leakage_fraction == pytest.approx(1.0, abs=1e-9)
+    rows = {name: (volf, fisf) for name, volf, _f, fisf in res._material_stats}
+    assert rows["fuel"][0] == pytest.approx(0.5, abs=1e-9)       # tag 1 is half the cells
+    assert rows["fuel"][1] == pytest.approx(1.0, abs=1e-6)       # only the fuel fissions
+
+
+# --- triangular HexLattice -----------------------------------------------
+def test_hexlattice_reproduces_low_level_tri_solver():
+    lat = HexLattice(pitch=20.0, refine=3).set_boundary("vacuum")
+    lat.set_site((0, 0), _FUEL)
+    for rc in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+        lat.set_site(rc, _REFLECTOR)
+    k_model = lat.run(method="diffusion", **TOL).k_eff
+
+    # rebuild the same raster/solver by hand: ids 1=fuel, 2=reflector, 0=void
+    void = Material(name="void", diffusion=[1.0, 1.0], sigma_a=[0.0, 0.0], nu_sigma_f=[0.0, 0.0])
+    site_mat = {(0, 0): 1, (1, 0): 2, (-1, 0): 2, (0, 1): 2, (0, -1): 2}
+    raster = rasterize_hex_sites(site_mat, 20.0, 3)
+    grid = TriGrid(shape=raster.material_map.shape, side=raster.side)
+    k_low = TriDiffusionEigenSolver(grid, [void, _FUEL, _REFLECTOR], raster.material_map,
+                                    active=raster.material_map > 0,
+                                    mask_bc="vacuum").solve(**TOL).k_eff
+    assert k_model == pytest.approx(k_low, rel=0, abs=1e-9)
+
+
+def test_hexlattice_sp3_differs_from_diffusion():
+    lat = HexLattice(pitch=18.0, refine=3).set_boundary("vacuum").set_site((0, 0), _FUEL)
+    for rc in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, -1), (-1, 1)]:
+        lat.set_site(rc, _REFLECTOR)
+    kd = lat.run(method="diffusion", **TOL).k_eff
+    ks = lat.run(method="sp3", **TOL).k_eff
+    assert abs(ks - kd) * 1e5 > 20.0                    # SP3 is a distinct transport solution
