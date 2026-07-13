@@ -64,6 +64,58 @@ pip install -e .                 # CPU (NumPy)
 pip install -e .[cuda12]        # + CuPy for CUDA 12.x GPUs
 ```
 
+## Quickstart
+
+The `Model` front end defines a reactor in centimetres, paints regions with your
+own materials, and prints a human-readable solution. Define materials, geometry,
+and boundary conditions, then `run()`:
+
+```python
+import ndgpu
+from ndgpu import Material
+
+fuel = Material(name="fuel", diffusion=[1.26, 0.35], sigma_a=[0.012, 0.121],
+                nu_sigma_f=[0.0085, 0.185], sigma_s=[[0, 0.026], [0, 0]], chi=[1, 0])
+reflector = Material(name="reflector", diffusion=[1.15, 0.90], sigma_a=[0.0002, 0.005],
+                     nu_sigma_f=[0, 0], sigma_s=[[0, 0.045], [0, 0]])
+
+model = (ndgpu.Model(size=(120, 120, 120), cells=(40, 40, 40))   # cm
+         .fill(reflector)                                        # background
+         .add_box(fuel, x=(30, 90), y=(30, 90), z=(30, 90))      # central fuel block
+         .set_boundary("vacuum"))                                # leak from the surface
+
+print(model.run())          # solves on GPU if available, else CPU
+```
+
+```
+NDgpu reactor solution
+======================
+  geometry    : 120 x 120 x 120 cm,  40 x 40 x 40 cells (64,000)  [3D]
+  groups      : 2     method: diffusion     device: cpu (numpy)
+  boundary    : x: vacuum | y: vacuum | z: vacuum
+
+  k_eff       : 1.109007
+  reactivity  : +9829 pcm   (rho = (k-1)/k)
+  status      : converged in 29 outer / 681 inner iterations, 0.96 s
+
+  where the fission neutrons go (per neutron produced / k):
+    absorbed  :  96.3 %
+    leaked    :   3.7 %
+
+  flux peaking (thermal group): peak / average = 4.17
+
+  material           volume   fission
+    reflector        87.5%      0.0%
+    fuel             12.5%    100.0%
+```
+
+`Model` accepts 1-D, 2-D or 3-D `size`/`cells`, `method="diffusion"` or `"sp3"`,
+per-face boundary names (`"vacuum"`, `"reflective"`, `"zero-flux"`, or an albedo),
+and returns the raw `k_eff`, `flux`, and balance fractions as plain values. For
+full control (unstructured meshes, triangular lattices, transients, adjoint) use
+the solver classes directly — see `examples/`. Runnable: `examples/bare_reactor.py`,
+`examples/reflected_core.py`.
+
 ## Repository map
 
 | Directory | Contains |
