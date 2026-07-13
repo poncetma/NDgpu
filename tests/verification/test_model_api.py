@@ -265,3 +265,30 @@ def test_transient_requires_kinetics_and_reports():
     text = res.summary()
     for token in ("transient", "k0", "beta", "power P/P0", "steady"):
         assert token in text
+
+
+def test_hexlattice_builds_the_hpmr_core():
+    # The HP-MR assembly lattice maps onto HexLattice.set_site; building it there
+    # must reproduce the benchmark raster geometry exactly (drums as Be bodies,
+    # i.e. the arc-free core -- the sub-hex B4C arc is build_hpmr2d's job).
+    from ndgpu.benchmarks.hpmr import (_placeholder_materials, _FUEL_SITES,
+                                       _BE_SITES, _DRUM_SITES, PITCH, CENTRAL,
+                                       FUEL, BE_REFLECTOR, DRUM_BE, hpmr_raster)
+    from ndgpu.tri import TriGrid, TriDiffusionEigenSolver
+    mats = _placeholder_materials()
+    lat = HexLattice(pitch=PITCH, refine=3).set_boundary("vacuum")
+    lat.set_site((0, 0), mats[CENTRAL])
+    for s in _FUEL_SITES:
+        lat.set_site(s, mats[FUEL])
+    for s in _BE_SITES:
+        lat.set_site(s, mats[BE_REFLECTOR])
+    for s in _DRUM_SITES:
+        lat.set_site(s, mats[DRUM_BE])
+    k_api = lat.run(method="diffusion", tol_k=1e-9, tol_source=1e-8).k_eff
+
+    raster = hpmr_raster(3, 0.0, paint_absorber=False)
+    grid = TriGrid(shape=raster.material_map.shape, side=raster.side)
+    k_ref = TriDiffusionEigenSolver(grid, mats, raster.material_map,
+                                    active=raster.material_map > 0,
+                                    mask_bc="vacuum").solve(tol_k=1e-9, tol_source=1e-8).k_eff
+    assert k_api == pytest.approx(k_ref, abs=1e-6)

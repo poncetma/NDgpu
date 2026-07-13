@@ -175,6 +175,7 @@ Checked against **exact analytic solutions**, not just self-consistency:
 | Flux shape | fundamental sin×sin×sin mode, cosine similarity > 0.99999 |
 | Symmetry plane | half-core with reflective face reproduces full-core k to 1e-7 |
 | Reflected core | k between bare-core k and k_∞ |
+| **Reflected slab** (Lamarsh Ch. 7) | k matches the exact transcendental eigenvalue, 2nd order; reflector savings > bare; solved via both the low-level solver and the Model API (`examples/reflected_slab.py`) |
 
 At 64³ × 2 groups, k_eff is reproduced to ~1 pcm of the analytic value.
 
