@@ -10,20 +10,26 @@ their vertices, and per-cell materials.
 The scheme is a cell-centred two-point-flux finite volume: for a face shared by
 cells i and j, the coupling is D_face * L_face / d(centroid_i, centroid_j) with
 D_face the harmonic mean of the cell diffusion coefficients; boundary faces get
-the Robin/albedo term (vacuum alpha = 1/2). The connectivity is irregular, so
-the within-group operator is a sparse matrix (SciPy) rather than a shifted
-stencil -- correct and general, at the cost of the matrix-free locality the
-structured solvers enjoy. Power iteration drives the outer fission source.
+the Robin/albedo term (vacuum alpha = 1/2). The connectivity is irregular, but
+the within-group operator is still applied matrix-free: the off-diagonal
+coupling is a gather over face-neighbour cells scattered back with a segment sum
+(``bincount``, which both NumPy and CuPy provide), so the same code path runs on
+CPU or GPU and the solve reuses the structured solvers' Jacobi/Neumann-PCG. This
+puts the general-geometry track on the GPU alongside the structured lattices,
+rather than the earlier SciPy sparse direct factorisation. Power iteration drives
+the outer fission source.
 """
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 
 import numpy as np
-import scipy.sparse as sp
-from scipy.sparse.linalg import splu
+
+from .backend import asnumpy, device_name, get_backend, synchronize
+from .linalg import neumann_preconditioner, pcg
 
 
 _VACUUM_ALPHA = 0.5
@@ -149,87 +155,162 @@ class MeshResult:
     converged: bool
     outer_iterations: int
     solve_seconds: float
+    device: str = "cpu (numpy)"
+    inner_iterations: int = 0
+
+
+class _MeshGroupOperator:
+    """Matrix-free within-group FV operator on an unstructured mesh.
+
+    Exposes the same ``apply`` / ``inv_diag`` interface as the structured
+    :class:`~ndgpu.operator.GroupOperator`, so it drops straight into the shared
+    Jacobi/Neumann-PCG. The connectivity is an explicit face list rather than a
+    shifted stencil: ``apply`` gathers the neighbour flux across every face and
+    scatters the ``-w * phi_neighbour`` coupling back onto both endpoints with a
+    segment sum (``bincount``). The assembled operator -- volume-integrated
+    harmonic-mean two-point-flux leakage, plus removal and the Robin boundary
+    term on the diagonal -- is symmetric and diagonally dominant, hence SPD, so
+    CG converges.
+    """
+
+    def __init__(self, xp, n_cells, face_i, face_j, face_w, diag):
+        self.xp = xp
+        self.n = n_cells
+        self.face_i = face_i          # (n_faces,) int, both device-resident
+        self.face_j = face_j
+        self.face_w = face_w          # (n_faces,) harmonic-mean D * L / d
+        self.diag = diag              # (n_cells,) assembled diagonal
+        self.inv_diag = 1.0 / diag    # Jacobi preconditioner
+
+    def apply(self, phi):
+        xp, n = self.xp, self.n
+        out = self.diag * phi
+        out = out - xp.bincount(self.face_i, weights=self.face_w * phi[self.face_j],
+                                minlength=n)
+        out = out - xp.bincount(self.face_j, weights=self.face_w * phi[self.face_i],
+                                minlength=n)
+        return out
 
 
 class UnstructuredDiffusionSolver:
     """Multigroup k-eigenvalue diffusion FV solver on an arbitrary Gmsh mesh.
 
-    materials      : list of Material (all same group count, no upscatter).
+    materials      : list of Material (all same group count, up- or down-scatter).
     cell_material  : (n_cells,) index into `materials` for each cell.
     alpha_boundary : Robin coefficient on every boundary face (0.5 = vacuum,
                      0 = reflective, or a custom albedo).
+    device         : "auto" (GPU if present) | "gpu" | "cpu".
+    precond_degree : Neumann-polynomial preconditioner degree for the inner CG
+                     (0 = plain Jacobi, the default), as on the structured
+                     solvers.
     """
 
-    def __init__(self, mesh: Mesh, materials, cell_material, alpha_boundary=_VACUUM_ALPHA):
+    def __init__(self, mesh: Mesh, materials, cell_material,
+                 alpha_boundary=_VACUUM_ALPHA, device="auto",
+                 precond_degree=0, dtype=np.float64):
+        self.xp = xp = get_backend(device)
+        self.device = device_name(xp)
+        self.dtype = dtype
         self.mesh = mesh
         self.mats = list(materials)
-        self.cm = np.asarray(cell_material)
+        self.cm = cm = np.asarray(cell_material)
         self.alpha = float(alpha_boundary)
-        self.G = self.mats[0].n_groups
-        self.D = [np.array([self.mats[m].diffusion[g] for m in self.cm]) for g in range(self.G)]
-        self.removal = [np.array([self.mats[m].removal[g] for m in self.cm]) for g in range(self.G)]
-        self.nsf = [np.array([self.mats[m].nu_sigma_f[g] for m in self.cm]) for g in range(self.G)]
-        self.chi = [np.array([self.mats[m].chi[g] for m in self.cm]) for g in range(self.G)]
-        # scattering g'->g for every off-diagonal pair (both down- and
-        # up-scatter); lagged one outer iteration through the group source.
+        self.G = G = self.mats[0].n_groups
+        n = mesh.n_cells
+
+        area = np.asarray(mesh.area, dtype=dtype)
+        D = [np.array([self.mats[m].diffusion[g] for m in cm], dtype=dtype) for g in range(G)]
+        removal = [np.array([self.mats[m].removal[g] for m in cm], dtype=dtype) for g in range(G)]
+
+        # Face and boundary connectivity as flat arrays (host; moved to device).
+        fi = np.array([f[0] for f in mesh.faces], dtype=np.int64)
+        fj = np.array([f[1] for f in mesh.faces], dtype=np.int64)
+        fL = np.array([f[2] for f in mesh.faces], dtype=dtype)
+        fd = np.array([f[3] for f in mesh.faces], dtype=dtype)
+        bi = np.array([b[0] for b in mesh.bfaces], dtype=np.int64)
+        bL = np.array([b[1] for b in mesh.bfaces], dtype=dtype)
+        bd = np.array([b[2] for b in mesh.bfaces], dtype=dtype)
+
+        self.ops = []
+        for g in range(G):
+            Dg = D[g]
+            Di, Dj = Dg[fi], Dg[fj]
+            face_w = 2.0 * Di * Dj / (Di + Dj) * fL / fd          # harmonic-mean coupling
+            diag = removal[g] * area
+            diag = diag + np.bincount(fi, weights=face_w, minlength=n)
+            diag = diag + np.bincount(fj, weights=face_w, minlength=n)
+            if self.alpha != 0.0:
+                bw = self.alpha * Dg[bi] * bL / (bd * self.alpha + Dg[bi])
+                diag = diag + np.bincount(bi, weights=bw, minlength=n)
+            self.ops.append(_MeshGroupOperator(
+                xp, n, xp.asarray(fi), xp.asarray(fj), xp.asarray(face_w),
+                xp.asarray(diag)))
+        self.preconds = [neumann_preconditioner(op.apply, op.inv_diag,
+                                                 int(precond_degree))
+                         for op in self.ops]
+
+        # Source data, device-resident.
+        self.area = xp.asarray(area)
+        self.nsf = [xp.asarray(np.array([self.mats[m].nu_sigma_f[g] for m in cm], dtype=dtype))
+                    for g in range(G)]
+        self.chi = [xp.asarray(np.array([self.mats[m].chi[g] for m in cm], dtype=dtype))
+                    for g in range(G)]
+        # scattering g'->g (both down- and up-scatter); lagged through the source.
         self.scat = {}
-        for gf in range(self.G):
-            for gt in range(self.G):
+        for gf in range(G):
+            for gt in range(G):
                 if gt != gf:
-                    col = np.array([self.mats[m].sigma_s[gf, gt] for m in self.cm])
+                    col = np.array([self.mats[m].sigma_s[gf, gt] for m in cm], dtype=dtype)
                     if np.any(col):
-                        self.scat[(gf, gt)] = col
+                        self.scat[(gf, gt)] = xp.asarray(col)
 
-    def _operator(self, g, extra_diag=None):
-        """Sparse within-group operator A_g (integrated over cell volumes)."""
-        m = self.mesh
-        D = self.D[g]
-        diag = (self.removal[g] * m.area).astype(float).copy()
-        if extra_diag is not None:
-            diag = diag + extra_diag
-        I, J, V = [], [], []
-        for i, j, L, d in m.faces:
-            w = 2.0 * D[i] * D[j] / (D[i] + D[j]) * L / d
-            diag[i] += w
-            diag[j] += w
-            I += [i, j]
-            J += [j, i]
-            V += [-w, -w]
-        if self.alpha != 0.0:
-            for i, L, db in m.bfaces:
-                diag[i] += self.alpha * D[i] * L / (db * self.alpha + D[i])
-        I += list(range(m.n_cells))
-        J += list(range(m.n_cells))
-        V += list(diag)
-        return sp.csc_matrix((V, (I, J)), shape=(m.n_cells, m.n_cells))
-
-    def solve(self, tol_k=1e-7, max_outer=1000) -> MeshResult:
-        import time
+    def solve(self, tol_k=1e-7, tol_source=1e-8, max_outer=1000,
+              inner_rtol_floor=1e-11) -> MeshResult:
+        xp, G = self.xp, self.G
+        synchronize(xp)
         t0 = time.perf_counter()
-        m = self.mesh
-        A = m.area
-        lu = [splu(self._operator(g)) for g in range(self.G)]
-        phi = [np.ones(m.n_cells) for _ in range(self.G)]
+        n = self.mesh.n_cells
+        area = self.area
+        phi = [xp.ones(n, dtype=self.dtype) for _ in range(G)]
         k = 1.0
+        F = sum(self.nsf[g] * phi[g] for g in range(G))
+        total = xp.sum(F)
         conv = False
+        inner_total = 0
+        src_err = 1.0
         for outer in range(1, max_outer + 1):
-            F = sum(self.nsf[g] * phi[g] for g in range(self.G))
-            Ftot = F.sum()
-            for g in range(self.G):
-                q = self.chi[g] / k * F * A
+            # Inner CG tolerance tracks the outer residual: loose early, tight late.
+            rtol = min(1e-3, max(0.1 * src_err, inner_rtol_floor, 0.01 * tol_source))
+            for g in range(G):
+                q = self.chi[g] / k * F * area
                 for (gf, gt), col in self.scat.items():
                     if gt == g:
-                        q = q + col * phi[gf] * A
-                phi[g] = lu[g].solve(q)
-            Fn = sum(self.nsf[g] * phi[g] for g in range(self.G))
-            k_new = k * Fn.sum() / Ftot
-            if abs(k_new - k) < tol_k and outer > 5:
-                k = k_new
+                        q = q + col * phi[gf] * area
+                phi[g], n_it = pcg(self.ops[g].apply, q, phi[g], self.ops[g].inv_diag,
+                                   xp, rtol=rtol, precond=self.preconds[g])
+                inner_total += n_it
+
+            Fn = sum(self.nsf[g] * phi[g] for g in range(G))
+            total_new = xp.sum(Fn)
+            k_new = k * float(total_new / total)
+
+            diff = Fn / total_new - F / total
+            src_err = float(xp.sqrt(xp.sum(diff * diff) / xp.sum((Fn / total_new) ** 2)))
+            dk = abs(k_new - k)
+
+            scale = n / float(total_new)
+            for g in range(G):
+                phi[g] = phi[g] * scale
+            F = Fn * scale
+            total = xp.sum(F)
+            k = k_new
+
+            if dk < tol_k and src_err < tol_source and outer > 5:
                 conv = True
                 break
-            k = k_new
-            s = m.n_cells / (Fn * A).sum()
-            for g in range(self.G):
-                phi[g] *= s
-        return MeshResult(k_eff=k, flux=np.array(phi), converged=conv,
-                          outer_iterations=outer, solve_seconds=time.perf_counter() - t0)
+
+        synchronize(xp)
+        flux = np.array([asnumpy(phi[g]) for g in range(G)])
+        return MeshResult(k_eff=k, flux=flux, converged=conv, outer_iterations=outer,
+                          solve_seconds=time.perf_counter() - t0, device=self.device,
+                          inner_iterations=inner_total)

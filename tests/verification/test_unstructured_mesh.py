@@ -67,6 +67,34 @@ def test_unstructured_matches_tri_on_hpmr_staircase():
         assert k_tri == pytest.approx(k_mesh, abs=1e-6), (angle, k_tri, k_mesh)
 
 
+def test_matrix_free_apply_equals_assembled_operator():
+    # The matrix-free within-group apply (a bincount scatter over the face list)
+    # must equal an explicitly assembled dense operator built from the same
+    # face/boundary weights -- this pins the one piece of new logic, the segment
+    # sum, independent of the eigensolve. A locally-refined mesh exercises the
+    # 2:1 hanging-node faces too.
+    from ndgpu.benchmarks.hpmr import hpmr_locally_refined_mesh
+    mesh, cm, mats, alpha = hpmr_locally_refined_mesh(
+        refine=3, drum_angle_deg=90.0, refine_drums=True)
+    solver = UnstructuredDiffusionSolver(mesh, mats, cm, alpha, device="cpu")
+    n = mesh.n_cells
+
+    D = np.array([mats[m].diffusion[0] for m in cm])
+    A_dense = np.zeros((n, n))
+    for i, j, L, d in mesh.faces:
+        w = 2.0 * D[i] * D[j] / (D[i] + D[j]) * L / d
+        A_dense[i, i] += w; A_dense[j, j] += w
+        A_dense[i, j] -= w; A_dense[j, i] -= w
+    for i, L, db in mesh.bfaces:
+        A_dense[i, i] += alpha * D[i] * L / (db * alpha + D[i])
+    A_dense[np.diag_indices(n)] += np.array([mats[m].removal[0] for m in cm]) * mesh.area
+
+    rng = np.random.default_rng(0)
+    for _ in range(3):
+        x = rng.standard_normal(n)
+        assert np.allclose(solver.ops[0].apply(x), A_dense @ x, rtol=0, atol=1e-9)
+
+
 def test_unstructured_reflective_is_kinf():
     # Reflective (alpha=0) on all faces -> k = k_inf, independent of geometry.
     mesh = _cartesian_quad_mesh(10, 50.0)
