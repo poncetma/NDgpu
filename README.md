@@ -145,6 +145,10 @@ the result carries both the power history and the initial `.steady` solution:
 All builders return raw `k_eff`, `flux`, and balance fractions as plain values.
 For SPH or the lower-level knobs, use the solver classes directly.
 
+Full API reference and a literature-validated worked example (the TWIGL
+benchmark, static + transient) are in **[docs/model_api.md](docs/model_api.md)**;
+runnable as `examples/twigl_benchmark.py`.
+
 ## Repository map
 
 | Directory | Contains |
