@@ -16,7 +16,8 @@ from .hex import HexDiffusionEigenSolver, HexGrid, offset_to_axial
 from .materials import Kinetics, Material, ONE_GROUP_DEMO, PWR_TWO_GROUP
 from .mesh import (Mesh, MeshResult, UnstructuredDiffusionSolver, assemble_mesh,
                   assemble_mesh_3d, read_gmsh)
-from .model import (HexLattice, MeshModel, Model, ModelResult, ReactorResult)
+from .model import (HexLattice, MeshModel, Model, ModelResult, ReactorResult,
+                   TransientModelResult)
 from .perturbation import first_order_reactivity
 from .solver import DiffusionEigenSolver, Result, SP3EigenSolver
 from .sph import (SphResult, flux_weighted_homogenize, region_average,
@@ -32,6 +33,7 @@ __all__ = [
     "HexLattice",
     "ModelResult",
     "ReactorResult",
+    "TransientModelResult",
     "DiffusionEigenSolver",
     "SP3EigenSolver",
     "TriDiffusionEigenSolver",

@@ -209,3 +209,59 @@ def test_hexlattice_sp3_differs_from_diffusion():
     kd = lat.run(method="diffusion", **TOL).k_eff
     ks = lat.run(method="sp3", **TOL).k_eff
     assert abs(ks - kd) * 1e5 > 20.0                    # SP3 is a distinct transport solution
+
+
+# --- transients ----------------------------------------------------------
+from ndgpu import Kinetics                                  # noqa: E402
+from ndgpu.transient import TransientSolver                 # noqa: E402
+
+_KIN = dict(velocities=[1.0e7, 3.0e5], beta=[0.0065], decay=[0.08])
+
+
+def _transient_core():
+    return (Model(size=(200.0, 200.0, 200.0), cells=(10, 10, 10))
+            .fill(_FUEL).set_boundary("vacuum").set_kinetics(**_KIN))
+
+
+def test_transient_unperturbed_stays_at_equilibrium():
+    # The steady eigenvalue k0 normalises the fission source, so with no change
+    # the reactor sits exactly at P/P0 = 1 for the whole transient.
+    res = _transient_core().transient(t_end=1.0, dt=0.05)
+    assert np.allclose(res.power, 1.0, atol=1e-6)
+    assert res.k0 == pytest.approx(res.steady.k_eff, abs=1e-12)   # steady exposed on result
+
+
+def test_transient_reproduces_low_level_solver():
+    # A thermal-absorption step; Model.transient must give the same power trace
+    # as driving TransientSolver directly with the equivalent problem_at.
+    hot = Material(name="fuel", diffusion=_FUEL.diffusion, sigma_a=[0.01207, 0.1240],
+                   nu_sigma_f=_FUEL.nu_sigma_f, sigma_s=_FUEL.sigma_s, chi=_FUEL.chi)
+    mats_at = lambda t: [_FUEL if t <= 0 else hot]
+    res = _transient_core().transient(t_end=0.6, dt=0.02, materials_at=mats_at)
+
+    grid = Grid(shape=(10, 10, 10), size=(200.0, 200.0, 200.0))
+    kin = Kinetics(**_KIN)
+    tres = TransientSolver(grid, lambda t: ([_FUEL if t <= 0 else hot], None), kin,
+                           bc="vacuum", device="cpu").solve(t_end=0.6, dt=0.02)
+    assert np.allclose(res.power, tres.power, rtol=1e-6, atol=1e-9)
+
+
+def test_transient_rod_insertion_lowers_power_positive_raises_it():
+    def step(dsig):                                          # change thermal absorption
+        pert = Material(name="fuel", diffusion=_FUEL.diffusion,
+                        sigma_a=[0.01207, 0.1210 + dsig], nu_sigma_f=_FUEL.nu_sigma_f,
+                        sigma_s=_FUEL.sigma_s, chi=_FUEL.chi)
+        return lambda t: [_FUEL if t <= 0 else pert]
+    down = _transient_core().transient(t_end=1.0, dt=0.02, materials_at=step(+0.0020))
+    up = _transient_core().transient(t_end=1.0, dt=0.02, materials_at=step(-0.0003))
+    assert down.final_power < 0.95 and down.power.min() > 0.0    # rod in -> falls, stays physical
+    assert up.final_power > 1.05                                 # positive rho -> rises
+
+
+def test_transient_requires_kinetics_and_reports():
+    with pytest.raises(ValueError):
+        Model(size=(50.0,), cells=(5,)).fill(_FUEL).transient(t_end=0.1, dt=0.05)
+    res = _transient_core().transient(t_end=0.2, dt=0.05)
+    text = res.summary()
+    for token in ("transient", "k0", "beta", "power P/P0", "steady"):
+        assert token in text

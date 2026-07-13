@@ -130,8 +130,20 @@ ndgpu.MeshModel("core.msh").fill(reflector).assign(fuel, tag=1).set_boundary("va
  .set_boundary("vacuum").run(method="sp3"))
 ```
 
-All three return raw `k_eff`, `flux`, and balance fractions as plain values. For
-transients, SPH, or the lower-level knobs, use the solver classes directly.
+A `Model` also runs **transients**. It solves the steady state first (its
+eigenvalue `k0` normalises the fission source, so an unperturbed run stays at
+`P/P0 = 1`), then marches; the perturbation is a `materials_at(t)` callback and
+the result carries both the power history and the initial `.steady` solution:
+
+```python
+(model.set_kinetics(velocities=[1e7, 3e5], beta=[0.0065], decay=[0.08])
+      .transient(t_end=3.0, dt=0.02,
+                 materials_at=lambda t: [fuel, rod if t >= 0.5 else coolant]))
+# -> report with k0, a power-vs-time sparkline, peak/final P/P0; see examples/transient_rod_drop.py
+```
+
+All builders return raw `k_eff`, `flux`, and balance fractions as plain values.
+For SPH or the lower-level knobs, use the solver classes directly.
 
 ## Repository map
 

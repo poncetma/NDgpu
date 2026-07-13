@@ -30,10 +30,11 @@ import numpy as np
 
 from .grid import Grid
 from .hexraster import rasterize_hex_sites
-from .materials import Material
+from .materials import Kinetics, Material
 from .mesh import UnstructuredDiffusionSolver, read_gmsh
 from .operator import face_alpha
 from .solver import DiffusionEigenSolver, SP3EigenSolver
+from .transient import TransientSolver
 from .tri import TriDiffusionEigenSolver, TriGrid, TriSP3EigenSolver
 
 _STRUCTURED = {"diffusion": DiffusionEigenSolver, "sp3": SP3EigenSolver}
@@ -181,6 +182,77 @@ class ModelResult(ReactorResult):
             geometry_line=model._geometry_line(), boundary_line=model._boundary_line())
 
 
+_SPARK = " ▁▂▃▄▅▆▇█"
+
+
+class TransientModelResult:
+    """The outcome of :meth:`Model.transient`: the initial steady state plus the
+    power history.
+
+    Every transient begins from a steady-state solve, so that solution is kept
+    here as :attr:`steady` (a :class:`ModelResult`) and its eigenvalue as
+    :attr:`k0`; the perturbation drives the power away from ``P(0) = 1``. The
+    time and power arrays (:attr:`times`, :attr:`power`) are plain NumPy.
+    """
+
+    def __init__(self, model, tres, kinetics):
+        self.model = model
+        self.kinetics = kinetics
+        self.k0 = float(tres.k0)
+        self.times = np.asarray(tres.times)
+        self.power = np.asarray(tres.power)
+        self.device = tres.device
+        self.solve_seconds = tres.solve_seconds
+        self.total_inner_iterations = tres.total_inner_iterations
+        self.flux = tres.flux_numpy                    # final scalar flux
+        self.steady = ModelResult(model, tres.steady, "diffusion")
+        ip = int(np.argmax(self.power))
+        self.peak_power, self.peak_time = float(self.power[ip]), float(self.times[ip])
+        self.final_power, self.final_time = float(self.power[-1]), float(self.times[-1])
+        self.dt = float(self.times[1] - self.times[0]) if self.times.size > 1 else 0.0
+
+    def _sparkline(self, width=48):
+        p = self.power
+        idx = np.linspace(0, len(p) - 1, min(width, len(p))).round().astype(int)
+        s = p[idx]
+        lo, hi = float(s.min()), float(s.max())
+        lvl = (np.zeros(len(s), int) if hi - lo < 1e-12
+               else np.clip(((s - lo) / (hi - lo) * 8).astype(int), 0, 8))
+        return "".join(_SPARK[i] for i in lvl)
+
+    def summary(self) -> str:
+        kin = self.kinetics
+        fam = "family" if kin.n_families == 1 else "families"
+        lines = [
+            "NDgpu reactor transient",
+            "=======================",
+            f"  geometry    : {self.model._geometry_line()}",
+            f"  groups      : {self.steady.n_groups}     boundary: {self.model._boundary_line()}",
+            f"  kinetics    : {kin.n_families} delayed {fam}, beta = {kin.beta_total * 1e5:.0f} pcm",
+            "",
+            f"  initial steady state : k0 = {self.k0:.6f}  "
+            f"(fission source normalised by k0; unperturbed -> P/P0 stays 1)",
+            f"  time span            : 0 -> {self.final_time:g} s, dt = {self.dt:g} s, "
+            f"{self.times.size - 1} steps, {self.solve_seconds:.2f} s on {self.device}",
+            "",
+            "  power P/P0:",
+            f"    peak      : {self.peak_power:.4f} at t = {self.peak_time:g} s",
+            f"    final     : {self.final_power:.4f} at t = {self.final_time:g} s",
+            f"    trace     : {self._sparkline()}",
+            f"                [{self.power.min():.3g} .. {self.power.max():.3g}] over 0..{self.final_time:g} s",
+            "",
+            "  (.steady holds the full t=0 solution report)",
+        ]
+        return "\n".join(lines)
+
+    def __str__(self):
+        return self.summary()
+
+    def __repr__(self):
+        return (f"TransientModelResult(k0={self.k0:.6f}, P(end)={self.final_power:.4f} P0, "
+                f"peak {self.peak_power:.4f} at t={self.peak_time:g}s, on {self.device})")
+
+
 # ---------------------------------------------------------------------------
 # Structured Cartesian model
 # ---------------------------------------------------------------------------
@@ -211,6 +283,7 @@ class Model:
         self._materials: list[Material] = []
         self._map = np.zeros(self._shape, dtype=np.int64)
         self._bc = ["vacuum"] * self.ndim
+        self._kinetics = None
         self._centers = [(np.arange(n) + 0.5) * (L / n)
                          for n, L in zip(self._shape, self._size3)]
 
@@ -314,6 +387,63 @@ class Model:
         solver = _STRUCTURED[method](grid, material, **kw)
         res = solver.solve(tol_k=tol_k, tol_source=tol_source, adjoint=adjoint, **solve_kw)
         return ModelResult(self, res, method, adjoint=adjoint)
+
+    def set_kinetics(self, velocities, beta, decay, chi_delayed=None) -> "Model":
+        """Attach point-kinetics data for :meth:`transient` (one velocity per group,
+        one beta/decay per delayed-neutron family)."""
+        self._kinetics = Kinetics(velocities=velocities, beta=beta, decay=decay,
+                                  chi_delayed=chi_delayed)
+        return self
+
+    def transient(self, t_end: float, dt: float, kinetics=None, materials_at=None,
+                  at=None, device: str = "auto", **solve_kw) -> TransientModelResult:
+        """Run a time-dependent solve, starting from this model's steady state.
+
+        A steady eigenvalue solve is always performed first; its eigenvalue k0
+        normalises the fission source (the standard critical adjustment), so the
+        t=0 state is an exact equilibrium -- an unperturbed run stays at P/P0 = 1
+        and the power moves only in response to the perturbation. k0 and the full
+        initial solution are returned on the result (``.k0``, ``.steady``).
+
+        kinetics     : :class:`~ndgpu.Kinetics`, or set it earlier with
+                       :meth:`set_kinetics`.
+        materials_at : optional ``t -> list[Material]`` returning the materials
+                       (in this model's index order) at time t -- how the cross
+                       sections evolve (a rod ramp, a temperature feedback...).
+                       Return the *same* Material objects while nothing changes so
+                       operators are only rebuilt when they must be. Omit for an
+                       unperturbed run (which must stay at P/P0 = 1).
+        at           : advanced escape hatch -- a full ``t -> (materials,
+                       material_map)`` callback (lets the geometry move too).
+        """
+        if not self._materials:
+            raise ValueError("empty model: call fill() first")
+        kin = kinetics if kinetics is not None else self._kinetics
+        if kin is None:
+            raise ValueError("no kinetics: use set_kinetics(...) or transient(kinetics=...)")
+        groups = self._materials[0].n_groups
+        if any(m.n_groups != groups for m in self._materials):
+            raise ValueError("all materials must have the same number of groups")
+        if len(kin.velocities) != groups:
+            raise ValueError(f"kinetics.velocities must have {groups} entries (one per group)")
+
+        grid = Grid(shape=self._shape, size=self._size3)
+        if at is not None:
+            problem_at = at
+        else:
+            base, mp, cache = list(self._materials), self._map, {}
+
+            def problem_at(t):
+                mats = materials_at(t) if materials_at is not None else base
+                key = tuple(id(m) for m in mats)
+                if key not in cache:               # keep only the latest so operators
+                    cache.clear()                  # are rebuilt exactly when materials change
+                    cache[key] = list(mats)
+                return cache[key], mp
+
+        solver = TransientSolver(grid, problem_at, kin, bc=self._full_bc(), device=device)
+        tres = solver.solve(t_end=t_end, dt=dt, **solve_kw)
+        return TransientModelResult(self, tres, kin)
 
 
 # ---------------------------------------------------------------------------
