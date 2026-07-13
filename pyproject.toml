@@ -20,3 +20,9 @@ test = ["pytest"]
 
 [tool.setuptools.packages.find]
 include = ["ndgpu*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: expensive full-core solves (deselected by default; run with -m slow)",
+]
+addopts = "-m 'not slow'"

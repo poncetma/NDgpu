@@ -92,14 +92,22 @@ def flux_weighted_homogenize(flux, materials, material_map, region_map,
         region_volume[i] = vol
         region_flux[i] = (phi[:, cells] * Vi).sum(axis=1) / vol   # volume-average flux
 
+        # Fall back to volume weighting in any group with no flux (a void or a
+        # decoupled region), so the region still yields a finite Material rather
+        # than a division-by-zero; such regions carry no reaction rate and are
+        # frozen (mu = 1) by the SPH solve anyway.
+        wsafe = np.where(wsum > 0, wsum, 1.0)
+
         def fw(table):                                # flux-volume weighted, (G,)
-            return (table[cells].T * w).sum(axis=1) / wsum        # (G,)
+            fluxw = (table[cells].T * w).sum(axis=1) / wsafe      # (G,)
+            volw = (table[cells].T * Vi).sum(axis=1) / vol        # (G,)
+            return np.where(wsum > 0, fluxw, volw)
 
         sigma_a = fw(tab["sigma_a"])
         nu_sigma_f = fw(tab["nu_sigma_f"])
         sigma_t = fw(tab["sigma_t"])
         # diffusion: flux-weight the transport cross section 1/(3D), then invert
-        sigma_tr = (( (1.0 / (3.0 * tab["diffusion"]))[cells].T * w).sum(axis=1) / wsum)
+        sigma_tr = fw(1.0 / (3.0 * tab["diffusion"]))
         diffusion = 1.0 / (3.0 * sigma_tr)
         # scattering g->g' weighted by the source-group (g) flux-volume weight
         ss = tab["sigma_s"][cells]                    # (ni, G, G)
@@ -210,8 +218,14 @@ def sph_correct(homogenized_materials, region_map, reference_region_flux, solve,
     """
     R = len(homogenized_materials)
     ref = np.asarray(reference_region_flux, dtype=float)
-    ln_ref_n = np.log(ref / ref.sum())
     shape = ref.shape
+    # Freeze regions/groups with no reference flux (void, decoupled reflector):
+    # they carry no reaction rate, so their factor stays mu = 1 and is excluded
+    # from the residual and the flux normalization.
+    live = (ref > ref.max() * 1e-12).reshape(-1)
+    ref_flat = ref.reshape(-1)
+    ln_ref_n = np.zeros(ref.size)
+    ln_ref_n[live] = np.log(ref_flat[live] / ref_flat[live].sum())
     x = np.zeros(ref.size)                            # x = log(mu), start mu = 1
     X, F = [], []
     k = float("nan")
@@ -220,10 +234,11 @@ def sph_correct(homogenized_materials, region_map, reference_region_flux, solve,
         mu = np.exp(x).reshape(shape)
         region_flux, k = solve([_scale_material(homogenized_materials[i], mu[i])
                                 for i in range(R)])
-        phi = np.asarray(region_flux, dtype=float)
-        ln_phi_n = np.log(phi / phi.sum()).reshape(-1)
-        g = ln_ref_n.reshape(-1) - ln_phi_n           # g(x): the fixed-point map
-        f = g - x                                     # residual
+        phi = np.asarray(region_flux, dtype=float).reshape(-1)
+        ln_phi_n = np.zeros(ref.size)
+        ln_phi_n[live] = np.log(phi[live] / phi[live].sum())
+        f = (ln_ref_n - ln_phi_n) - x                 # residual of x = g(x)
+        f[~live] = 0.0                                # frozen regions never move
         err = np.abs(np.expm1(f)).max()               # |mu_new/mu - 1|
         if err < tol:
             converged = True
