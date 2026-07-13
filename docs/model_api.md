@@ -237,6 +237,28 @@ transport = lat.run(method="sp3")          # SP3 captures the transport correcti
 `"sp3"`, and `adjoint=True` is available. A void placeholder fills the lattice
 padding automatically; the report counts only the active triangles.
 
+### Control drums
+
+A hex site can instead be a **control drum** — an assembly body carrying a thin
+absorber *arc* that rotates to change reactivity. `set_drum` volume-mixes the arc
+into the drum cells by area fraction (so it is represented smoothly even when
+thinner than a triangle, and varies continuously with rotation):
+
+```python
+lat.set_drum((0, 3), body=beryllium, absorber=b4c,
+             inner_radius=12.25, outer_radius=13.25,   # the annular arc, cm from the hex centre
+             arc_deg=90,                                # angular span of the arc
+             angle_deg=180)                             # 0 = arc outward (withdrawn), 180 = toward core
+```
+
+`angle_deg` is measured from the outward radial direction, so sweeping it from 0
+to 180 for every drum traces the **drum-worth curve**. Any number of drums may be
+placed and rotated independently. `run(..., samples=8)` controls the arc
+sub-sampling resolution. The report's neutron balance accounts for the mixed
+absorber. This reproduces `ndgpu.benchmarks.build_hpmr2d`'s polar drum model
+exactly; see `examples/hpmr_hexlattice.py`, which builds the full HP-MR
+microreactor — 55 assemblies and 12 drums — and sweeps the worth curve.
+
 ---
 
 ## Worked example: the TWIGL benchmark (validated against literature)

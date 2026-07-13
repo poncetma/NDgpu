@@ -26,10 +26,12 @@ Example -- a reflected Cartesian core::
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from .grid import Grid
-from .hexraster import rasterize_hex_sites
+from .hexraster import hex_site_xy, rasterize_hex_sites
 from .materials import Kinetics, Material
 from .mesh import UnstructuredDiffusionSolver, read_gmsh
 from .operator import face_alpha
@@ -96,7 +98,7 @@ class ReactorResult:
     def __init__(self, *, k_eff, converged, outer_iterations, inner_iterations,
                  solve_seconds, device, method, flux, materials, cell_material,
                  cell_volume=1.0, active=None, geometry_line="", boundary_line="",
-                 adjoint=False):
+                 adjoint=False, absorption_correction=0.0):
         self.k_eff = float(k_eff)
         self.reactivity_pcm = (1.0 - 1.0 / self.k_eff) * 1e5
         self.converged = bool(converged)
@@ -115,6 +117,7 @@ class ReactorResult:
         act = (np.ones(flat.shape[1], bool) if active is None
                else np.asarray(active).reshape(-1).astype(bool))
         prod, absorb, rows = _diagnostics(materials, cell_material, flat, cell_volume, act)
+        absorb += absorption_correction           # volume-mixed sub-cell absorbers (drum arcs)
         loss = prod / self.k_eff                  # neutrons available per generation
         self.absorbed_fraction = absorb / loss if loss > 0 else float("nan")
         self.leakage_fraction = 1.0 - self.absorbed_fraction
@@ -548,6 +551,53 @@ class MeshModel:
             geometry_line=self._geometry_line(), boundary_line=f"all faces: {self._bc}")
 
 
+def _drum_absorber_mix(raster, pitch, drums, samples):
+    """Per-cell volume fraction of each drum's absorber arc (mix_material/weight).
+
+    ``drums`` is a list of dicts with ``rc``, ``inner``, ``outer``, ``arc_half``
+    (radians), ``arc_az`` (radians) and ``absorber_id``. For every triangle near a
+    drum the fraction of its area inside that drum's annular sector -- radius in
+    (inner, outer], azimuth within +-arc_half of the (rotated) arc centre -- is
+    estimated by barycentric sub-sampling. The fraction is non-zero even where the
+    thin arc only partly crosses a cell, and varies smoothly as the drum rotates,
+    so it drives the volume-mix (mix a fraction of the absorber into the drum-body
+    cell) rather than a staircase. Returns (mix_material, mix_weight) shaped like
+    the material map (sentinel mix_material = -1 where there is no absorber).
+    """
+    mmap = raster.material_map
+    ni, nj, _ = mmap.shape
+    weight = np.zeros((ni, nj, 2))
+    mix = np.full((ni, nj, 2), -1, dtype=np.int64)
+    centres = np.array([hex_site_xy(rc[0], rc[1], pitch) for d in drums for rc in (d["rc"],)])
+    outers = np.array([d["outer"] for d in drums])
+    n = samples
+    bary = np.array([(i / n, j / n, (n - i - j) / n)
+                     for i in range(n + 1) for j in range(n + 1 - i)])   # (S, 3)
+    for a in range(ni):
+        for b in range(nj):
+            for t in (0, 1):
+                if mmap[a, b, t] == 0:
+                    continue
+                V = raster.cell_vertices(a, b, t)
+                cx, cy = V.mean(0)
+                d2 = (centres[:, 0] - cx) ** 2 + (centres[:, 1] - cy) ** 2
+                d = int(d2.argmin())
+                reach = outers[d] + raster.side
+                if d2[d] > reach * reach:
+                    continue
+                dm = drums[d]
+                pts = bary @ V
+                dx, dy = pts[:, 0] - centres[d, 0], pts[:, 1] - centres[d, 1]
+                rr = np.hypot(dx, dy)
+                dphi = (np.arctan2(dy, dx) - dm["arc_az"] + np.pi) % (2 * np.pi) - np.pi
+                inside = (rr > dm["inner"]) & (rr <= dm["outer"]) & (np.abs(dphi) <= dm["arc_half"])
+                f = float(inside.mean())
+                if f > 0.0:
+                    weight[a, b, t] = f
+                    mix[a, b, t] = dm["absorber_id"]
+    return mix, weight
+
+
 # ---------------------------------------------------------------------------
 # Triangular hex-lattice model
 # ---------------------------------------------------------------------------
@@ -557,7 +607,8 @@ class HexLattice:
     pitch  : centre-to-centre hex spacing, cm. refine : triangles per hex is
              ``6 * refine**2`` (>= 2 for a usable mesh).
 
-    Place assemblies with :meth:`set_site` (axial coordinates ``(R, C)``), set the
+    Place assemblies with :meth:`set_site` (axial coordinates ``(R, C)``) or, for a
+    control drum, :meth:`set_drum` (a hex with a rotatable absorber arc), set the
     lattice-edge boundary, then :meth:`run` with diffusion or SP3 transport.
     """
 
@@ -567,11 +618,33 @@ class HexLattice:
         self.pitch = float(pitch)
         self.refine = int(refine)
         self._sites: dict = {}
+        self._drums: dict = {}
         self._bc = "vacuum"
 
     def set_site(self, rc, material) -> "HexLattice":
         """Place ``material`` at hex site ``rc = (R, C)`` (axial coordinates)."""
         self._sites[tuple(rc)] = material
+        return self
+
+    def set_drum(self, rc, body, absorber, inner_radius, outer_radius, arc_deg,
+                 angle_deg=0.0) -> "HexLattice":
+        """Place a control drum at hex site ``rc``: a ``body`` assembly carrying a
+        rotatable ``absorber`` arc, volume-mixed by area fraction.
+
+        The absorber occupies the annular sector between ``inner_radius`` and
+        ``outer_radius`` (cm from the hex centre) spanning ``arc_deg`` degrees.
+        ``angle_deg`` rotates it about the hex centre, measured from the outward
+        radial direction: 0 points away from the core (withdrawn), 180 toward the
+        core centre (inserted). Any number of drums may be placed, each rotated
+        independently -- the drum-worth curve is swept by rerunning with different
+        ``angle_deg``.
+        """
+        rc = tuple(rc)
+        self._sites[rc] = body
+        self._drums[rc] = dict(absorber=absorber, inner=float(inner_radius),
+                               outer=float(outer_radius),
+                               arc_half=math.radians(arc_deg) / 2.0,
+                               angle_deg=float(angle_deg))
         return self
 
     def set_boundary(self, spec) -> "HexLattice":
@@ -580,17 +653,28 @@ class HexLattice:
         return self
 
     def run(self, method: str = "diffusion", device: str = "auto", adjoint: bool = False,
-            tol_k: float = 1e-6, tol_source: float = 1e-5, **solve_kw) -> ReactorResult:
-        """Rasterize the lattice and solve; returns a :class:`ReactorResult`."""
+            tol_k: float = 1e-6, tol_source: float = 1e-5, samples: int = 8,
+            **solve_kw) -> ReactorResult:
+        """Rasterize the lattice and solve; returns a :class:`ReactorResult`.
+
+        ``samples`` sets the drum-arc sub-sampling order (area/rotation resolution).
+        """
         if not self._sites:
             raise ValueError("place at least one assembly with set_site()")
         if method not in _TRI:
             raise ValueError(f"method must be one of {sorted(_TRI)}, got {method!r}")
         uniq, id_of = [], {}
-        for mat in self._sites.values():
+
+        def register(mat):
             if id(mat) not in id_of:
                 id_of[id(mat)] = len(uniq) + 1              # 1-based; 0 is void
                 uniq.append(mat)
+            return id_of[id(mat)]
+
+        for mat in self._sites.values():
+            register(mat)
+        for dm in self._drums.values():
+            register(dm["absorber"])
         groups = uniq[0].n_groups
         if any(m.n_groups != groups for m in uniq):
             raise ValueError("all assemblies must have the same number of groups")
@@ -602,12 +686,41 @@ class HexLattice:
         raster = rasterize_hex_sites(site_material, self.pitch, self.refine)
         grid = TriGrid(shape=raster.material_map.shape, side=raster.side)
         active = raster.material_map > 0
+
+        mix_material = mix_weight = None
+        if self._drums:
+            specs = []
+            for rc, dm in self._drums.items():
+                x, y = hex_site_xy(rc[0], rc[1], self.pitch)
+                specs.append(dict(rc=rc, inner=dm["inner"], outer=dm["outer"],
+                                  arc_half=dm["arc_half"],
+                                  arc_az=math.atan2(y, x) + math.radians(dm["angle_deg"]),
+                                  absorber_id=id_of[id(dm["absorber"])]))
+            mix_material, mix_weight = _drum_absorber_mix(raster, self.pitch, specs, samples)
+
         solver = _TRI[method](grid, materials, raster.material_map, active=active,
-                              mask_bc=self._bc, device=device)
+                              mask_bc=self._bc, mix_material=mix_material,
+                              mix_weight=mix_weight, device=device)
         res = solver.solve(tol_k=tol_k, tol_source=tol_source, adjoint=adjoint, **solve_kw)
 
+        # Report absorption must count the volume-mixed arc, which is not in the
+        # (body-material) map: add sum_cells w * (Sigma_a,absorber - Sigma_a,body) * phi * V.
+        corr = 0.0
+        if self._drums and not adjoint:
+            flux = res.flux_numpy
+            sa = np.array([m.sigma_a for m in materials])
+            body = raster.material_map
+            mixed = mix_material >= 0
+            aid = np.where(mixed, mix_material, 0)
+            # uniform triangular cells -> unit volume, matching the ReactorResult
+            # diagnostics (fractions are volume-independent here).
+            for g in range(groups):
+                dsa = np.where(mixed, mix_weight * (sa[aid, g] - sa[body, g]), 0.0)
+                corr += float((dsa * flux[g]).sum())
+
         ntri = int(active.sum())
-        geo = (f"{len(self._sites)} hex sites, pitch {self.pitch:g} cm, "
+        drum_note = f", {len(self._drums)} drums" if self._drums else ""
+        geo = (f"{len(self._sites)} hex sites{drum_note}, pitch {self.pitch:g} cm, "
                f"{6 * self.refine ** 2} triangles/hex, {ntri:,} active triangles  "
                f"[triangular]")
         return ReactorResult(
@@ -615,4 +728,5 @@ class HexLattice:
             inner_iterations=res.inner_iterations, solve_seconds=res.solve_seconds,
             device=res.device, method=method, flux=res.flux_numpy, materials=materials,
             cell_material=raster.material_map, active=active, adjoint=adjoint,
-            geometry_line=geo, boundary_line=f"lattice edge: {self._bc}")
+            geometry_line=geo, boundary_line=f"lattice edge: {self._bc}",
+            absorption_correction=corr)

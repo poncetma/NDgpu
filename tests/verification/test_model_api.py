@@ -292,3 +292,41 @@ def test_hexlattice_builds_the_hpmr_core():
                                     active=raster.material_map > 0,
                                     mask_bc="vacuum").solve(tol_k=1e-9, tol_source=1e-8).k_eff
     assert k_api == pytest.approx(k_ref, abs=1e-6)
+
+
+def test_hexlattice_drum_arc_matches_polar_benchmark():
+    # set_drum's rotatable, volume-mixed B4C arc must reproduce build_hpmr2d's
+    # polar absorber exactly, and give a monotone drum-worth curve.
+    from ndgpu.benchmarks.hpmr import (_placeholder_materials, _FUEL_SITES,
+                                       _BE_SITES, _DRUM_SITES, PITCH,
+                                       DRUM_ABSORBER_INNER, DRUM_RADIUS,
+                                       DRUM_ARC_HALF_DEG, CENTRAL, FUEL,
+                                       BE_REFLECTOR, DRUM_BE, DRUM_ABSORBER,
+                                       build_hpmr2d)
+    from ndgpu.tri import TriDiffusionEigenSolver
+    m = _placeholder_materials()
+
+    def api_k(angle):
+        lat = HexLattice(pitch=PITCH, refine=4).set_boundary("vacuum")
+        lat.set_site((0, 0), m[CENTRAL])
+        for s in _FUEL_SITES:
+            lat.set_site(s, m[FUEL])
+        for s in _BE_SITES:
+            lat.set_site(s, m[BE_REFLECTOR])
+        for s in _DRUM_SITES:
+            lat.set_drum(s, body=m[DRUM_BE], absorber=m[DRUM_ABSORBER],
+                         inner_radius=DRUM_ABSORBER_INNER, outer_radius=DRUM_RADIUS,
+                         arc_deg=2 * DRUM_ARC_HALF_DEG, angle_deg=angle)
+        return lat.run(tol_k=1e-9, tol_source=1e-8, samples=10).k_eff
+
+    def ref_k(angle):
+        p = build_hpmr2d(refine=4, drum_angle_deg=angle, absorber="polar", samples=10)
+        return TriDiffusionEigenSolver(p.grid, p.materials, p.material_map, active=p.active,
+                                       mask_bc=p.mask_bc, mix_material=p.mix_material,
+                                       mix_weight=p.mix_weight).solve(tol_k=1e-9, tol_source=1e-8).k_eff
+
+    ks = {a: api_k(a) for a in (0.0, 90.0, 180.0)}
+    for a in (0.0, 90.0, 180.0):
+        assert ks[a] == pytest.approx(ref_k(a), abs=1e-6)     # exact match to the benchmark
+    assert ks[0.0] > ks[90.0] > ks[180.0]                     # inserting the arc lowers k
+    assert (1.0 / ks[180.0] - 1.0 / ks[0.0]) * 1e5 > 1000.0   # substantial drum worth
