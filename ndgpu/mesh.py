@@ -1,16 +1,19 @@
 """Unstructured finite-volume diffusion on a Gmsh mesh.
 
-Reads a Gmsh 2.2 ``.msh`` file (quad or triangle cells) and solves the
-multigroup k-eigenvalue diffusion problem on the arbitrary geometry it
-describes -- the same job FEMFFUSION or GeN-Foam do from a mesh, rather than
-from a structured lattice. This is the general-geometry escape hatch: where the
-structured Cartesian/hex operators need a lattice, this one needs only cells,
-their vertices, and per-cell materials.
+Reads a Gmsh 2.2 ``.msh`` file -- 2D triangle/quad cells, or 3D tetrahedra,
+hexahedra and prisms -- and solves the multigroup k-eigenvalue diffusion problem
+on the arbitrary geometry it describes, the same job FEMFFUSION or GeN-Foam do
+from a mesh rather than from a structured lattice. This is the general-geometry
+escape hatch: where the structured Cartesian/hex operators need a lattice, this
+one needs only cells, their vertices, and per-cell materials.
 
 The scheme is a cell-centred two-point-flux finite volume: for a face shared by
-cells i and j, the coupling is D_face * L_face / d(centroid_i, centroid_j) with
+cells i and j, the coupling is D_face * A_face / d(centroid_i, centroid_j) with
+A_face the shared face measure (edge length in 2D, polygon area in 3D) and
 D_face the harmonic mean of the cell diffusion coefficients; boundary faces get
-the Robin/albedo term (vacuum alpha = 1/2). The connectivity is irregular, but
+the Robin/albedo term (vacuum alpha = 1/2). The 2D and 3D assemblers produce the
+same face quantities, so the operator and solver below are dimension-agnostic.
+The connectivity is irregular, but
 the within-group operator is still applied matrix-free as a pure *gather*: the
 faces are stored as a row-wise ELLPACK adjacency (each cell's neighbours padded
 to the maximum degree), and the apply reads each cell's neighbour fluxes and
@@ -39,41 +42,60 @@ _VACUUM_ALPHA = 0.5
 
 @dataclass
 class Mesh:
-    """Cells and faces read from a Gmsh file (2D, single z-plane)."""
+    """Cells and faces of a 2D or 3D finite-volume mesh.
 
-    coords: np.ndarray              # (n_nodes, 2)
+    ``area`` holds the cell measure (area in 2D, volume in 3D) and each face its
+    measure (edge length in 2D, face area in 3D); the two-point-flux operator
+    consumes these identically in either dimension.
+    """
+
+    coords: np.ndarray              # (n_nodes, 2) or (n_nodes, 3)
     cells: list                     # list of node-index tuples (per cell)
     cell_tag: np.ndarray            # (n_cells,) physical/elementary tag per cell
-    centroid: np.ndarray            # (n_cells, 2)
-    area: np.ndarray                # (n_cells,)
-    faces: list                     # (i, j, length, centroid_distance) interior
-    bfaces: list                    # (i, length, centroid_to_edge_distance) boundary
+    centroid: np.ndarray            # (n_cells, 2) or (n_cells, 3)
+    area: np.ndarray                # (n_cells,) cell measure (2D area / 3D volume)
+    faces: list                     # (i, j, face_measure, centroid_distance) interior
+    bfaces: list                    # (i, face_measure, centroid_to_face_distance) boundary
 
     @property
     def n_cells(self) -> int:
         return len(self.cells)
 
 
+# Gmsh element type -> node count, split by dimension.
+_GMSH_2D = {2: 3, 3: 4}                          # triangle, quad
+_GMSH_3D = {4: 4, 5: 8, 6: 6}                     # tetrahedron, hexahedron, prism
+
+
 def read_gmsh(path: str) -> Mesh:
-    """Parse a Gmsh 2.2 ASCII mesh of 2D quad (type 3) / triangle (type 2) cells."""
+    """Parse a Gmsh 2.2 ASCII mesh and assemble a Mesh.
+
+    Handles 2D meshes of triangles (type 2) / quads (type 3) and 3D meshes of
+    tetrahedra (4) / hexahedra (5) / prisms (6). If any 3D volume element is
+    present the mesh is built in 3D (surface elements are ignored); otherwise the
+    2D path is used.
+    """
     lines = open(path).read().splitlines()
     ni = lines.index("$Nodes")
     nn = int(lines[ni + 1])
-    coords = np.zeros((nn + 1, 2))
+    coords = np.zeros((nn + 1, 3))
     for k in range(nn):
         t = lines[ni + 2 + k].split()
-        coords[int(t[0])] = (float(t[1]), float(t[2]))
+        coords[int(t[0])] = (float(t[1]), float(t[2]), float(t[3]))
     ei = lines.index("$Elements")
     ne = int(lines[ei + 1])
+    elems = [[int(x) for x in lines[ei + 2 + k].split()] for k in range(ne)]
+    is_3d = any(t[1] in _GMSH_3D for t in elems)
+    table = _GMSH_3D if is_3d else _GMSH_2D
     cells, tags = [], []
-    for k in range(ne):
-        t = [int(x) for x in lines[ei + 2 + k].split()]
-        etype = t[1]
-        if etype in (2, 3):                      # 3-node tri or 4-node quad
-            nnode = 3 if etype == 2 else 4
+    for t in elems:
+        nnode = table.get(t[1])
+        if nnode is not None:
             tags.append(t[3])                    # first tag (physical / assembly id)
             cells.append(tuple(t[5:5 + nnode]))
-    return assemble_mesh(coords, cells, tags)
+    if is_3d:
+        return assemble_mesh_3d(coords, cells, tags)
+    return assemble_mesh(coords[:, :2], cells, tags)
 
 
 def assemble_mesh(coords, cells, tags) -> Mesh:
@@ -148,6 +170,101 @@ def assemble_mesh(coords, cells, tags) -> Mesh:
             bfaces.append((i, L, db))
     return Mesh(coords=coords, cells=cells, cell_tag=np.asarray(tags), centroid=centroid,
                area=area, faces=faces, bfaces=bfaces)
+
+
+# Local face node-orderings per 3D element type, keyed by node count. Orientation
+# is irrelevant here: face areas and cell volumes are taken in magnitude and a
+# face is identified by the *set* of its nodes, so any consistent enumeration of
+# each element's bounding faces works. (Gmsh 4=tet, 5=hex, 6=prism/wedge.)
+_TET_FACES = [(0, 1, 2), (0, 3, 1), (0, 2, 3), (1, 3, 2)]
+_HEX_FACES = [(0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1),
+              (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)]
+_PRISM_FACES = [(0, 2, 1), (3, 4, 5), (0, 1, 4, 3), (1, 2, 5, 4), (2, 0, 3, 5)]
+_FACE_TEMPLATES = {4: _TET_FACES, 8: _HEX_FACES, 6: _PRISM_FACES}
+
+
+def _poly_area_centroid_3d(pts):
+    """Area and area-weighted centroid of a planar polygon in 3D (fan triangulation)."""
+    p0 = pts[0]
+    atot = 0.0
+    csum = np.zeros(3)
+    for i in range(1, len(pts) - 1):
+        cr = np.cross(pts[i] - p0, pts[i + 1] - p0)
+        a = 0.5 * float(np.linalg.norm(cr))
+        atot += a
+        csum += a * (p0 + pts[i] + pts[i + 1]) / 3.0
+    return atot, (csum / atot if atot > 0 else pts.mean(0))
+
+
+def _cell_volume_centroid_3d(cell_pts, faces_local):
+    """Volume and volume-weighted centroid of a star-convex polyhedron.
+
+    Decomposes into tetrahedra from a seed point (the vertex mean) to a fan
+    triangulation of every bounding face. Exact for convex tets/hexes/prisms.
+    """
+    g = cell_pts.mean(0)
+    vtot = 0.0
+    csum = np.zeros(3)
+    for f in faces_local:
+        fp = cell_pts[list(f)]
+        p0 = fp[0]
+        for i in range(1, len(fp) - 1):
+            v = abs(float(np.dot(np.cross(fp[i] - g, fp[i + 1] - g), p0 - g))) / 6.0
+            vtot += v
+            csum += v * (g + p0 + fp[i] + fp[i + 1]) / 4.0
+    return vtot, (csum / vtot if vtot > 0 else g)
+
+
+def assemble_mesh_3d(coords, cells, tags) -> Mesh:
+    """Build a 3D Mesh (volumes, centroids, interior/boundary faces) from cells.
+
+    coords : (n_nodes, 3) node coordinates. cells : list of node-index tuples,
+    each a tetrahedron (4 nodes), prism/wedge (6) or hexahedron (8) in Gmsh
+    ordering. tags : one integer per cell (material id). Two cells share a face
+    when they share the same set of face nodes (conforming meshes only -- 3D
+    hanging nodes are not split); a face touched by one cell is a boundary face.
+
+    The returned Mesh carries the same two-point-flux quantities the 2D path
+    does -- so `Mesh.area` holds the cell *volume* and each face its *area* and
+    centroid-to-centroid (or centroid-to-face) distance -- and drives the exact
+    same operator and solver.
+    """
+    coords = np.asarray(coords, dtype=float)
+    cells = [tuple(c) for c in cells]
+    nc = len(cells)
+    centroid = np.zeros((nc, 3))
+    volume = np.zeros(nc)
+    face_cells = defaultdict(list)      # sorted global node key -> [(cell, global face nodes)]
+    for c, ns in enumerate(cells):
+        tmpl = _FACE_TEMPLATES.get(len(ns))
+        if tmpl is None:
+            raise ValueError(f"cell {c} has {len(ns)} nodes; expected a tet (4), "
+                             "prism (6) or hex (8)")
+        cell_pts = coords[list(ns)]
+        volume[c], centroid[c] = _cell_volume_centroid_3d(cell_pts, tmpl)
+        for fl in tmpl:
+            gface = tuple(ns[k] for k in fl)
+            face_cells[tuple(sorted(gface))].append((c, gface))
+
+    def dist(a, b):
+        return float(np.linalg.norm(centroid[a] - centroid[b]))
+
+    faces, bfaces = [], []
+    for lst in face_cells.values():
+        gface = lst[0][1]
+        A, fcent = _poly_area_centroid_3d(coords[list(gface)])
+        if len(lst) == 2:
+            i, j = lst[0][0], lst[1][0]
+            faces.append((i, j, A, dist(i, j)))
+        elif len(lst) == 1:
+            i = lst[0][0]
+            db = float(np.linalg.norm(centroid[i] - fcent))
+            bfaces.append((i, A, db))
+        else:
+            raise ValueError(f"face {lst[0][1]} is shared by {len(lst)} cells "
+                             "(non-manifold or non-conforming mesh)")
+    return Mesh(coords=coords, cells=cells, cell_tag=np.asarray(tags),
+                centroid=centroid, area=volume, faces=faces, bfaces=bfaces)
 
 
 @dataclass

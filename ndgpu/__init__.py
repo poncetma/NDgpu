@@ -14,6 +14,8 @@ from .griffin_xs import (read_library as read_griffin_library,
 from .grid import Grid
 from .hex import HexDiffusionEigenSolver, HexGrid, offset_to_axial
 from .materials import Kinetics, Material, ONE_GROUP_DEMO, PWR_TWO_GROUP
+from .mesh import (Mesh, MeshResult, UnstructuredDiffusionSolver, assemble_mesh,
+                  assemble_mesh_3d, read_gmsh)
 from .perturbation import first_order_reactivity
 from .solver import DiffusionEigenSolver, Result, SP3EigenSolver
 from .sph import (SphResult, flux_weighted_homogenize, region_average,
@@ -50,6 +52,12 @@ __all__ = [
     "k_from_buckling",
     "k_infinite",
     "first_order_reactivity",
+    "UnstructuredDiffusionSolver",
+    "Mesh",
+    "MeshResult",
+    "read_gmsh",
+    "assemble_mesh",
+    "assemble_mesh_3d",
     "flux_weighted_homogenize",
     "region_average",
     "sph_correct",
