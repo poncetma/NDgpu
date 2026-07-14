@@ -417,7 +417,17 @@ class UnstructuredDiffusionSolver:
                         self.scat[(gf, gt)] = xp.asarray(col)
 
     def solve(self, tol_k=1e-7, tol_source=1e-8, max_outer=1000,
-              inner_rtol_floor=1e-11) -> MeshResult:
+              inner_rtol_floor=1e-11, anderson_depth=8) -> MeshResult:
+        """Power iteration on the fission source, Anderson-accelerated.
+
+        The fission-source map ``F -> (1/k) sum_g nuSigma_f,g A_g^-1 chi_g F`` is a
+        fixed point whose plain power iteration converges at the dominance ratio;
+        for a loosely-coupled core (ratio near 1) that is hundreds of outers.
+        Anderson acceleration mixes a short history of source residuals (the same
+        scheme used in the transient step and the SPH solve), collapsing the slow
+        modes so the eigenvector converges in far fewer outers. ``anderson_depth``
+        <= 1 recovers the plain power iteration.
+        """
         xp, G = self.xp, self.G
         synchronize(xp)
         t0 = time.perf_counter()
@@ -426,10 +436,11 @@ class UnstructuredDiffusionSolver:
         phi = [xp.ones(n, dtype=self.dtype) for _ in range(G)]
         k = 1.0
         F = sum(self.nsf[g] * phi[g] for g in range(G))
-        total = xp.sum(F)
+        F = F * (n / float(xp.sum(F)))                    # normalize source, sum = n
         conv = False
         inner_total = 0
         src_err = 1.0
+        hist = []                                         # (F_in, raw_iterate) for Anderson
         for outer in range(1, max_outer + 1):
             # Inner CG tolerance tracks the outer residual: loose early, tight late.
             rtol = min(1e-3, max(0.1 * src_err, inner_rtol_floor, 0.01 * tol_source))
@@ -443,23 +454,40 @@ class UnstructuredDiffusionSolver:
                 inner_total += n_it
 
             Fn = sum(self.nsf[g] * phi[g] for g in range(G))
-            total_new = xp.sum(Fn)
-            k_new = k * float(total_new / total)
-
-            diff = Fn / total_new - F / total
-            src_err = float(xp.sqrt(xp.sum(diff * diff) / xp.sum((Fn / total_new) ** 2)))
+            total_new = float(xp.sum(Fn))
+            k_new = k * total_new / n                     # F has sum n
+            g_F = Fn * (n / total_new)                    # raw power iterate, sum = n
+            r = g_F - F
+            src_err = float(xp.sqrt(xp.sum(r * r) / xp.sum(g_F ** 2)))
             dk = abs(k_new - k)
-
-            scale = n / float(total_new)
-            for g in range(G):
-                phi[g] = phi[g] * scale
-            F = Fn * scale
-            total = xp.sum(F)
             k = k_new
-
             if dk < tol_k and src_err < tol_source and outer > 5:
+                F = g_F
                 conv = True
                 break
+
+            # Anderson update: F <- residual-minimizing mix of the recent iterates.
+            F_new = g_F
+            if anderson_depth > 1:
+                hist.append((F, g_F))
+                if len(hist) > anderson_depth:
+                    hist.pop(0)
+                if len(hist) >= 2:
+                    res = [Gj - Sj for Sj, Gj in hist]
+                    dres = [res[i] - res[-1] for i in range(len(res) - 1)]
+                    m = len(dres)
+                    A = np.array([[float(xp.sum(dres[i] * dres[j])) for j in range(m)]
+                                  for i in range(m)])
+                    b = np.array([-float(xp.sum(dres[i] * res[-1])) for i in range(m)])
+                    A[np.diag_indices(m)] += 1e-12 * (np.trace(A) + 1e-300)
+                    try:
+                        gamma = np.linalg.solve(A, b)
+                    except np.linalg.LinAlgError:
+                        gamma = None
+                    if gamma is not None and np.all(np.abs(gamma) < 1e4):
+                        for j in range(m):
+                            F_new = F_new + float(gamma[j]) * (hist[j][1] - hist[-1][1])
+            F = F_new * (n / float(xp.sum(F_new)))        # renormalize, sum = n
 
         synchronize(xp)
         flux = np.array([asnumpy(phi[g]) for g in range(G)])

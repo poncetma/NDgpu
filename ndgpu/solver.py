@@ -41,6 +41,35 @@ from .materials import Material
 from .operator import BC_VACUUM, BC_ZERO_FLUX, GroupOperator, SP3GroupOperator
 
 
+def _anderson_source(hist, raw, xp):
+    """Anderson-accelerated next iterate from a history of (input, raw_output).
+
+    Given the recent (S_j, G(S_j)) pairs (latest last) and the latest raw iterate
+    G(S), return the residual-minimizing affine combination that collapses the
+    slow fixed-point modes. With fewer than two pairs it is the plain iterate.
+    A tiny diagonal regularization and a magnitude guard on the coefficients keep
+    it robust; the fixed point (and hence the eigenpair) is unchanged.
+    """
+    if len(hist) < 2:
+        return raw
+    res = [Gj - Sj for Sj, Gj in hist]                    # residuals f_j = G_j - S_j
+    dres = [res[i] - res[-1] for i in range(len(res) - 1)]
+    m = len(dres)
+    A = np.array([[float(xp.sum(dres[i] * dres[j])) for j in range(m)] for i in range(m)])
+    b = np.array([-float(xp.sum(dres[i] * res[-1])) for i in range(m)])
+    A[np.diag_indices(m)] += 1e-12 * (np.trace(A) + 1e-300)
+    try:
+        gamma = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        return raw
+    if not np.all(np.abs(gamma) < 1e4):
+        return raw
+    out = raw
+    for j in range(m):
+        out = out + float(gamma[j]) * (hist[j][1] - hist[-1][1])
+    return out
+
+
 @dataclass
 class Result:
     k_eff: float
@@ -240,9 +269,16 @@ class _PowerIterationSolver:
     def solve(self, tol_k: float = 1e-7, tol_source: float = 1e-6,
               max_outer: int = 2000, inner_rtol_floor: float = 1e-10,
               k_guess: float = 1.0, verbose: bool = False,
-              adjoint: bool = False) -> Result:
+              adjoint: bool = False, anderson_depth: int = 8) -> Result:
         """Run power iteration until |dk| < tol_k and the relative L2 change of
         the normalized fission source < tol_source.
+
+        The fission-source fixed point is Anderson-accelerated (a short history of
+        source residuals, the same scheme used in the transient step and SPH
+        solve): plain power iteration converges at the dominance ratio, which is
+        near 1 for a loosely-coupled core (hundreds of outers), whereas Anderson
+        collapses the slow modes into a handful. ``anderson_depth`` <= 1 recovers
+        the plain power iteration; the converged eigenpair is identical either way.
 
         adjoint : solve the adjoint (importance) k-eigenproblem M* phi* =
         (1/k) F* phi* instead of the forward one. The within-group operator
@@ -256,6 +292,12 @@ class _PowerIterationSolver:
         xp, G = self.xp, self.n_groups
         synchronize(xp)
         t0 = time.perf_counter()
+
+        # Anderson reliably accelerates the forward source, but on the adjoint
+        # (chi-weighted) source it can lock onto a subdominant eigenpair, so it is
+        # disabled there -- plain power iteration is used for the adjoint.
+        if adjoint:
+            anderson_depth = 1
 
         # Fission couples groups as F[g,g'] = chi_g * nu_sigma_f_g'. Its
         # transpose F* moves chi to the production weight and nu_sigma_f to the
@@ -272,12 +314,14 @@ class _PowerIterationSolver:
 
         k_hist, err_hist = [], []
         inner_total = 0
-        src_err = 1.0
+        src_err = prev_src_err = 1.0
         converged = False
+        hist = []                                # (fsrc_in, raw_iterate) for Anderson
 
         for outer in range(1, max_outer + 1):
             # Inner tolerance tracks the outer residual: cheap early, tight late.
             rtol = min(1e-3, max(0.1 * src_err, inner_rtol_floor, 0.01 * tol_source))
+            fsrc_in = fsrc                       # this iteration's input (for Anderson)
 
             for g in range(G):
                 q0 = (emit[g] / k) * fsrc
@@ -304,8 +348,7 @@ class _PowerIterationSolver:
             scale = self.grid.n_cells / total_new
             for g in range(G):
                 state[g] *= scale
-            fsrc = fsrc_new * scale
-            total = xp.sum(fsrc)
+            g_fsrc = fsrc_new * scale                     # raw power iterate, mean 1
             k = k_new
 
             k_hist.append(k)
@@ -314,8 +357,22 @@ class _PowerIterationSolver:
                 print(f"  outer {outer:4d}  k = {k:.8f}  dk = {dk:.2e}  src_err = {src_err:.2e}")
 
             if dk < tol_k and src_err < tol_source:
+                fsrc = g_fsrc
                 converged = True
                 break
+
+            # Anderson update of the fission source (state stays the plain iterate).
+            fsrc = g_fsrc
+            if anderson_depth > 1:
+                if src_err > 1.1 * prev_src_err:          # last mix overshot -> restart
+                    hist = []
+                hist.append((fsrc_in, g_fsrc))
+                if len(hist) > anderson_depth:
+                    hist.pop(0)
+                fsrc = _anderson_source(hist, g_fsrc, xp)
+                fsrc = fsrc * (self.grid.n_cells / float(xp.sum(fsrc)))
+            prev_src_err = src_err
+            total = xp.sum(fsrc)
 
         synchronize(xp)
         return Result(
