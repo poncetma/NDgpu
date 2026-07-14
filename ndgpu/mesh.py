@@ -276,6 +276,7 @@ class MeshResult:
     solve_seconds: float
     device: str = "cpu (numpy)"
     inner_iterations: int = 0
+    k_history: list = None
 
 
 def _build_ell(face_i, face_j, n):
@@ -440,10 +441,14 @@ class UnstructuredDiffusionSolver:
         conv = False
         inner_total = 0
         src_err = 1.0
+        k_hist = []
         hist = []                                         # (F_in, raw_iterate) for Anderson
         for outer in range(1, max_outer + 1):
-            # Inner CG tolerance tracks the outer residual: loose early, tight late.
-            rtol = min(1e-3, max(0.1 * src_err, inner_rtol_floor, 0.01 * tol_source))
+            # Inner CG tolerance tracks the *outer residual* (src_err): loose early,
+            # tight late. It must not be tied to tol_source -- doing so pinned the
+            # inner solve loose whenever tol_source was set large (converge on k
+            # only), so k stalled at the inner-solve noise floor and Anderson drifted.
+            rtol = min(1e-3, max(0.1 * src_err, inner_rtol_floor))
             for g in range(G):
                 q = self.chi[g] / k * F * area
                 for (gf, gt), col in self.scat.items():
@@ -461,6 +466,7 @@ class UnstructuredDiffusionSolver:
             src_err = float(xp.sqrt(xp.sum(r * r) / xp.sum(g_F ** 2)))
             dk = abs(k_new - k)
             k = k_new
+            k_hist.append(k)
             if dk < tol_k and src_err < tol_source and outer > 5:
                 F = g_F
                 conv = True
@@ -493,4 +499,4 @@ class UnstructuredDiffusionSolver:
         flux = np.array([asnumpy(phi[g]) for g in range(G)])
         return MeshResult(k_eff=k, flux=flux, converged=conv, outer_iterations=outer,
                           solve_seconds=time.perf_counter() - t0, device=self.device,
-                          inner_iterations=inner_total)
+                          inner_iterations=inner_total, k_history=k_hist)

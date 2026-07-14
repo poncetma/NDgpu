@@ -319,8 +319,10 @@ class _PowerIterationSolver:
         hist = []                                # (fsrc_in, raw_iterate) for Anderson
 
         for outer in range(1, max_outer + 1):
-            # Inner tolerance tracks the outer residual: cheap early, tight late.
-            rtol = min(1e-3, max(0.1 * src_err, inner_rtol_floor, 0.01 * tol_source))
+            # Inner tolerance tracks the *outer residual* (src_err): cheap early,
+            # tight late. Not tied to tol_source (that pinned the inner solve loose
+            # when converging on k alone, stalling k and letting Anderson drift).
+            rtol = min(1e-3, max(0.1 * src_err, inner_rtol_floor))
             fsrc_in = fsrc                       # this iteration's input (for Anderson)
 
             for g in range(G):

@@ -57,3 +57,21 @@ def test_vver440_msh_matches_femffusion():
     assert mesh.n_cells == 1263
     res = UnstructuredDiffusionSolver(mesh, mats, cm, alpha).solve(tol_k=1e-7)
     assert res.k_eff == pytest.approx(K_REFERENCE, abs=1e-3)   # FEMFFUSION FE3 diffusion
+
+
+@pytest.mark.skipif(not os.path.exists(_MSH), reason="FEMFFUSION VVER440.msh not present")
+def test_vver440_msh_converges_on_keff_with_loose_source_tolerance():
+    # Regression for the adaptive inner-CG tolerance: converging on k_eff alone
+    # (a loose source-shape tolerance) must still tighten the inner solve with the
+    # outer residual, so k reaches the right eigenvalue. An earlier version tied
+    # the inner tol to tol_source, which pinned it loose here and let Anderson
+    # drift to a wrong k (+26 pcm) without converging.
+    from ndgpu.benchmarks.vver440 import build_vver440_msh
+    from ndgpu.mesh import UnstructuredDiffusionSolver
+    mesh, mats, cm, alpha = build_vver440_msh(_MSH)
+    k_ref = UnstructuredDiffusionSolver(mesh, mats, cm, alpha).solve(
+        tol_k=1e-9, tol_source=1e-8).k_eff                       # fully converged
+    loose = UnstructuredDiffusionSolver(mesh, mats, cm, alpha).solve(
+        tol_k=1e-6, tol_source=1e9, max_outer=400)               # converge on k only
+    assert loose.converged                                       # not stalled at max_outer
+    assert loose.k_eff == pytest.approx(k_ref, abs=5e-5)         # right eigenvalue, no drift
