@@ -35,12 +35,22 @@ from .hexraster import hex_site_xy, rasterize_hex_sites
 from .materials import Kinetics, Material
 from .mesh import UnstructuredDiffusionSolver, read_gmsh
 from .operator import face_alpha
-from .solver import DiffusionEigenSolver, SP3EigenSolver
+from .solver import (DiffusionEigenSolver, SDP1EigenSolver, SDP2EigenSolver,
+                     SDP3EigenSolver, SP1EigenSolver, SP3EigenSolver,
+                     SP5EigenSolver, SP7EigenSolver)
 from .transient import TransientSolver
-from .tri import TriDiffusionEigenSolver, TriGrid, TriSP3EigenSolver
+from .tri import (TriDiffusionEigenSolver, TriGrid, TriSDP1EigenSolver,
+                  TriSDP2EigenSolver, TriSDP3EigenSolver, TriSP1EigenSolver,
+                  TriSP3EigenSolver, TriSP5EigenSolver, TriSP7EigenSolver)
 
-_STRUCTURED = {"diffusion": DiffusionEigenSolver, "sp3": SP3EigenSolver}
-_TRI = {"diffusion": TriDiffusionEigenSolver, "sp3": TriSP3EigenSolver}
+_STRUCTURED = {"diffusion": DiffusionEigenSolver, "sp1": SP1EigenSolver,
+               "sp3": SP3EigenSolver, "sp5": SP5EigenSolver,
+               "sp7": SP7EigenSolver, "sdp1": SDP1EigenSolver,
+               "sdp2": SDP2EigenSolver, "sdp3": SDP3EigenSolver}
+_TRI = {"diffusion": TriDiffusionEigenSolver, "sp1": TriSP1EigenSolver,
+        "sp3": TriSP3EigenSolver, "sp5": TriSP5EigenSolver,
+        "sp7": TriSP7EigenSolver, "sdp1": TriSDP1EigenSolver,
+        "sdp2": TriSDP2EigenSolver, "sdp3": TriSDP3EigenSolver}
 _AXES = ("x", "y", "z")
 
 
@@ -371,7 +381,10 @@ class Model:
             tol_k: float = 1e-6, tol_source: float = 1e-5, **solve_kw) -> ModelResult:
         """Solve the k-eigenvalue problem and return a :class:`ModelResult`.
 
-        method : ``"diffusion"`` or ``"sp3"``. device : ``"auto"``/``"cpu"``/``"gpu"``.
+        method : ``"diffusion"``, ``"sp3"``, or the simplified double-PN
+        approximations ``"sdp1"``/``"sdp2"``/``"sdp3"`` (equal-cost to
+        SP3/SP5/SP7, more accurate than SPN in strongly heterogeneous media).
+        device : ``"auto"``/``"cpu"``/``"gpu"``.
         adjoint : solve the adjoint (importance) problem instead of the forward one.
         """
         if not self._materials:

@@ -41,10 +41,36 @@ import numpy as np
 
 from .backend import asnumpy, device_name, get_backend, synchronize
 from .grid import Grid
-from .linalg import neumann_preconditioner, pcg
+from .linalg import get_linear_solver, neumann_preconditioner
 from .materials import Kinetics
-from .operator import BC_VACUUM, BC_ZERO_FLUX, GroupOperator
-from .solver import DiffusionEigenSolver, Fields, Result
+from .operator import (BC_VACUUM, BC_ZERO_FLUX, GroupOperator,
+                       SDPNGroupOperator, SP3GroupOperator, _SPN_C)
+from .solver import (DiffusionEigenSolver, Fields, Result, SDP1EigenSolver,
+                     SDPNEigenSolver)
+
+
+def _anderson_mix(hist, S, xp):
+    """One Anderson update of the fixed-point iterate S from the history of
+    (S_j, G(S_j)) pairs (oldest first; the current sweep is hist[-1]): the
+    residual-minimizing affine combination of the stored sweeps. Returns S
+    unchanged when the small dense system is singular or the coefficients
+    blow up (falls back to plain Picard)."""
+    F = [Gj - Sj for Sj, Gj in hist]
+    dF = [Fj - F[-1] for Fj in F[:-1]]
+    m = len(dF)
+    A = np.array([[float(xp.sum(dF[i] * dF[j])) for j in range(m)]
+                  for i in range(m)])
+    b = np.array([-float(xp.sum(dF[i] * F[-1])) for i in range(m)])
+    A[np.diag_indices(m)] += 1e-12 * (np.trace(A) + 1e-300)
+    try:
+        gamma = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        return S
+    if not np.all(np.abs(gamma) < 1e4):
+        return S
+    for j in range(m):
+        S = S + float(gamma[j]) * (hist[j][1] - hist[-1][1])
+    return S
 
 
 @dataclass
@@ -82,14 +108,17 @@ class TransientSolver:
                  nothing changes — operators are rebuilt only on identity
                  change of either element.
     kinetics   : Kinetics (velocities, delayed families).
-    bc, device, dtype : as for DiffusionEigenSolver.
+    bc, device, dtype, linear_solver, symmetric_operator : as for
+                 DiffusionEigenSolver (symmetric_operator=False needs a
+                 non-symmetric linear_solver and the default group_operator).
     """
 
     def __init__(self, grid: Grid, problem_at, kinetics: Kinetics,
                  bc=BC_ZERO_FLUX, device: str = "auto", dtype=np.float64,
                  active=None, mask_bc=BC_VACUUM,
                  group_operator=GroupOperator, eig_solver=DiffusionEigenSolver,
-                 precond_degree: int = 0):
+                 precond_degree: int = 0, linear_solver="cg",
+                 symmetric_operator: bool = True):
         self.grid = grid
         self.problem_at = problem_at
         self.kinetics = kinetics
@@ -101,6 +130,12 @@ class TransientSolver:
         self.group_operator = group_operator
         self.eig_solver = eig_solver
         self.precond_degree = int(precond_degree)
+        self.linear_solver = linear_solver
+        self.symmetric_operator = bool(symmetric_operator)
+        # Only the structured GroupOperator knows the kwarg; pluggable
+        # geometries (hex, ...) never see it in the default (True) case.
+        self._op_kwargs = {} if self.symmetric_operator else {"symmetric": False}
+        self._linsolve = get_linear_solver(linear_solver)
         self.xp = get_backend(device)
         self.device = device_name(self.xp)
         self.dtype = np.dtype(dtype)
@@ -126,7 +161,9 @@ class TransientSolver:
         eig = self.eig_solver(self.grid, mats, mmap, bc=self.bc,
                               device="cpu" if xp is np else "gpu",
                               dtype=self.dtype,
-                              active=self.active, mask_bc=self.mask_bc)
+                              active=self.active, mask_bc=self.mask_bc,
+                              linear_solver=self.linear_solver,
+                              symmetric_operator=self.symmetric_operator)
         G = eig.n_groups
         if len(kin.velocities) != G:
             raise ValueError("kinetics.velocities must have one entry per group")
@@ -135,10 +172,21 @@ class TransientSolver:
             raise RuntimeError(f"initial steady state did not converge: {steady}")
         k0 = steady.k_eff
 
+        # Cylindrical grids: the power integral is always the metric-weighted
+        # sum (physics, independent of the operator form), while the source
+        # weight fed to the operators follows the operator itself -- the
+        # volume-weighted SPD form wants a weighted source (.rhs_weight),
+        # the divergence form and Cartesian grids take the source as-is.
+        met = getattr(self.grid, "cylindrical_metrics", lambda: None)()
+        vol_w = None if met is None else xp.asarray(met[0], dtype=self.dtype)
+
+        def total_power(src):
+            return float(xp.sum(src if vol_w is None else src * vol_w))
+
         fields = eig.fields
         phi = [steady.flux[g].copy() for g in range(G)]
         S = fields.fission_source(phi) / k0
-        scale = 1.0 / float(xp.sum(S))          # P(0) = 1
+        scale = 1.0 / total_power(S)            # P(0) = 1
         for g in range(G):
             phi[g] *= scale
         S = S * scale
@@ -155,10 +203,12 @@ class TransientSolver:
 
         ops = [self.group_operator(xp, self.grid, fields.diffusion[g],
                              fields.removal[g] + inv_vdt[g], bc=self.bc,
-                             active=self.active, mask_bc=self.mask_bc)
+                             active=self.active, mask_bc=self.mask_bc,
+                             **self._op_kwargs)
                for g in range(G)]
         preconds = [neumann_preconditioner(op.apply, op.inv_diag,
                                            self.precond_degree) for op in ops]
+        src_w = getattr(ops[0], "rhs_weight", None)
         last = (mats, mmap)
 
         times = [0.0]
@@ -172,11 +222,13 @@ class TransientSolver:
                 fields = Fields(xp, self.grid, mats, mmap, self.dtype)
                 ops = [self.group_operator(xp, self.grid, fields.diffusion[g],
                                      fields.removal[g] + inv_vdt[g], bc=self.bc,
-                                     active=self.active, mask_bc=self.mask_bc)
+                                     active=self.active, mask_bc=self.mask_bc,
+                                     **self._op_kwargs)
                        for g in range(G)]
                 preconds = [neumann_preconditioner(op.apply, op.inv_diag,
                                                    self.precond_degree)
                             for op in ops]
+                src_w = getattr(ops[0], "rhs_weight", None)
                 last = (mats, mmap)
 
             phi_old = [p.copy() for p in phi]
@@ -205,9 +257,11 @@ class TransientSolver:
                         s = fields.sigma_s[gf][g]
                         if gf != g and s is not None:
                             q += s * phi[gf]
-                    phi[g], n_it = pcg(ops[g].apply, q, phi[g],
-                                       ops[g].inv_diag, xp, rtol=rtol,
-                                       precond=preconds[g])
+                    if src_w is not None:
+                        q = q * src_w
+                    phi[g], n_it = self._linsolve(ops[g].apply, q, phi[g],
+                                                  ops[g].inv_diag, xp, rtol=rtol,
+                                                  precond=preconds[g])
                     inner_total += n_it
                 G_S = fields.fission_source(phi) / k0
                 delta = G_S - S
@@ -219,22 +273,7 @@ class TransientSolver:
                 hist = hist[-anderson_depth:]
                 S = G_S
                 if len(hist) >= 2:
-                    # min || F_last + sum_j gamma_j (F_j - F_last) ||_2 over the
-                    # residuals F_j = G_j - S_j (small dense normal equations).
-                    F = [Gj - Sj for Sj, Gj in hist]
-                    dF = [Fj - F[-1] for Fj in F[:-1]]
-                    m = len(dF)
-                    A = np.array([[float(xp.sum(dF[i] * dF[j])) for j in range(m)]
-                                  for i in range(m)])
-                    b = np.array([-float(xp.sum(dF[i] * F[-1])) for i in range(m)])
-                    A[np.diag_indices(m)] += 1e-12 * (np.trace(A) + 1e-300)
-                    try:
-                        gamma = np.linalg.solve(A, b)
-                    except np.linalg.LinAlgError:
-                        gamma = None
-                    if gamma is not None and np.all(np.abs(gamma) < 1e4):
-                        for j in range(m):
-                            S = S + float(gamma[j]) * (hist[j][1] - hist[-1][1])
+                    S = _anderson_mix(hist, S, xp)
             else:
                 raise RuntimeError(
                     f"time step at t={t:g} s did not converge "
@@ -244,7 +283,7 @@ class TransientSolver:
                 C[i] = (C[i] + (dt * beta[i]) * S) / (1.0 + lam[i] * dt)
 
             times.append(t)
-            power.append(float(xp.sum(S)))
+            power.append(total_power(S))
             if verbose and (n % max(1, n_steps // 20) == 0 or n == n_steps):
                 print(f"  t = {t:8.4f} s   P/P0 = {power[-1]:.5f}   ({sweep} sweeps)")
 
@@ -260,3 +299,437 @@ class TransientSolver:
             solve_seconds=time.perf_counter() - t0,
             device=self.device,
         )
+
+
+class TransientSDP1Solver:
+    """Time-dependent multigroup SDP1 (simplified double-P1) solver.
+
+    The transient counterpart of :class:`~ndgpu.SDP1EigenSolver`: the same
+    two-moment (Phi1 = phi0 + 2 phi2, phi2) block as the steady SDP1, marched in
+    time with backward Euler and the same delayed-precursor / Anderson machinery
+    as :class:`TransientSolver`. The even-moment time derivatives couple through
+    the exact (symmetric) time matrix theta * sum_m c^(m) -- see the theta note
+    on :class:`~ndgpu.operator.SP3GroupOperator` -- so the transient block stays
+    SPD and the within-step solve uses CG, exactly like the steady SDP1.
+    Odd-moment time derivatives are neglected (the standard quasi-static
+    closure of time-SP3 kinetics). Captures the transport correction to reactor
+    kinetics (steeper
+    gradients, stronger absorbers) that diffusion kinetics misses, at ~2x the
+    per-step cost. Same ``problem_at`` / ``Kinetics`` interface and
+    :class:`TransientResult` as the diffusion solver.
+    """
+
+    def __init__(self, grid: Grid, problem_at, kinetics: Kinetics,
+                 bc=BC_ZERO_FLUX, device: str = "auto", dtype=np.float64,
+                 active=None, mask_bc=BC_VACUUM, precond_degree: int = 0):
+        self.grid = grid
+        self.problem_at = problem_at
+        self.kinetics = kinetics
+        self.bc = bc
+        self.active = active
+        self.mask_bc = mask_bc
+        self.precond_degree = int(precond_degree)
+        self._linsolve = get_linear_solver("cg")
+        self.xp = get_backend(device)
+        self.device = device_name(self.xp)
+        self.dtype = np.dtype(dtype)
+
+    @staticmethod
+    def _phi0(state_g):
+        return state_g[0] - 2.0 * state_g[1]
+
+    def _build_ops(self, xp, fields, inv_vdt, G):
+        ops = [SP3GroupOperator(xp, self.grid, fields.diffusion[g],
+                                fields.sigma_t[g], fields.removal[g], bc=self.bc,
+                                active=self.active, mask_bc=self.mask_bc,
+                                variant="sdp1", theta=inv_vdt[g])
+               for g in range(G)]
+        preconds = [neumann_preconditioner(op.apply, op.inv_diag,
+                                           self.precond_degree) for op in ops]
+        return ops, preconds
+
+    def solve(self, t_end: float, dt: float, tol_step: float = 1e-6,
+              max_sweeps: int = 200, anderson_depth: int = 5,
+              steady_kwargs: dict | None = None,
+              verbose: bool = False) -> TransientResult:
+        """March from the steady SDP1 state at t=0 to t_end with fixed step dt
+        (see :meth:`TransientSolver.solve` for the shared parameters)."""
+        xp, kin = self.xp, self.kinetics
+        beta, lam = kin.beta, kin.decay
+        n_steps = int(round(t_end / dt))
+        synchronize(xp)
+        t0 = time.perf_counter()
+
+        mats, mmap = self.problem_at(0.0)
+        eig = SDP1EigenSolver(self.grid, mats, mmap, bc=self.bc,
+                              device="cpu" if xp is np else "gpu",
+                              dtype=self.dtype, active=self.active,
+                              mask_bc=self.mask_bc)
+        G = eig.n_groups
+        if len(kin.velocities) != G:
+            raise ValueError("kinetics.velocities must have one entry per group")
+        steady = eig.solve(**(steady_kwargs or dict(tol_k=1e-8, tol_source=1e-7)))
+        if not steady.converged:
+            raise RuntimeError(f"initial steady state did not converge: {steady}")
+        k0 = steady.k_eff
+
+        met = getattr(self.grid, "cylindrical_metrics", lambda: None)()
+        vol_w = None if met is None else xp.asarray(met[0], dtype=self.dtype)
+
+        def total_power(src):
+            return float(xp.sum(src if vol_w is None else src * vol_w))
+
+        fields = eig.fields
+        state = [s.copy() for s in eig.state]          # (2, *grid) per group
+        phi0 = [self._phi0(state[g]) for g in range(G)]
+        S = fields.fission_source(phi0) / k0
+        scale = 1.0 / total_power(S)                    # P(0) = 1
+        for g in range(G):
+            state[g] *= scale
+        S = S * scale
+        C = [(beta[i] / lam[i]) * S for i in range(kin.n_families)]
+
+        omega = float(np.sum(lam * dt * beta / (1.0 + lam * dt)))
+        fis_w = (1.0 - kin.beta_total) + omega
+        inv_vdt = [1.0 / (kin.velocities[g] * dt) for g in range(G)]
+
+        def chi_d(g):
+            return (fields.chi[g] if kin.chi_delayed is None
+                    else float(kin.chi_delayed[g]))
+
+        ops, preconds = self._build_ops(xp, fields, inv_vdt, G)
+        src_w = getattr(ops[0], "rhs_weight", None)
+        last = (mats, mmap)
+
+        times = [0.0]
+        power = [1.0]
+        inner_total = 0
+
+        for n in range(1, n_steps + 1):
+            t = n * dt
+            mats, mmap = self.problem_at(t)
+            if mats is not last[0] or mmap is not last[1]:
+                fields = Fields(xp, self.grid, mats, mmap, self.dtype)
+                ops, preconds = self._build_ops(xp, fields, inv_vdt, G)
+                src_w = getattr(ops[0], "rhs_weight", None)
+                last = (mats, mmap)
+
+            state_old = [s.copy() for s in state]
+            phi0_old = [self._phi0(s) for s in state_old]
+            dsrc = (lam[0] / (1.0 + lam[0] * dt)) * C[0]
+            for i in range(1, kin.n_families):
+                dsrc += (lam[i] / (1.0 + lam[i] * dt)) * C[i]
+
+            change = 1.0
+            hist: list = []
+            for sweep in range(1, max_sweeps + 1):
+                rtol = min(1e-6, max(1e-3 * change, 1e-3 * tol_step, 1e-12))
+                phi0 = [self._phi0(state[g]) for g in range(G)]
+                for g in range(G):
+                    # Isotropic external source into phi0 (fission + delayed +
+                    # in-scatter); the time term is carried by the block below.
+                    q = (fis_w * fields.chi[g]) * S + chi_d(g) * dsrc
+                    for gf in range(G):
+                        s = fields.sigma_s[gf][g]
+                        if gf != g and s is not None:
+                            q += s * phi0[gf]
+                    if src_w is not None:
+                        q = q * src_w
+                    theta = inv_vdt[g]
+                    rhs = xp.empty_like(state[g])
+                    # Backward-Euler time sources mirror the operator's exact
+                    # time terms: theta*phi0 on row 0 and, on the 5x-scaled
+                    # row 1, theta*(9 phi2 - 2 Phi1) = theta*(5 phi2 - 2 phi0).
+                    rhs[0] = q + theta * phi0_old[g]
+                    rhs[1] = -2.0 * q + theta * (5.0 * state_old[g][1]
+                                                 - 2.0 * phi0_old[g])
+                    state[g], n_it = self._linsolve(
+                        ops[g].apply, rhs, state[g], ops[g].inv_diag, xp,
+                        rtol=rtol, precond=preconds[g])
+                    inner_total += n_it
+                    phi0[g] = self._phi0(state[g])
+                G_S = fields.fission_source(phi0) / k0
+                delta = G_S - S
+                change = float(xp.sqrt(xp.sum(delta * delta) / xp.sum(G_S**2)))
+                if change < tol_step:
+                    S = G_S
+                    break
+                hist.append((S, G_S))
+                hist = hist[-anderson_depth:]
+                S = G_S
+                if len(hist) >= 2:
+                    S = _anderson_mix(hist, S, xp)
+            else:
+                raise RuntimeError(
+                    f"time step at t={t:g} s did not converge "
+                    f"({max_sweeps} sweeps, source change {change:.2e})")
+
+            for i in range(kin.n_families):
+                C[i] = (C[i] + (dt * beta[i]) * S) / (1.0 + lam[i] * dt)
+
+            times.append(t)
+            power.append(total_power(S))
+            if verbose and (n % max(1, n_steps // 20) == 0 or n == n_steps):
+                print(f"  t = {t:8.4f} s   P/P0 = {power[-1]:.5f}   ({sweep} sweeps)")
+
+        synchronize(xp)
+        return TransientResult(
+            times=np.array(times), power=np.array(power), k0=k0, steady=steady,
+            flux=xp.stack([self._phi0(state[g]) for g in range(G)]),
+            precursors=xp.stack(C), total_inner_iterations=inner_total,
+            solve_seconds=time.perf_counter() - t0, device=self.device,
+        )
+
+
+class TransientSDPNSolver:
+    """Time-dependent multigroup SDPN solver in the diffusive U-form, order N
+    in {1, 2, 3} (M = N+1 moments) -- the transient counterpart of
+    :class:`~ndgpu.SDPNEigenSolver` and its SDP2/SDP3 subclasses.
+
+    Backward Euler with the exact even-moment time coupling: in the U-form a
+    time derivative transforms exactly like a cross section that is equal in
+    every even moment, so the time matrix is theta * sum_m c^(m) (theta =
+    1/(v dt); ``SDPNGroupOperator.time_weights``), and the step source adds
+    the matching theta * time_weights . U_old per moment row. Odd-moment time
+    derivatives are neglected -- the standard quasi-static closure of
+    time-SPN kinetics, the same approximation as :class:`TransientSDP1Solver`
+    (which order 1 reproduces through the dedicated two-moment block). Same
+    ``problem_at`` / ``Kinetics`` interface, delayed-precursor treatment and
+    :class:`TransientResult` as :class:`TransientSolver`; the within-step
+    block is non-symmetric (double-PN closure), so it is solved with CG in a
+    symmetrizing basis when the tables and boundary conditions admit one and
+    with BiCGStab otherwise (same auto-selection as the steady solver).
+    """
+
+    _coeffs = None                 # None -> SDPN tables (operator default)
+
+    def __init__(self, grid: Grid, problem_at, kinetics: Kinetics,
+                 order: int = 3, bc=BC_ZERO_FLUX, device: str = "auto",
+                 dtype=np.float64, active=None, mask_bc=BC_VACUUM,
+                 precond_degree: int = 0, symmetrize: bool | None = None):
+        self.grid = grid
+        self.problem_at = problem_at
+        self.kinetics = kinetics
+        self.order = int(order)
+        self.bc = bc
+        self.active = active
+        self.mask_bc = mask_bc
+        self.precond_degree = int(precond_degree)
+        # Symmetrize like the steady solver (the exact time matrix
+        # theta * sum_m c^(m) transforms along with A, so the transient block
+        # is symmetric exactly when the steady one is) and run CG; otherwise
+        # BiCGStab. Auto = the diagonal similarity when the tables admit one
+        # (SDP1/SDP2; SPN tables are symmetric as-is); on order 3 (no
+        # similarity) auto falls back to the congruence basis whenever the
+        # boundary conditions allow it (reflective/zero-flux faces only, see
+        # CongruentSDPNOperator).
+        from .operator import _SDPN_C, _congruence_available, _diag_similarity
+        tabs = (self._coeffs if self._coeffs is not None else _SDPN_C)[self.order]
+        r = _diag_similarity(tabs)
+        identity = r is not None and all(abs(x - 1.0) < 1e-12 for x in r)
+        if symmetrize is None:
+            if r is not None:
+                symmetrize = not identity
+            else:
+                symmetrize = _congruence_available(self.order, grid, bc,
+                                                   active, mask_bc,
+                                                   coeffs=self._coeffs)
+        self._symmetrize = bool(symmetrize)
+        self._diag_sym = r is not None
+        symmetric = identity or self._symmetrize
+        self._linsolve = get_linear_solver("cg" if symmetric else "bicgstab")
+        self.xp = get_backend(device)
+        self.device = device_name(self.xp)
+        self.dtype = np.dtype(dtype)
+
+    def _build_ops(self, xp, fields, inv_vdt, G):
+        if self._symmetrize and not self._diag_sym:
+            from .operator import CongruentSDPNOperator
+            ops = [CongruentSDPNOperator(xp, self.grid, fields.diffusion[g],
+                                         fields.sigma_t[g], fields.removal[g],
+                                         order=self.order, bc=self.bc,
+                                         active=self.active,
+                                         mask_bc=self.mask_bc,
+                                         coeffs=self._coeffs,
+                                         theta=inv_vdt[g])
+                   for g in range(G)]
+        else:
+            ops = [SDPNGroupOperator(xp, self.grid, fields.diffusion[g],
+                                     fields.sigma_t[g], fields.removal[g],
+                                     order=self.order, bc=self.bc,
+                                     active=self.active, mask_bc=self.mask_bc,
+                                     coeffs=self._coeffs, theta=inv_vdt[g],
+                                     symmetrize=self._symmetrize)
+               for g in range(G)]
+        preconds = [neumann_preconditioner(op.apply, op.inv_diag,
+                                           self.precond_degree) for op in ops]
+        return ops, preconds
+
+    def solve(self, t_end: float, dt: float, tol_step: float = 1e-6,
+              max_sweeps: int = 200, anderson_depth: int = 5,
+              steady_kwargs: dict | None = None,
+              verbose: bool = False) -> TransientResult:
+        """March from the steady SDPN state at t=0 to t_end with fixed step dt
+        (see :meth:`TransientSolver.solve` for the shared parameters)."""
+        xp, kin = self.xp, self.kinetics
+        beta, lam = kin.beta, kin.decay
+        n_steps = int(round(t_end / dt))
+        synchronize(xp)
+        t0 = time.perf_counter()
+
+        mats, mmap = self.problem_at(0.0)
+        eig_cls = type(f"_SDPN{self.order}Eig", (SDPNEigenSolver,),
+                       {"_order": self.order, "_coeffs": self._coeffs})
+        # The steady state seeds the marching state, so it must live in the
+        # same (possibly symmetrized) moment basis as the transient operators.
+        eig = eig_cls(self.grid, mats, mmap, bc=self.bc,
+                      device="cpu" if xp is np else "gpu", dtype=self.dtype,
+                      active=self.active, mask_bc=self.mask_bc,
+                      symmetrize=self._symmetrize)
+        G = eig.n_groups
+        M = self.order + 1
+        if len(kin.velocities) != G:
+            raise ValueError("kinetics.velocities must have one entry per group")
+        steady = eig.solve(**(steady_kwargs or dict(tol_k=1e-8, tol_source=1e-7)))
+        if not steady.converged:
+            raise RuntimeError(f"initial steady state did not converge: {steady}")
+        k0 = steady.k_eff
+
+        met = getattr(self.grid, "cylindrical_metrics", lambda: None)()
+        vol_w = None if met is None else xp.asarray(met[0], dtype=self.dtype)
+
+        def total_power(src):
+            return float(xp.sum(src if vol_w is None else src * vol_w))
+
+        fields = eig.fields
+        w_phi = eig.ops[0].phi0_weights          # phi0 = w_phi . U
+        w_src = eig.ops[0].src_weights           # isotropic source row weights
+        tw = eig.ops[0].time_weights             # exact time matrix / theta
+
+        def phi0_of(state_g):
+            p = w_phi[0] * state_g[0]
+            for j in range(1, M):
+                if w_phi[j] != 0.0:
+                    p = p + w_phi[j] * state_g[j]
+            return p
+
+        state = [s.copy() for s in eig.state]    # (M, *grid) per group
+        phi0 = [phi0_of(state[g]) for g in range(G)]
+        S = fields.fission_source(phi0) / k0
+        scale = 1.0 / total_power(S)             # P(0) = 1
+        for g in range(G):
+            state[g] *= scale
+        S = S * scale
+        C = [(beta[i] / lam[i]) * S for i in range(kin.n_families)]
+
+        omega = float(np.sum(lam * dt * beta / (1.0 + lam * dt)))
+        fis_w = (1.0 - kin.beta_total) + omega
+        inv_vdt = [1.0 / (kin.velocities[g] * dt) for g in range(G)]
+
+        def chi_d(g):
+            return (fields.chi[g] if kin.chi_delayed is None
+                    else float(kin.chi_delayed[g]))
+
+        ops, preconds = self._build_ops(xp, fields, inv_vdt, G)
+        src_w = getattr(ops[0], "rhs_weight", None)
+        last = (mats, mmap)
+
+        times = [0.0]
+        power = [1.0]
+        inner_total = 0
+
+        for n in range(1, n_steps + 1):
+            t = n * dt
+            mats, mmap = self.problem_at(t)
+            if mats is not last[0] or mmap is not last[1]:
+                fields = Fields(xp, self.grid, mats, mmap, self.dtype)
+                ops, preconds = self._build_ops(xp, fields, inv_vdt, G)
+                src_w = getattr(ops[0], "rhs_weight", None)
+                last = (mats, mmap)
+
+            state_old = [s.copy() for s in state]
+            dsrc = (lam[0] / (1.0 + lam[0] * dt)) * C[0]
+            for i in range(1, kin.n_families):
+                dsrc += (lam[i] / (1.0 + lam[i] * dt)) * C[i]
+
+            change = 1.0
+            hist: list = []
+            for sweep in range(1, max_sweeps + 1):
+                rtol = min(1e-6, max(1e-3 * change, 1e-3 * tol_step, 1e-12))
+                phi0 = [phi0_of(state[g]) for g in range(G)]
+                for g in range(G):
+                    # Isotropic external source into phi0 (fission + delayed +
+                    # in-scatter), distributed over the moment rows by the
+                    # first column of c^(1); each row also carries its exact
+                    # backward-Euler time source theta * time_weights . U_old.
+                    q = (fis_w * fields.chi[g]) * S + chi_d(g) * dsrc
+                    for gf in range(G):
+                        s = fields.sigma_s[gf][g]
+                        if gf != g and s is not None:
+                            q += s * phi0[gf]
+                    if src_w is not None:
+                        q = q * src_w
+                    theta = inv_vdt[g]
+                    rhs = xp.empty_like(state[g])
+                    for i in range(M):
+                        rhs[i] = w_src[i] * q
+                        for j in range(M):
+                            if tw[i][j] != 0.0:
+                                rhs[i] += (theta * tw[i][j]) * state_old[g][j]
+                    state[g], n_it = self._linsolve(
+                        ops[g].apply, rhs, state[g], ops[g].inv_diag, xp,
+                        rtol=rtol, precond=preconds[g])
+                    inner_total += n_it
+                    phi0[g] = phi0_of(state[g])
+                G_S = fields.fission_source(phi0) / k0
+                delta = G_S - S
+                change = float(xp.sqrt(xp.sum(delta * delta) / xp.sum(G_S**2)))
+                if change < tol_step:
+                    S = G_S
+                    break
+                hist.append((S, G_S))
+                hist = hist[-anderson_depth:]
+                S = G_S
+                if len(hist) >= 2:
+                    S = _anderson_mix(hist, S, xp)
+            else:
+                raise RuntimeError(
+                    f"time step at t={t:g} s did not converge "
+                    f"({max_sweeps} sweeps, source change {change:.2e})")
+
+            for i in range(kin.n_families):
+                C[i] = (C[i] + (dt * beta[i]) * S) / (1.0 + lam[i] * dt)
+
+            times.append(t)
+            power.append(total_power(S))
+            if verbose and (n % max(1, n_steps // 20) == 0 or n == n_steps):
+                print(f"  t = {t:8.4f} s   P/P0 = {power[-1]:.5f}   ({sweep} sweeps)")
+
+        synchronize(xp)
+        return TransientResult(
+            times=np.array(times), power=np.array(power), k0=k0, steady=steady,
+            flux=xp.stack([phi0_of(state[g]) for g in range(G)]),
+            precursors=xp.stack(C), total_inner_iterations=inner_total,
+            solve_seconds=time.perf_counter() - t0, device=self.device,
+        )
+
+
+class TransientSDP3Solver(TransientSDPNSolver):
+    """Time-dependent multigroup SDP3 solver (4-moment U-form block) -- the
+    transient counterpart of :class:`~ndgpu.SDP3EigenSolver`. See
+    :class:`TransientSDPNSolver`."""
+
+    def __init__(self, grid: Grid, problem_at, kinetics: Kinetics, **kwargs):
+        kwargs.pop("order", None)
+        super().__init__(grid, problem_at, kinetics, order=3, **kwargs)
+
+
+class TransientSPNSolver(TransientSDPNSolver):
+    """Time-dependent multigroup standard-SPN solver: order 0/1/2/3 =
+    SP1/SP3/SP5/SP7 kinetics. Identical machinery to
+    :class:`TransientSDPNSolver` with the standard SPN coefficient tables
+    (both A and the time matrix theta * sum_m c^(m) are then symmetric).
+    Order 0 is P1/diffusion kinetics run through the block machinery --
+    equivalent to :class:`TransientSolver` (tested)."""
+
+    _coeffs = _SPN_C

@@ -16,12 +16,14 @@ without a checkout).
 | File | Pins down |
 |---|---|
 | `test_diffusion_analytic.py` | Cartesian FV vs exact bare-reactor solutions, 2nd-order convergence |
+| `test_cylindrical.py` | cylindrical (r-z) FV vs the exact bare-cylinder (Bessel-mode) eigenvalue, 2nd-order convergence, inert axis bc |
 | `test_sp3_analytic.py` | SP3 vs the exact analytic SP3 eigenvalue |
 | `test_boundary_conditions.py` | bc spec forms; symmetry-plane invariant |
 | `test_hex_lattice.py` | hex topology, k = k∞ invariant, BC ordering |
 | `test_tri_prisms.py` | tri-z extrusion: slab limit, order, extruded-2D = 3D |
 | `test_unstructured_mesh.py` | unstructured FV ≡ structured FV on the same mesh |
 | `test_transient_point_kinetics.py` | transient stack vs the exact point-kinetics ODE |
+| `test_linalg_krylov.py` | GMRES/BiCGStab options: match CG on SPD systems through every solver entry point; solve a convection-dominated non-symmetric system where CG provably diverges; the non-symmetric divergence-form cylindrical stencil (`symmetric_operator=False`) equals the SPD-weighted one |
 | `test_femffusion_io.py` | .xsec/XML readers vs the files' exact contents |
 
 ## `validation/` — does it reproduce *published reactor problems*?
@@ -38,6 +40,7 @@ there is a single source of truth for every published number.
 | `test_biblis_iaea.py` | BIBLIS 2D, IAEA 3D | published k's, FEMFFUSION |
 | `test_vver440.py` | VVER-440 2D (tri + Gmsh mesh) | FEMFFUSION k = 1.00349 |
 | `test_twigl_langenbuch.py` | TWIGL 2D, Langenbuch/LMW 3D kinetics | published power histories |
+| `test_anl7416_8a1.py` | ANL-7416 Problem 8-A1 (r-z kinetics) | book k's + Exhibit A power trace |
 | `test_hpmr.py` | HP-MR microreactor 2D/3D | behavioural (placeholder XS): symmetry, drum worth, mesh stability |
 
 Related directories: `ndgpu/benchmarks/` holds the benchmark *problem

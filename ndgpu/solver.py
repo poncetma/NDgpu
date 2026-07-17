@@ -29,6 +29,7 @@ the entire solve; only per-iteration convergence scalars cross the PCIe bus.
 
 from __future__ import annotations
 
+import inspect
 import time
 from dataclasses import dataclass, field
 
@@ -36,9 +37,12 @@ import numpy as np
 
 from .backend import asnumpy, device_name, get_backend, synchronize
 from .grid import Grid
-from .linalg import neumann_preconditioner, pcg
+from .linalg import get_linear_solver, neumann_preconditioner, pcg
 from .materials import Material
-from .operator import BC_VACUUM, BC_ZERO_FLUX, GroupOperator, SP3GroupOperator
+from .operator import (BC_VACUUM, BC_ZERO_FLUX, CongruentSDPNOperator,
+                       GroupOperator, _SDPN_C, _SDPN_G, _SPN_C, _SPN_G,
+                       _congruence_available, _diag_similarity,
+                       SDPNGroupOperator, SP3GroupOperator)
 
 
 def _anderson_source(hist, raw, xp):
@@ -116,12 +120,14 @@ class Fields:
         # cell XS = (1 - w) * base + w * mix, for a per-cell mix material and
         # weight w (sentinel mix_material < 0 = no blend). This is the volume-
         # mixing homogenization used for a partially-present material -- e.g. a
-        # control-drum absorber arc that covers a fraction w of the cell, or a
-        # partially-inserted rod tip. Cross sections blend linearly (exact
-        # reaction-rate averaging under a flat flux); the diffusion coefficient
-        # blends *harmonically* (i.e. its transport cross section 1/(3D)
-        # volume-averages), so a trace of a strong absorber correctly chokes
-        # the cell. Non-blended cells stay bit-identical to the pure-index map.
+        # control-drum absorber arc that covers a fraction w of the cell, a
+        # partially-inserted rod tip, or a rasterized fuel-pin rim. Cross
+        # sections blend linearly (exact reaction-rate averaging under a flat
+        # flux); the diffusion coefficient blends *harmonically* (i.e. its
+        # transport cross section 1/(3D) volume-averages), so a trace of a
+        # strong absorber correctly chokes the cell; the emission spectrum chi
+        # blends by fission-production share (see below). Non-blended cells
+        # stay bit-identical to the pure-index map.
         mix = mix_material is not None
         if material_map is None:
             if len(mats) > 1:
@@ -162,7 +168,32 @@ class Fields:
             return [lookup(table[:, g]) for g in range(G)]
 
         self.nu_sigma_f = per_group("nu_sigma_f")
-        self.chi = per_group("chi")
+        # chi is an emission *spectrum*, not a cross section: blending it
+        # linearly by volume would leave a fissile material mixed with a
+        # non-fissile one emitting a spectrum that sums to w -- silently losing
+        # (1 - w) of the cell's fission neutrons. The correct merge weights
+        # each component's spectrum by its share of the cell's fission
+        # production, w * sum_g nuSigma_f (flat-flux proxy; exact whenever at
+        # most one component is fissile, e.g. a fuel pin blended with
+        # moderator). Cells where neither component is fissile keep the base
+        # spectrum (it multiplies a zero source).
+        if mix:
+            prod = np.array([np.sum(m.nu_sigma_f) for m in mats])
+            chi_t = np.array([m.chi for m in mats])  # (M, G)
+            pdev = xp.asarray(prod, dtype=dtype)
+            wb = (1.0 - w) * pdev[mmap]
+            wo = w * pdev[mm2c]
+            den = wb + wo
+            blendable = active_mix & (den > 0)
+            safe_den = xp.where(den > 0, den, 1.0)
+            self.chi = []
+            for g in range(G):
+                cdev = xp.asarray(chi_t[:, g], dtype=dtype)
+                base = cdev[mmap]
+                merged = (wb * base + wo * cdev[mm2c]) / safe_den
+                self.chi.append(xp.where(blendable, merged, base))
+        else:
+            self.chi = per_group("chi")
         self.removal = per_group("removal")
         self.diffusion = per_group("diffusion", lookup=harm)
         self.sigma_t = per_group("sigma_t")
@@ -208,18 +239,39 @@ class _PowerIterationSolver:
                    GPU's only synchronization points. Degree 2-3 is a good
                    setting (cf. E et al., NED 320 (2017), where degree-3
                    Neumann-PCG was the fastest GPU solver for 2e4-3e6 cells).
+    linear_solver : "cg" (default), "gmres", or "bicgstab" -- the within-group
+                   Krylov solver. The built-in operators are SPD, so CG is
+                   right; the other two exist for future non-symmetric
+                   operators (see ndgpu.linalg) and as cross-checks, at
+                   higher cost.
+    symmetric_operator : cylindrical grids only (True default). False builds
+                   the natural divergence-form (per-unit-volume) stencil,
+                   which is non-symmetric -- pair it with
+                   linear_solver="gmres" or "bicgstab". Same discrete
+                   solution as the default volume-weighted SPD form; exists
+                   as a cross-check and a template for genuinely
+                   non-symmetrizable operators. Diffusion only (the SP3
+                   block symmetrization assumes SPD moment operators).
     """
 
     def __init__(self, grid: Grid, materials, material_map=None,
                  bc: str = BC_ZERO_FLUX, device: str = "auto", dtype=np.float64,
                  active=None, mask_bc=BC_VACUUM, precond_degree: int = 0,
-                 mix_material=None, mix_weight=None):
+                 mix_material=None, mix_weight=None, linear_solver="cg",
+                 symmetric_operator: bool = True):
         self.grid = grid
         self.xp = xp = get_backend(device)
         self.device = device_name(xp)
         self.dtype = np.dtype(dtype)
         self.active = active
         self.mask_bc = mask_bc
+        self.symmetric_operator = bool(symmetric_operator)
+        self._linsolve = get_linear_solver(linear_solver)
+        if (not self.symmetric_operator and self._linsolve is pcg
+                and getattr(grid, "geometry", "cartesian") == "cylindrical"):
+            raise ValueError(
+                "symmetric_operator=False builds the non-symmetric divergence-"
+                "form cylindrical stencil; use linear_solver='gmres' or 'bicgstab'")
 
         f = Fields(xp, grid, materials, material_map, self.dtype,
                    mix_material=mix_material, mix_weight=mix_weight)
@@ -232,6 +284,10 @@ class _PowerIterationSolver:
         self.sigma_s = f.sigma_s
 
         self._build_operators(grid, f.diffusion, f.sigma_t, f.removal, bc)
+        # Cylindrical grids: the operators are volume-weighted, so the
+        # isotropic source must carry the same per-cell metric factor
+        # (None on Cartesian grids -- the source is used as-is).
+        self._src_weight = getattr(self.ops[0], "rhs_weight", None)
         self.preconds = [neumann_preconditioner(op.apply, op.inv_diag,
                                                 int(precond_degree))
                          for op in self.ops]
@@ -333,9 +389,12 @@ class _PowerIterationSolver:
                     s = self.sigma_s[g][gf] if adjoint else self.sigma_s[gf][g]
                     if gf != g and s is not None:
                         q0 += s * self._phi(state[gf])
-                state[g], n_it = pcg(self.ops[g].apply, self._rhs(g, q0), state[g],
-                                     self.ops[g].inv_diag, xp, rtol=rtol,
-                                     precond=self.preconds[g])
+                if self._src_weight is not None:
+                    q0 = q0 * self._src_weight
+                state[g], n_it = self._linsolve(
+                    self.ops[g].apply, self._rhs(g, q0), state[g],
+                    self.ops[g].inv_diag, xp, rtol=rtol,
+                    precond=self.preconds[g])
                 inner_total += n_it
 
             fsrc_new = self._fission_source(state, prod)
@@ -377,6 +436,9 @@ class _PowerIterationSolver:
             total = xp.sum(fsrc)
 
         synchronize(xp)
+        # Retain the converged per-group state (moment vectors for the block
+        # solvers) so a transient can start from the exact steady moments.
+        self.state = state
         return Result(
             k_eff=k,
             flux=xp.stack([self._phi(state[g]) for g in range(G)]),
@@ -395,7 +457,8 @@ class DiffusionEigenSolver(_PowerIterationSolver):
 
     def _build_operators(self, grid, diffusion, sigma_t, removal, bc):
         self.ops = [GroupOperator(self.xp, grid, diffusion[g], removal[g], bc=bc,
-                                  active=self.active, mask_bc=self.mask_bc)
+                                  active=self.active, mask_bc=self.mask_bc,
+                                  symmetric=self.symmetric_operator)
                     for g in range(self.n_groups)]
 
     def _initial_state(self):
@@ -417,9 +480,16 @@ class SP3EigenSolver(_PowerIterationSolver):
     (steep flux gradients, strong absorbers, small cores).
     """
 
+    # Angular variant of the two-moment block: "sp3" (Brantley & Larsen) or
+    # "sdp1" (simplified double-P1); see SP3GroupOperator. Same solve otherwise.
+    _sp_variant = "sp3"
+
     def _build_operators(self, grid, diffusion, sigma_t, removal, bc):
+        if not self.symmetric_operator:
+            raise ValueError("symmetric_operator=False is diffusion-only: the "
+                             "SP3 block symmetrization assumes SPD moment operators")
         self.ops = [SP3GroupOperator(self.xp, grid, diffusion[g], sigma_t[g],
-                                     removal[g], bc=bc,
+                                     removal[g], bc=bc, variant=self._sp_variant,
                                      active=self.active, mask_bc=self.mask_bc)
                     for g in range(self.n_groups)]
 
@@ -440,3 +510,236 @@ class SP3EigenSolver(_PowerIterationSolver):
 
     def _phi(self, state_g):
         return state_g[0] - 2.0 * state_g[1]
+
+
+class SDP1EigenSolver(SP3EigenSolver):
+    """Multigroup simplified double-P1 (SDP1) k-eigenvalue solver.
+
+    The N=1 simplified double-PN approximation of Carreno et al., Ann. Nucl.
+    Energy 207 (2024) 110675. Same two-moment block, cost, and interface as
+    :class:`SP3EigenSolver` (SDP1 and SP3 have the identical number of degrees
+    of freedom), differing only in the second-moment diffusion coefficient
+    (see :class:`~ndgpu.operator.SP3GroupOperator`). Derived from a half-range
+    (double-PN) angular expansion, it resolves discontinuous angular flux more
+    faithfully than SP3, giving more accurate results across strongly
+    heterogeneous media at equal cost.
+    """
+
+    _sp_variant = "sdp1"
+
+
+def _peek_base_args(args, kwargs):
+    """(grid, bc, active, mask_bc) as _PowerIterationSolver.__init__ will see
+    them -- for subclasses that must make per-problem decisions before calling
+    super().__init__. Falls back to the defaults on a bad call signature (the
+    real error is then raised by super().__init__ itself)."""
+    sig = inspect.signature(_PowerIterationSolver.__init__)
+    try:
+        bound = sig.bind_partial(None, *args, **kwargs).arguments
+    except TypeError:
+        bound = {}
+    return (bound.get("grid"), bound.get("bc", BC_ZERO_FLUX),
+            bound.get("active"), bound.get("mask_bc", BC_VACUUM))
+
+
+class SDPNEigenSolver(_PowerIterationSolver):
+    """Multigroup simplified double-PN (SDPN) k-eigenvalue solver, order N in
+    {1, 2, 3}, in the diffusive U-form of Carreno et al., Ann. Nucl. Energy 207
+    (2024) 110675 (see :class:`~ndgpu.operator.SDPNGroupOperator`).
+
+    The group state is the M = N+1 even-moment vector U; the block reaction
+    matrix is non-symmetric (the double-PN closure), so the within-group solve
+    runs on CG in a symmetrizing basis whenever the tables and boundary
+    conditions admit one (see ``symmetrize`` below) and on BiCGStab otherwise. Successive orders match
+    the degrees of freedom of SP3/SP5/SP7 respectively and, for strongly
+    heterogeneous media, converge toward the transport solution from fewer
+    moments. Order 1 is equivalent to :class:`SDP1EigenSolver`, which is kept as
+    a faster symmetric (CG) special case; use N = 2, 3 for the higher orders.
+    """
+
+    _order = 2
+    _coeffs = None                 # None -> SDPN (operator default); _SPN_C -> SPN
+    _g_coeffs = _SDPN_G            # Marshak boundary matrices for this family
+
+    def __init__(self, *args, linear_solver: str | None = None,
+                 marshak_vacuum: bool = False, symmetrize: bool | None = None,
+                 spn_precondition: int | bool = 0, **kwargs):
+        # marshak_vacuum: apply the exact moment-coupled Marshak vacuum boundary
+        # (-n.D grad U = (g (x) I) U) on vacuum faces instead of the default
+        # per-moment Robin (alpha=1/2) approximation -- matches the SPN/SDPN
+        # boundary treatment of Carreno et al. (2024).
+        #
+        # symmetrize (default auto): put the block in a symmetric basis so
+        # the within-group solve runs on CG. Auto turns on the *diagonal
+        # similarity* whenever the tables admit one (SDP1/SDP2; works with
+        # every boundary type except Marshak). SDP3 admits no diagonal
+        # similarity, so auto falls back to the full symmetrizing *congruence*
+        # (CongruentSDPNOperator) whenever this problem's boundaries allow it
+        # -- every face (and the active-mask boundary, if any) reflective or
+        # zero-flux, e.g. C5G7; vacuum-Robin faces are moment-dependent and
+        # break the symmetry, so those problems keep the plain non-symmetric
+        # form. The SPN family is symmetric as-is -- including its Marshak g
+        # -- and takes CG without any transform. linear_solver=None resolves
+        # to "cg" for a symmetric block and "bicgstab" otherwise.
+        #
+        # spn_precondition: for the blocks that stay non-symmetric (SDP3 with
+        # vacuum faces, any SDPN order with Marshak), precondition BiCGStab/
+        # GMRES with `spn_precondition` Neumann (damped-Jacobi) sweeps of the
+        # matched-order standard-SPN block -- the symmetric operator that
+        # differs from SDPN only in the closure rows of the c tables (same
+        # D_i, same boundary structure; with Marshak it carries SPN's own
+        # symmetric g). The sweeps are a fixed linear operator, so both
+        # BiCGStab and right-preconditioned GMRES remain valid. 0/False = off
+        # (plain Jacobi, the default); True = 2 sweeps. Use EVEN sweep counts:
+        # the block's moment coupling makes Jacobi non-contractive, so an
+        # odd-degree Neumann polynomial is indefinite and stalls the Krylov
+        # solve (measured: degree 1 is 10x WORSE than plain Jacobi). Degree 2
+        # roughly halves the Krylov applies (Brantley-Larsen SDP3/vacuum and
+        # SDP2/Marshak) but each sweep costs one block apply, so on CPU it is
+        # net-slower than Jacobi; it is aimed at GPU runs, where applies are
+        # streaming kernels and the saved iterations remove global reductions
+        # (cf. the same trade-off for precond_degree / Neumann-PCG).
+        # Meaningless on a path that already runs symmetric/CG (the companion
+        # lives in the untransformed basis), so that combination raises.
+        self.marshak_vacuum = bool(marshak_vacuum)
+        coeffs = self._coeffs if self._coeffs is not None else _SDPN_C
+        r = _diag_similarity(coeffs[self._order])
+        identity = r is not None and all(abs(x - 1.0) < 1e-12 for x in r)
+        if symmetrize is None:
+            if r is not None:
+                symmetrize = not identity and not self.marshak_vacuum
+            else:
+                grid, bc, active, mask_bc = _peek_base_args(args, kwargs)
+                symmetrize = (not self.marshak_vacuum and
+                              _congruence_available(self._order, grid, bc,
+                                                    active, mask_bc,
+                                                    coeffs=self._coeffs))
+        self._symmetrize = bool(symmetrize)
+        self._diag_sym = r is not None                # similarity vs congruence
+        if self._symmetrize and self.marshak_vacuum:
+            raise ValueError("symmetrize is incompatible with marshak_vacuum")
+        symmetric = identity or self._symmetrize
+        self._spn_precond = 2 if spn_precondition is True else int(spn_precondition)
+        if self._spn_precond < 0:
+            raise ValueError("spn_precondition must be a non-negative sweep count")
+        if self._spn_precond and symmetric:
+            raise ValueError("spn_precondition applies only to the "
+                             "non-symmetric SDPN path; this block is "
+                             "symmetric(-ized) and already runs CG")
+        if linear_solver is None:
+            linear_solver = "cg" if symmetric else "bicgstab"
+        super().__init__(*args, linear_solver=linear_solver, **kwargs)
+        if self._spn_precond:
+            self.preconds = [neumann_preconditioner(op.apply, op.inv_diag,
+                                                    self._spn_precond)
+                             for op in self._precond_ops]
+
+    def _build_operators(self, grid, diffusion, sigma_t, removal, bc):
+        if not self.symmetric_operator:
+            raise ValueError("symmetric_operator=False is diffusion-only")
+        if self._symmetrize and not self._diag_sym:
+            self.ops = [CongruentSDPNOperator(
+                self.xp, grid, diffusion[g], sigma_t[g], removal[g],
+                order=self._order, bc=bc, active=self.active,
+                mask_bc=self.mask_bc, op_cls=self._moment_op_cls,
+                coeffs=self._coeffs) for g in range(self.n_groups)]
+            return
+        bg = self._g_coeffs[self._order] if self.marshak_vacuum else None
+        self.ops = [SDPNGroupOperator(self.xp, grid, diffusion[g], sigma_t[g],
+                                      removal[g], order=self._order, bc=bc,
+                                      active=self.active, mask_bc=self.mask_bc,
+                                      op_cls=self._moment_op_cls,
+                                      coeffs=self._coeffs, boundary_g=bg,
+                                      symmetrize=self._symmetrize)
+                    for g in range(self.n_groups)]
+        if self._spn_precond:
+            # Matched-order standard-SPN companion blocks (symmetric tables,
+            # same D_i and boundary treatment) for the Neumann preconditioner.
+            bg_spn = _SPN_G[self._order] if self.marshak_vacuum else None
+            self._precond_ops = [SDPNGroupOperator(
+                self.xp, grid, diffusion[g], sigma_t[g], removal[g],
+                order=self._order, bc=bc, active=self.active,
+                mask_bc=self.mask_bc, op_cls=self._moment_op_cls,
+                coeffs=_SPN_C, boundary_g=bg_spn)
+                for g in range(self.n_groups)]
+
+    # Spatial stencil for each moment (overridden by the triangular solver).
+    _moment_op_cls = None
+
+    def _initial_state(self):
+        M = self._order + 1
+        state = []
+        for _ in range(self.n_groups):
+            u = self.xp.zeros((M,) + self.grid.shape, dtype=self.dtype)
+            u[0] = 1.0
+            state.append(u)
+        return state
+
+    def _rhs(self, g, q0):
+        # Isotropic source (fission/k + in-scatter into phi0) distributed over
+        # the moment rows by the first column of c^(1).
+        w = self.ops[g].src_weights
+        M = self._order + 1
+        rhs = self.xp.empty((M,) + self.grid.shape, dtype=self.dtype)
+        for i in range(M):
+            rhs[i] = w[i] * q0
+        return rhs
+
+    def _phi(self, state_g):
+        w = self.ops[0].phi0_weights
+        phi = w[0] * state_g[0]
+        for j in range(1, len(w)):
+            if w[j] != 0.0:
+                phi = phi + w[j] * state_g[j]
+        return phi
+
+
+class SDP2EigenSolver(SDPNEigenSolver):
+    """Simplified double-P2 (SDP2) k-eigenvalue solver -- 3-moment block, the
+    degrees of freedom of SP5. See :class:`SDPNEigenSolver`."""
+
+    _order = 2
+
+
+class SDP3EigenSolver(SDPNEigenSolver):
+    """Simplified double-P3 (SDP3) k-eigenvalue solver -- 4-moment block, the
+    degrees of freedom of SP7. See :class:`SDPNEigenSolver`."""
+
+    _order = 3
+
+
+class SPNEigenSolver(SDPNEigenSolver):
+    """Standard simplified-PN (SPN) k-eigenvalue solver in the unified U-form,
+    order N in {1, 2, 3} = SP3/SP5/SP7 (SP3 here reproduces the dedicated
+    symmetric :class:`SP3EigenSolver`). Same block machinery as
+    :class:`SDPNEigenSolver` with the standard SPN coefficient matrices, so SP5
+    and SP7 -- which ndgpu otherwise lacks -- come for free and enable the
+    matched-DoF SPN-vs-SDPN comparison of Carreno et al. (2024): SP3/SDP1,
+    SP5/SDP2, SP7/SDP3."""
+
+    _coeffs = _SPN_C
+    _g_coeffs = _SPN_G
+
+
+class SP1EigenSolver(SPNEigenSolver):
+    """Standard SP1 k-eigenvalue solver (1-moment block) -- the P1/diffusion
+    equation run through the general U-form machinery, so it must reproduce
+    :class:`DiffusionEigenSolver` exactly (same D = 1/(3 Sigma_1), removal and
+    boundary law; with marshak_vacuum=True the coupled condition degenerates
+    to the same alpha = 1/2 Robin term). Exists as the order-0 member of the
+    SPN family for like-for-like hierarchy comparisons and as an end-to-end
+    consistency check of the block machinery."""
+
+    _order = 0
+
+
+class SP5EigenSolver(SPNEigenSolver):
+    """Standard SP5 k-eigenvalue solver (3-moment block)."""
+
+    _order = 2
+
+
+class SP7EigenSolver(SPNEigenSolver):
+    """Standard SP7 k-eigenvalue solver (4-moment block)."""
+
+    _order = 3

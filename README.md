@@ -28,7 +28,16 @@ selectable angular approximations:
 Features: arbitrary group count with up/downscatter, heterogeneous cores via
 per-cell material maps (harmonic-mean face diffusion coefficients), per-face
 zero-flux/reflective boundary conditions (quarter-core symmetry, exact 2D),
-float64 or float32.
+float64 or float32. Besides Cartesian boxes, the structured grid solves
+**cylindrical (r-z) bodies of revolution** (`Grid(..., geometry="cylindrical")`,
+x-axis = radius): the stencil is volume-weighted so it stays SPD, the r = 0
+axis is a natural boundary, and the same eigenvalue/transient machinery runs
+unchanged (verified 2nd-order against the exact Bessel-mode bare-cylinder k).
+Alternative Krylov solvers (`linear_solver="gmres"` / `"bicgstab"`) exist for
+operators CG can't touch; `symmetric_operator=False` exercises that path today
+by solving the cylindrical stencil in its natural non-symmetric divergence
+form instead of the SPD weighting (validated on ANL-7416 8-A1: identical k
+and power trace).
 
 ## Why it's fast on GPU (architecture)
 
@@ -289,8 +298,19 @@ point-kinetics reference:
 | **2D TWIGL** step (Σ_a2 drop) | P(0.1), P(0.5) vs literature 2.06, 2.13 | 2.061, 2.130 |
 | **2D TWIGL** ramp | P(0.1), P(0.5) vs literature 1.31, 2.11 | 1.308, 2.109 |
 | **3D Langenbuch (LMW)** rod-bank transient | peak power / time vs reference ≈1.6 @ ≈21 s | 1.61 @ 21 s |
+| **ANL-7416 Problem 8-A1** (2D r-z, 6 precursor families) | initial k vs book 0.86690/0.86705; Exhibit A power trace | k to 75 pcm (coarse) / ~40 pcm (refined); ramp phase < 3%, tail within the documented discretization band |
 
 (TWIGL at the converged `cells_per_8cm=4` mesh, `dt=1e-3`.)
+
+The 8-A1 problem (`ndgpu.benchmarks.build_anl8a1`, from the 1977 Argonne
+Benchmark Problem Book) is the r-z geometry's validation case: a delayed
+supercritical Σ_a ramp in three regions of a 240 × 525 cm thermal reactor.
+Its published power trace is tied to the reference codes' vertex-centered
+coarse-mesh discretization (which *under*-estimates the mesh-converged ramp
+worth by ~5%, as re-deriving that scheme shows — see
+`ndgpu/benchmarks/anl_bss8.py` for the analysis and for a cross-section
+erratum in the book), so the eigenvalue is validated tightly and the
+excursion tail within a quantified band.
 
 ## Benchmarks
 

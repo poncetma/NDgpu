@@ -31,7 +31,8 @@ from dataclasses import dataclass
 
 from .operator import (BC_VACUUM, SP3GroupOperator, face_alpha, harmonic_mean,
                        normalize_bc, robin_face_term)
-from .solver import DiffusionEigenSolver, SP3EigenSolver
+from .solver import (DiffusionEigenSolver, SDPNEigenSolver, SP3EigenSolver,
+                     SPNEigenSolver)
 
 _SQRT3 = math.sqrt(3.0)
 
@@ -205,5 +206,65 @@ class TriSP3EigenSolver(SP3EigenSolver):
     def _build_operators(self, grid, diffusion, sigma_t, removal, bc):
         self.ops = [SP3GroupOperator(self.xp, grid, diffusion[g], sigma_t[g],
                                      removal[g], bc=bc, active=self.active,
+                                     variant=self._sp_variant,
                                      mask_bc=self.mask_bc, op_cls=TriGroupOperator)
                     for g in range(self.n_groups)]
+
+
+class TriSDP1EigenSolver(TriSP3EigenSolver):
+    """Simplified double-P1 (SDP1) k-eigenvalue solver on the triangular mesh.
+
+    The body-fitted hex/triangular counterpart of :class:`~ndgpu.SDP1EigenSolver`:
+    same angular block as :class:`TriSP3EigenSolver` at identical cost, but with
+    the double-P1 second-moment coefficient (see
+    :class:`~ndgpu.operator.SP3GroupOperator`). Preferable to SP3 on the HP-MR
+    core, where strong drum absorbers drive steep, near-discontinuous angular
+    flux gradients.
+    """
+
+    _sp_variant = "sdp1"
+
+
+class TriSDPNEigenSolver(SDPNEigenSolver):
+    """Simplified double-PN (SDPN, N=2/3) solver on the triangular mesh: the
+    body-fitted counterpart of :class:`~ndgpu.SDPNEigenSolver`, with every
+    moment's in-plane leakage discretized by :class:`TriGroupOperator`."""
+
+    _moment_op_cls = TriGroupOperator
+
+
+class TriSDP2EigenSolver(TriSDPNEigenSolver):
+    """SDP2 (3-moment) k-eigenvalue solver on the triangular mesh."""
+
+    _order = 2
+
+
+class TriSDP3EigenSolver(TriSDPNEigenSolver):
+    """SDP3 (4-moment) k-eigenvalue solver on the triangular mesh."""
+
+    _order = 3
+
+
+class TriSPNEigenSolver(SPNEigenSolver):
+    """Standard SPN (SP5/SP7) k-eigenvalue solver on the triangular mesh."""
+
+    _moment_op_cls = TriGroupOperator
+
+
+class TriSP1EigenSolver(TriSPNEigenSolver):
+    """SP1 (1-moment) k-eigenvalue solver on the triangular mesh -- equivalent
+    to triangular-mesh diffusion; see :class:`ndgpu.solver.SP1EigenSolver`."""
+
+    _order = 0
+
+
+class TriSP5EigenSolver(TriSPNEigenSolver):
+    """SP5 (3-moment) k-eigenvalue solver on the triangular mesh."""
+
+    _order = 2
+
+
+class TriSP7EigenSolver(TriSPNEigenSolver):
+    """SP7 (4-moment) k-eigenvalue solver on the triangular mesh."""
+
+    _order = 3

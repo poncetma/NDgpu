@@ -43,6 +43,85 @@ def test_blend_laws_at_a_mixed_cell():
     assert f.removal[0][1, 1, 1] == 0.02
 
 
+def test_chi_keeps_fissile_spectrum_when_mixed_with_nonfissile():
+    # chi is a spectrum, not a cross section: mixing moderator into a fuel
+    # cell must NOT scale the emission spectrum by the fuel fraction (that
+    # loses (1 - w) of the fission neutrons -- the bug that made pin-resolved
+    # C5G7 appear to diverge at coarse mesh). Fuel + non-fissile partner keeps
+    # the fuel spectrum exactly, at any weight, in either blend direction.
+    fuel = Material(name="fuel", diffusion=[1.4, 0.4], sigma_a=[0.01, 0.09],
+                    nu_sigma_f=[0.006, 0.12], chi=[1.0, 0.0],
+                    sigma_s=[[0.0, 0.02], [0.0, 0.0]])
+    wat = Material(name="water", diffusion=[1.2, 0.15], sigma_a=[0.0, 0.02],
+                   nu_sigma_f=[0.0, 0.0], chi=[0.0, 0.0],
+                   sigma_s=[[0.0, 0.04], [0.0, 0.0]])
+    xp = get_backend("cpu")
+    mm = np.full(GRID.shape, -1, dtype=int); mm[0, 0, 0] = 1
+    ww = np.zeros(GRID.shape); ww[0, 0, 0] = 0.7
+    for mats in ([fuel, wat], [wat, fuel]):        # base fissile / mix fissile
+        f = Fields(xp, GRID, mats, np.zeros(GRID.shape, dtype=int),
+                   np.float64, mix_material=mm, mix_weight=ww)
+        assert f.chi[0][0, 0, 0] == pytest.approx(1.0)
+        assert f.chi[1][0, 0, 0] == pytest.approx(0.0)
+        # nu_sigma_f still blends linearly by volume
+        w_fuel = 0.3 if mats[0] is fuel else 0.7
+        assert f.nu_sigma_f[1][0, 0, 0] == pytest.approx(w_fuel * 0.12)
+
+
+def test_chi_blend_is_production_weighted_for_two_fissile_materials():
+    # Two fissile components: the merged spectrum weights each component's chi
+    # by its share of the cell's fission production, w * sum_g nuSigma_f.
+    m1 = Material(name="m1", diffusion=[1.4, 0.4], sigma_a=[0.01, 0.09],
+                  nu_sigma_f=[0.01, 0.11], chi=[1.0, 0.0],
+                  sigma_s=[[0.0, 0.02], [0.0, 0.0]])
+    m2 = Material(name="m2", diffusion=[1.3, 0.3], sigma_a=[0.01, 0.10],
+                  nu_sigma_f=[0.02, 0.28], chi=[0.8, 0.2],
+                  sigma_s=[[0.0, 0.03], [0.0, 0.0]])
+    xp = get_backend("cpu")
+    w = 0.4
+    mm = np.full(GRID.shape, -1, dtype=int); mm[0, 0, 0] = 1
+    ww = np.zeros(GRID.shape); ww[0, 0, 0] = w
+    f = Fields(xp, GRID, [m1, m2], np.zeros(GRID.shape, dtype=int),
+               np.float64, mix_material=mm, mix_weight=ww)
+    p1, p2 = (1 - w) * (0.01 + 0.11), w * (0.02 + 0.28)
+    for g, (c1, c2) in enumerate([(1.0, 0.8), (0.0, 0.2)]):
+        expect = (p1 * c1 + p2 * c2) / (p1 + p2)
+        assert f.chi[g][0, 0, 0] == pytest.approx(expect)
+    # the merged spectrum is still normalized
+    assert f.chi[0][0, 0, 0] + f.chi[1][0, 0, 0] == pytest.approx(1.0)
+
+
+def test_mixed_cell_k_matches_premixed_material():
+    # A reflective cell of fuel volume-mixed with moderator at weight w must
+    # reproduce the k_inf of the explicitly pre-mixed material (linear XS,
+    # harmonic D, fuel chi) -- the same homogenization done by hand in
+    # ndgpu.benchmarks.c5g7._homogenized_pin.
+    fuel = Material(name="fuel", diffusion=[1.4, 0.4], sigma_a=[0.01, 0.09],
+                    nu_sigma_f=[0.006, 0.12], chi=[1.0, 0.0],
+                    sigma_s=[[0.0, 0.02], [0.0, 0.0]])
+    wat = Material(name="water", diffusion=[1.2, 0.15], sigma_a=[0.0, 0.02],
+                   nu_sigma_f=[0.0, 0.0], chi=[0.0, 0.0],
+                   sigma_s=[[0.0, 0.04], [0.0, 0.0]])
+    w = 0.6                                          # fuel fraction
+    lin = lambda a, b: w * np.asarray(a) + (1 - w) * np.asarray(b)
+    harm = lambda a, b: 1.0 / (w / np.asarray(a) + (1 - w) / np.asarray(b))
+    premixed = Material(name="mix", diffusion=harm(fuel.diffusion, wat.diffusion),
+                        sigma_a=lin(fuel.sigma_a, wat.sigma_a),
+                        nu_sigma_f=lin(fuel.nu_sigma_f, wat.nu_sigma_f),
+                        chi=fuel.chi, sigma_s=lin(fuel.sigma_s, wat.sigma_s))
+    grid = Grid(shape=(1, 1, 1), size=(2.0, 2.0, 2.0))
+    zero = np.zeros(grid.shape, dtype=int)
+    k_pre = DiffusionEigenSolver(grid, [premixed], zero, bc="reflective",
+                                 device="cpu").solve(tol_k=1e-9).k_eff
+    mm = np.zeros(grid.shape, dtype=int)             # blend fuel (idx 0) ...
+    ww = np.full(grid.shape, w)                      # ... into water at w
+    k_mix = DiffusionEigenSolver(grid, [fuel, wat], np.ones(grid.shape, dtype=int),
+                                 bc="reflective", device="cpu",
+                                 mix_material=mm, mix_weight=ww).solve(
+        tol_k=1e-9).k_eff
+    assert k_mix == pytest.approx(k_pre, abs=1e-8)
+
+
 def test_weight_one_equals_direct_assignment():
     mm = np.full(GRID.shape, -1, dtype=int); mm[0, 0, 0] = 1
     ww = np.zeros(GRID.shape); ww[0, 0, 0] = 1.0

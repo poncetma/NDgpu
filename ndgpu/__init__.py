@@ -19,11 +19,17 @@ from .mesh import (Mesh, MeshResult, UnstructuredDiffusionSolver, assemble_mesh,
 from .model import (HexLattice, MeshModel, Model, ModelResult, ReactorResult,
                    TransientModelResult)
 from .perturbation import first_order_reactivity
-from .solver import DiffusionEigenSolver, Result, SP3EigenSolver
+from .solver import (DiffusionEigenSolver, Result, SDP1EigenSolver,
+                     SDP2EigenSolver, SDP3EigenSolver, SP1EigenSolver,
+                     SP3EigenSolver, SP5EigenSolver, SP7EigenSolver)
 from .sph import (SphResult, flux_weighted_homogenize, region_average,
                   sph_correct)
-from .tri import TriDiffusionEigenSolver, TriGrid, TriSP3EigenSolver
-from .transient import TransientResult, TransientSolver
+from .tri import (TriDiffusionEigenSolver, TriGrid, TriSDP1EigenSolver,
+                  TriSDP2EigenSolver, TriSDP3EigenSolver, TriSP1EigenSolver,
+                  TriSP3EigenSolver, TriSP5EigenSolver, TriSP7EigenSolver)
+from .transient import (TransientResult, TransientSDP1Solver,
+                        TransientSDP3Solver, TransientSDPNSolver,
+                        TransientSPNSolver, TransientSolver)
 
 __version__ = "0.1.0"
 
@@ -35,12 +41,28 @@ __all__ = [
     "ReactorResult",
     "TransientModelResult",
     "DiffusionEigenSolver",
+    "SP1EigenSolver",
     "SP3EigenSolver",
+    "SP5EigenSolver",
+    "SP7EigenSolver",
+    "SDP1EigenSolver",
+    "SDP2EigenSolver",
+    "SDP3EigenSolver",
     "TriDiffusionEigenSolver",
+    "TriSP1EigenSolver",
     "TriSP3EigenSolver",
+    "TriSP5EigenSolver",
+    "TriSP7EigenSolver",
+    "TriSDP1EigenSolver",
+    "TriSDP2EigenSolver",
+    "TriSDP3EigenSolver",
     "TriGrid",
     "HexDiffusionEigenSolver",
     "TransientSolver",
+    "TransientSDP1Solver",
+    "TransientSDPNSolver",
+    "TransientSDP3Solver",
+    "TransientSPNSolver",
     "TransientResult",
     "Grid",
     "HexGrid",

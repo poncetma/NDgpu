@@ -34,7 +34,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .backend import asnumpy, device_name, get_backend, synchronize
-from .linalg import neumann_preconditioner, pcg
+from .linalg import get_linear_solver, neumann_preconditioner
 
 
 _VACUUM_ALPHA = 0.5
@@ -350,14 +350,17 @@ class UnstructuredDiffusionSolver:
     precond_degree : Neumann-polynomial preconditioner degree for the inner CG
                      (0 = plain Jacobi, the default), as on the structured
                      solvers.
+    linear_solver  : "cg" (default), "gmres", or "bicgstab", as on the
+                     structured solvers.
     """
 
     def __init__(self, mesh: Mesh, materials, cell_material,
                  alpha_boundary=_VACUUM_ALPHA, device="auto",
-                 precond_degree=0, dtype=np.float64):
+                 precond_degree=0, dtype=np.float64, linear_solver="cg"):
         self.xp = xp = get_backend(device)
         self.device = device_name(xp)
         self.dtype = dtype
+        self._linsolve = get_linear_solver(linear_solver)
         self.mesh = mesh
         self.mats = list(materials)
         self.cm = cm = np.asarray(cell_material)
@@ -454,8 +457,9 @@ class UnstructuredDiffusionSolver:
                 for (gf, gt), col in self.scat.items():
                     if gt == g:
                         q = q + col * phi[gf] * area
-                phi[g], n_it = pcg(self.ops[g].apply, q, phi[g], self.ops[g].inv_diag,
-                                   xp, rtol=rtol, precond=self.preconds[g])
+                phi[g], n_it = self._linsolve(self.ops[g].apply, q, phi[g],
+                                              self.ops[g].inv_diag, xp,
+                                              rtol=rtol, precond=self.preconds[g])
                 inner_total += n_it
 
             Fn = sum(self.nsf[g] * phi[g] for g in range(G))

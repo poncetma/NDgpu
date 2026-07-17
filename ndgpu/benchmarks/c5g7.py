@@ -121,6 +121,16 @@ def _homogenized_pin(pin_char: str) -> tuple[Material, np.ndarray]:
     return mat, mix("fission")
 
 
+def _pure_pin(pin_char: str) -> tuple[Material, np.ndarray]:
+    """The pin's own (un-homogenized) material -- the cylinder interior, used by
+    the pin-resolved geometry. Returns (Material, fission cross section)."""
+    xs = C5G7_XS[PIN_XS_NAME[pin_char]]
+    mat = _material_from_xs(name=PIN_XS_NAME[pin_char], total=xs["total"],
+                            nu_fission=xs["nu_fission"], chi=xs["chi"],
+                            scatter=xs["scatter"])
+    return mat, np.asarray(xs["fission"])
+
+
 @dataclass
 class C5G7Problem:
     grid: Grid
@@ -130,19 +140,47 @@ class C5G7Problem:
     fission_xs: np.ndarray   # (n_materials, G), for pin-power post-processing
     pin_map: np.ndarray      # (51, 51) material indices at pin-cell level
     cells_per_pin: int
+    mix_material: np.ndarray = None   # pin-resolved: per-cell blend partner
+    mix_weight: np.ndarray = None     # pin-resolved: fuel-covered area fraction
 
 
-def build_c5g7_2d(cells_per_pin: int = 2) -> C5G7Problem:
+def _pin_coverage(s: int, sub: int = 16) -> np.ndarray:
+    """Fraction of each of the s x s sub-cells of a pin covered by the centred
+    r = 0.54 cm fuel cylinder (identical for every pin). Sub-sampled sub x sub."""
+    R = PIN_RADIUS / PIN_PITCH
+    off = (np.arange(s) + 0.5) / s - 0.5                    # sub-cell centres
+    soff = (np.arange(sub) + 0.5) / sub - 0.5               # points within a sub-cell (in cell units)
+    frac = np.empty((s, s))
+    for i, cx in enumerate(off):
+        for j, cy in enumerate(off):
+            px = cx + soff / s
+            py = cy + soff / s
+            d2 = px[:, None]**2 + py[None, :]**2
+            frac[i, j] = np.mean(d2 < R * R)
+    return frac
+
+
+def build_c5g7_2d(cells_per_pin: int = 2,
+                  pin_resolved: bool = False) -> C5G7Problem:
     """Assemble the 2D quarter-core problem on a Cartesian grid.
 
     cells_per_pin: spatial cells per pin-cell side; the 64.26 cm quarter core
     becomes a (51 * cells_per_pin)^2 x 1 grid. z is reflective (exact 2D).
+
+    pin_resolved: when True, follow the benchmark's heterogeneous geometry -- the
+    r = 0.54 cm fuel cylinder is rasterized onto the fine mesh (interior cells
+    take the pin's own material, the rest water) instead of volume-homogenizing
+    each pin cell. The staircase fuel area converges to pi r^2 / pitch^2 as
+    cells_per_pin grows, so this needs a fine mesh (cells_per_pin >= 8-10). This
+    is the pin-resolved treatment used by pin-transport codes and by the FE
+    solutions of Carreno et al. (2024); the default (False) keeps the fast
+    volume-homogenized pin cells.
     """
-    # Homogenized pin-cell materials + pure water, indexed 0..6.
     chars = ["U", "m", "o", "x", "G", "F"]
+    build_pin = _pure_pin if pin_resolved else _homogenized_pin
     materials, fission = [], []
     for c in chars:
-        mat, fis = _homogenized_pin(c)
+        mat, fis = build_pin(c)
         materials.append(mat)
         fission.append(fis)
     water = C5G7_XS["Water"]
@@ -168,7 +206,28 @@ def build_c5g7_2d(cells_per_pin: int = 2) -> C5G7Problem:
     # Expand to the solve grid: [row, col] -> [x=col, y=row], z thickness 1 cell.
     s = cells_per_pin
     expanded = np.kron(pin_map, np.ones((s, s), dtype=np.int64))
-    material_map = expanded.T[:, :, None].copy()
+    mix_material = mix_weight = None
+    if pin_resolved:
+        # Carve the r = 0.54 cm fuel cylinder out of each pin cell with exact
+        # area weighting: cells fully inside the circle take the pin material,
+        # fully outside cells are water, and boundary cells blend pin + water by
+        # their covered area fraction (mix_material / mix_weight). This conserves
+        # the pi r^2 / pitch^2 fuel loading at *any* resolution -- a plain
+        # in/out raster does not, and its fuel area (hence k) swings wildly with
+        # cells_per_pin.
+        frac = np.tile(_pin_coverage(s), (n, n))           # covered fraction
+        frac[expanded == water_idx] = 0.0                  # water pins: no fuel
+        eps = 1e-9
+        full = frac >= 1.0 - eps
+        part = (frac > eps) & ~full
+        base = np.where(full, expanded, water_idx)         # pure interior / water
+        mm = np.where(part, expanded, -1)                  # blend partner
+        wt = np.where(part, frac, 0.0)
+        material_map = base.T[:, :, None].copy()
+        mix_material = mm.T[:, :, None].copy()
+        mix_weight = wt.T[:, :, None].copy()
+    else:
+        material_map = expanded.T[:, :, None].copy()
 
     L = n * PIN_PITCH  # 64.26 cm
     grid = Grid(shape=(n * s, n * s, 1), size=(L, L, PIN_PITCH))
@@ -177,4 +236,5 @@ def build_c5g7_2d(cells_per_pin: int = 2) -> C5G7Problem:
           "reflective")                  # z: exact 2D
     return C5G7Problem(grid=grid, materials=materials, material_map=material_map,
                        bc=bc, fission_xs=np.array(fission), pin_map=pin_map,
-                       cells_per_pin=s)
+                       cells_per_pin=s, mix_material=mix_material,
+                       mix_weight=mix_weight)
