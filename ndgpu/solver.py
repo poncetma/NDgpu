@@ -162,6 +162,11 @@ class Fields:
             lin = lambda table: blend(table, lambda b, o, wt: (1.0 - wt) * b + wt * o)
             harm = lambda table: blend(table, lambda b, o, wt: 1.0 / ((1.0 - wt) / b + wt / o))
 
+        # Per-cell lookup of an arbitrary per-material table (linear blend on
+        # mixed cells) -- also used by the transient solver to map per-material
+        # kinetics data (1/v, beta) onto the grid.
+        self.map_table = lin
+
         def per_group(attr, lookup=None):
             lookup = lookup or lin
             table = np.array([getattr(m, attr) for m in mats])  # (M, G)
@@ -179,21 +184,28 @@ class Fields:
         # spectrum (it multiplies a zero source).
         if mix:
             prod = np.array([np.sum(m.nu_sigma_f) for m in mats])
-            chi_t = np.array([m.chi for m in mats])  # (M, G)
             pdev = xp.asarray(prod, dtype=dtype)
             wb = (1.0 - w) * pdev[mmap]
             wo = w * pdev[mm2c]
             den = wb + wo
             blendable = active_mix & (den > 0)
             safe_den = xp.where(den > 0, den, 1.0)
-            self.chi = []
-            for g in range(G):
-                cdev = xp.asarray(chi_t[:, g], dtype=dtype)
-                base = cdev[mmap]
-                merged = (wb * base + wo * cdev[mm2c]) / safe_den
-                self.chi.append(xp.where(blendable, merged, base))
+
+            def fission_weighted(table):
+                dev = xp.asarray(table, dtype=dtype)
+                base = dev[mmap]
+                merged = (wb * base + wo * dev[mm2c]) / safe_den
+                return xp.where(blendable, merged, base)
         else:
-            self.chi = per_group("chi")
+            fission_weighted = lin
+        # Per-cell lookup of a per-material quantity that rides on the fission
+        # source (chi, delayed fraction beta): mixed cells weight each
+        # component by its share of the cell's fission production, so e.g. a
+        # fuel/moderator rim cell keeps the fuel's spectrum and beta exactly.
+        self.map_table_fission_weighted = fission_weighted
+
+        chi_t = np.array([m.chi for m in mats])  # (M, G)
+        self.chi = [fission_weighted(chi_t[:, g]) for g in range(G)]
         self.removal = per_group("removal")
         self.diffusion = per_group("diffusion", lookup=harm)
         self.sigma_t = per_group("sigma_t")

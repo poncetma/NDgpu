@@ -16,3 +16,4 @@ venv/
 # Local reference copies of papers (not redistributable) + Windows ADS junk
 docs/*.pdf
 *Zone.Identifier
+results/

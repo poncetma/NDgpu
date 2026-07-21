@@ -49,6 +49,26 @@ from .solver import (DiffusionEigenSolver, Fields, Result, SDP1EigenSolver,
                      SDPNEigenSolver)
 
 
+# Anderson safeguard: a sweep residual growing past this factor means the
+# stored history no longer describes the fixed-point map (see the restart
+# comment in TransientSolver.solve); the history is then dropped. 1.5 tolerates
+# the mild non-monotonicity of healthy Anderson steps (1.0 restarts so often it
+# degenerates to Picard and stalls on C5G7's upscatter; >= 5 lets divergent
+# oscillations run).
+_ANDERSON_RESTART_GROWTH = 1.5
+
+
+def _require_global_kinetics(kin: Kinetics, who: str):
+    """Per-material kinetics (2D velocities/beta) and per-family chi_delayed
+    are currently implemented only by the diffusion TransientSolver."""
+    if kin.per_material or (kin.chi_delayed is not None
+                            and kin.chi_delayed.ndim == 2):
+        raise NotImplementedError(
+            f"{who} supports only global kinetics data; per-material "
+            f"velocities/beta and per-family chi_delayed need TransientSolver "
+            f"(diffusion)")
+
+
 def _anderson_mix(hist, S, xp):
     """One Anderson update of the fixed-point iterate S from the history of
     (S_j, G(S_j)) pairs (oldest first; the current sweep is hist[-1]): the
@@ -107,7 +127,16 @@ class TransientSolver:
                  None for a homogeneous reactor. Return cached objects while
                  nothing changes — operators are rebuilt only on identity
                  change of either element.
-    kinetics   : Kinetics (velocities, delayed families).
+    kinetics   : Kinetics (velocities, delayed families). Per-material tables
+                 (2D velocities/beta, rows indexing the problem_at materials
+                 list) and per-family chi_delayed (I, G) are supported: the
+                 solver maps them onto the grid through the material map
+                 (mixed cells blend linearly) and the arithmetic proceeds
+                 elementwise.
+    mix_material, mix_weight : optional per-cell two-material blend on top of
+                 the integer material map, as for DiffusionEigenSolver. Static
+                 in time -- time dependence belongs in the *values* of the
+                 materials returned by problem_at, not in the maps.
     bc, device, dtype, linear_solver, symmetric_operator : as for
                  DiffusionEigenSolver (symmetric_operator=False needs a
                  non-symmetric linear_solver and the default group_operator).
@@ -118,13 +147,16 @@ class TransientSolver:
                  active=None, mask_bc=BC_VACUUM,
                  group_operator=GroupOperator, eig_solver=DiffusionEigenSolver,
                  precond_degree: int = 0, linear_solver="cg",
-                 symmetric_operator: bool = True):
+                 symmetric_operator: bool = True,
+                 mix_material=None, mix_weight=None):
         self.grid = grid
         self.problem_at = problem_at
         self.kinetics = kinetics
         self.bc = bc
         self.active = active
         self.mask_bc = mask_bc
+        self.mix_material = mix_material
+        self.mix_weight = mix_weight
         # Geometry is pluggable: the Cartesian (GroupOperator/DiffusionEigenSolver)
         # or hex (HexGroupOperator/HexDiffusionEigenSolver) pair share signatures.
         self.group_operator = group_operator
@@ -142,6 +174,7 @@ class TransientSolver:
 
     def solve(self, t_end: float, dt: float, tol_step: float = 1e-6,
               max_sweeps: int = 200, anderson_depth: int = 5,
+              scatter_subsweeps: int | None = None,
               steady_kwargs: dict | None = None,
               verbose: bool = False) -> TransientResult:
         """March from the steady state at t=0 to t_end with fixed step dt.
@@ -149,6 +182,15 @@ class TransientSolver:
         anderson_depth : number of past fission-source iterates retained by the
             Anderson acceleration of the within-step fixed point (window m+1 for
             m residual differences). Depth 1 disables it (plain Picard).
+        scatter_subsweeps : Gauss-Seidel passes over the groups per fixed-point
+            evaluation (fission source held fixed). With downscatter only, one
+            ordered pass is exact, so extra passes are pointless; with
+            *upscatter* a single pass leaves the evaluation dependent on the
+            incoming flux iterate, and Anderson -- which assumes the sweeps it
+            mixes sample a fixed map G(S) -- loses most of its acceleration
+            (C5G7's 7-group water: ~450 sweeps instead of ~10). A few passes
+            restore an (almost) pure G(S). None (default) auto-selects: 3 when
+            any upscatter coupling exists, else 1.
         """
         xp, kin = self.xp, self.kinetics
         beta, lam = kin.beta, kin.decay
@@ -158,15 +200,26 @@ class TransientSolver:
 
         # --- initial condition: steady state, critically adjusted ------------
         mats, mmap = self.problem_at(0.0)
+        # Mix arrays only reach solvers that were given them: pluggable
+        # geometries (hex, ...) never see the kwargs in the default case.
+        mix_kwargs = ({} if self.mix_material is None else
+                      dict(mix_material=self.mix_material,
+                           mix_weight=self.mix_weight))
         eig = self.eig_solver(self.grid, mats, mmap, bc=self.bc,
                               device="cpu" if xp is np else "gpu",
                               dtype=self.dtype,
                               active=self.active, mask_bc=self.mask_bc,
                               linear_solver=self.linear_solver,
-                              symmetric_operator=self.symmetric_operator)
+                              symmetric_operator=self.symmetric_operator,
+                              **mix_kwargs)
         G = eig.n_groups
-        if len(kin.velocities) != G:
+        if kin.velocities.shape[-1] != G:
             raise ValueError("kinetics.velocities must have one entry per group")
+        n_mats = len(mats) if isinstance(mats, (list, tuple)) else 1
+        for name, table in (("velocities", kin.velocities), ("beta", kin.beta)):
+            if table.ndim == 2 and len(table) != n_mats:
+                raise ValueError(f"per-material kinetics.{name} must have one "
+                                 f"row per entry of the materials list")
         steady = eig.solve(**(steady_kwargs or dict(tol_k=1e-8, tol_source=1e-7)))
         if not steady.converged:
             raise RuntimeError(f"initial steady state did not converge: {steady}")
@@ -184,6 +237,26 @@ class TransientSolver:
             return float(xp.sum(src if vol_w is None else src * vol_w))
 
         fields = eig.fields
+
+        # Kinetics tables become scalars (global data) or per-cell device
+        # fields (per-material rows looked up through the material map, mixed
+        # cells blended linearly); either shape flows through the same
+        # elementwise arithmetic below. The maps are static in time, so the
+        # fields are built once, from the t=0 Fields instance.
+        if kin.beta.ndim == 2:
+            # beta rides on the fission source: mixed cells weight each
+            # component by its fission-production share (a fuel/moderator rim
+            # cell keeps the fuel's beta), exactly like the chi blend.
+            beta = [fields.map_table_fission_weighted(kin.beta[:, i])
+                    for i in range(kin.n_families)]
+        else:
+            beta = [float(b) for b in beta]
+        if kin.velocities.ndim == 2:
+            inv_vdt = [fields.map_table(1.0 / (kin.velocities[:, g] * dt))
+                       for g in range(G)]
+        else:
+            inv_vdt = [1.0 / (kin.velocities[g] * dt) for g in range(G)]
+
         phi = [steady.flux[g].copy() for g in range(G)]
         S = fields.fission_source(phi) / k0
         scale = 1.0 / total_power(S)            # P(0) = 1
@@ -192,14 +265,59 @@ class TransientSolver:
         S = S * scale
         C = [(beta[i] / lam[i]) * S for i in range(kin.n_families)]  # equilibrium
 
-        # Delayed-source weight of the end-of-step fission source.
-        omega = float(np.sum(lam * dt * beta / (1.0 + lam * dt)))
-        fis_w = (1.0 - kin.beta_total) + omega
-        inv_vdt = [1.0 / (kin.velocities[g] * dt) for g in range(G)]
+        chi_d2 = kin.chi_delayed if (kin.chi_delayed is not None
+                                     and kin.chi_delayed.ndim == 2) else None
 
-        def chi_d(g):
-            return (fields.chi[g] if kin.chi_delayed is None
-                    else float(kin.chi_delayed[g]))
+        # End-of-step fission-source spectrum weight. The material chi is the
+        # *total* (steady) spectrum -- what C5G7-TD calls the cumulative
+        # spectrum -- so the prompt spectrum never appears explicitly:
+        # (1 - beta) chi_p,g = chi_g - sum_i beta_i chi_d,ig, and substituting
+        # the analytic backward-Euler precursor update into the flux equation
+        # weights the end-of-step fission source by
+        #     w_fis,g = chi_g - sum_i chi_d,ig beta_i / (1 + lam_i dt),
+        # which reduces to the familiar chi_g [(1 - beta) + omega] when
+        # chi_d = chi. In this form the unperturbed t=0 state is an exact
+        # equilibrium of the transient equations for *any* delayed spectrum.
+        bcoef = [beta[i] / (1.0 + lam[i] * dt) for i in range(kin.n_families)]
+        bcoef_sum = sum(bcoef)
+
+        def fission_weights():
+            if chi_d2 is not None:               # one spectrum per family
+                ws = []
+                for g in range(G):
+                    acc = 0.0
+                    for i in range(kin.n_families):
+                        if chi_d2[i, g] != 0.0:
+                            acc = acc + chi_d2[i, g] * bcoef[i]
+                    ws.append(fields.chi[g] - acc)
+                return ws
+            if kin.chi_delayed is not None:      # single global spectrum
+                return [fields.chi[g] - float(kin.chi_delayed[g]) * bcoef_sum
+                        for g in range(G)]
+            return [fields.chi[g] * (1.0 - bcoef_sum) for g in range(G)]
+
+        w_fis = fission_weights()
+
+        def delayed_source_by_group(C):
+            """Per-group delayed emission Sum_i chi_d,i,g lam_i C_i/(1+lam_i dt),
+            precomputed once per step (C is the start-of-step field)."""
+            decayed = [(lam[i] / (1.0 + lam[i] * dt)) * C[i]
+                       for i in range(kin.n_families)]
+            if chi_d2 is not None:               # one spectrum per family
+                out = []
+                for g in range(G):
+                    dg = 0.0
+                    for i in range(kin.n_families):
+                        if chi_d2[i, g] != 0.0:
+                            dg = dg + chi_d2[i, g] * decayed[i]
+                    out.append(dg)
+                return out
+            dsrc = decayed[0]
+            for d in decayed[1:]:
+                dsrc = dsrc + d
+            if kin.chi_delayed is not None:      # single global spectrum
+                return [float(kin.chi_delayed[g]) * dsrc for g in range(G)]
+            return [fields.chi[g] * dsrc for g in range(G)]  # material spectrum
 
         ops = [self.group_operator(xp, self.grid, fields.diffusion[g],
                              fields.removal[g] + inv_vdt[g], bc=self.bc,
@@ -211,6 +329,13 @@ class TransientSolver:
         src_w = getattr(ops[0], "rhs_weight", None)
         last = (mats, mmap)
 
+        # sigma_s is indexed [g_from][g_to]: any coupling above the diagonal
+        # is upscatter, which one ordered Gauss-Seidel pass cannot resolve.
+        has_upscatter = any(fields.sigma_s[gf][gt] is not None
+                            for gt in range(G) for gf in range(gt + 1, G))
+        n_sub = (int(scatter_subsweeps) if scatter_subsweeps
+                 else (3 if has_upscatter else 1))
+
         times = [0.0]
         power = [1.0]
         inner_total = 0
@@ -219,7 +344,9 @@ class TransientSolver:
             t = n * dt
             mats, mmap = self.problem_at(t)
             if mats is not last[0] or mmap is not last[1]:
-                fields = Fields(xp, self.grid, mats, mmap, self.dtype)
+                fields = Fields(xp, self.grid, mats, mmap, self.dtype,
+                                mix_material=self.mix_material,
+                                mix_weight=self.mix_weight)
                 ops = [self.group_operator(xp, self.grid, fields.diffusion[g],
                                      fields.removal[g] + inv_vdt[g], bc=self.bc,
                                      active=self.active, mask_bc=self.mask_bc,
@@ -229,13 +356,12 @@ class TransientSolver:
                                                    self.precond_degree)
                             for op in ops]
                 src_w = getattr(ops[0], "rhs_weight", None)
+                w_fis = fission_weights()
                 last = (mats, mmap)
 
             phi_old = [p.copy() for p in phi]
-            # Decayed precursor source, constant within the step.
-            dsrc = (lam[0] / (1.0 + lam[0] * dt)) * C[0]
-            for i in range(1, kin.n_families):
-                dsrc += (lam[i] / (1.0 + lam[i] * dt)) * C[i]
+            # Delayed emission from decayed precursors, constant within the step.
+            dsrc_g = delayed_source_by_group(C)
 
             # Fixed point on the end-of-step fission source (Gauss-Seidel over
             # groups, warm-started from the previous step). Near criticality
@@ -245,30 +371,41 @@ class TransientSolver:
             # of the last few sweeps, which collapses the handful of slow
             # error modes (one per perturbed region) in a few sweeps.
             change = 1.0
+            change_prev = np.inf
             hist: list = []  # (S_j, G(S_j)) pairs, oldest first
             for sweep in range(1, max_sweeps + 1):
                 # Solve well below both the current sweep change and the step
                 # tolerance, so CG noise never becomes the fixed point's floor.
                 rtol = min(1e-6, max(1e-3 * change, 1e-3 * tol_step, 1e-12))
-                for g in range(G):
-                    q = inv_vdt[g] * phi_old[g] + (fis_w * fields.chi[g]) * S \
-                        + chi_d(g) * dsrc
-                    for gf in range(G):
-                        s = fields.sigma_s[gf][g]
-                        if gf != g and s is not None:
-                            q += s * phi[gf]
-                    if src_w is not None:
-                        q = q * src_w
-                    phi[g], n_it = self._linsolve(ops[g].apply, q, phi[g],
-                                                  ops[g].inv_diag, xp, rtol=rtol,
-                                                  precond=preconds[g])
-                    inner_total += n_it
+                for _ in range(n_sub):
+                    for g in range(G):
+                        q = inv_vdt[g] * phi_old[g] + w_fis[g] * S + dsrc_g[g]
+                        for gf in range(G):
+                            s = fields.sigma_s[gf][g]
+                            if gf != g and s is not None:
+                                q += s * phi[gf]
+                        if src_w is not None:
+                            q = q * src_w
+                        phi[g], n_it = self._linsolve(ops[g].apply, q, phi[g],
+                                                      ops[g].inv_diag, xp,
+                                                      rtol=rtol,
+                                                      precond=preconds[g])
+                        inner_total += n_it
                 G_S = fields.fission_source(phi) / k0
                 delta = G_S - S
                 change = float(xp.sqrt(xp.sum(delta * delta) / xp.sum(G_S**2)))
                 if change < tol_step:
                     S = G_S
                     break
+                if change > _ANDERSON_RESTART_GROWTH * change_prev:
+                    # A growing residual means the stored sweeps no longer
+                    # describe the current fixed-point map: with upscatter
+                    # (or a large Anderson jump) one Gauss-Seidel sweep is a
+                    # *stateful* function of the flux iterate, not of S alone,
+                    # and mixing across inconsistent pairs diverges (seen on
+                    # C5G7's 7-group water). Restart from plain Picard.
+                    hist = []
+                change_prev = change
                 hist.append((S, G_S))
                 hist = hist[-anderson_depth:]
                 S = G_S
@@ -322,6 +459,7 @@ class TransientSDP1Solver:
     def __init__(self, grid: Grid, problem_at, kinetics: Kinetics,
                  bc=BC_ZERO_FLUX, device: str = "auto", dtype=np.float64,
                  active=None, mask_bc=BC_VACUUM, precond_degree: int = 0):
+        _require_global_kinetics(kinetics, "TransientSDP1Solver")
         self.grid = grid
         self.problem_at = problem_at
         self.kinetics = kinetics
@@ -507,6 +645,7 @@ class TransientSDPNSolver:
                  order: int = 3, bc=BC_ZERO_FLUX, device: str = "auto",
                  dtype=np.float64, active=None, mask_bc=BC_VACUUM,
                  precond_degree: int = 0, symmetrize: bool | None = None):
+        _require_global_kinetics(kinetics, "TransientSDPNSolver")
         self.grid = grid
         self.problem_at = problem_at
         self.kinetics = kinetics

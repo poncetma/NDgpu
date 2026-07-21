@@ -80,13 +80,24 @@ class Material:
 
 @dataclass
 class Kinetics:
-    """Point-kinetics data for transient calculations (global for the problem).
+    """Kinetics data for transient calculations.
 
-    velocities  : neutron speeds v_g in cm/s, shape (G,)
+    velocities  : neutron speeds v_g in cm/s, shape (G,) -- or (M, G) with one
+                  row per entry of the problem's materials list, for
+                  material-dependent speeds (e.g. C5G7-TD Table 13).
     beta        : delayed neutron fractions per precursor family, shape (I,)
-    decay       : decay constants lambda_i in 1/s, shape (I,)
-    chi_delayed : delayed emission spectrum, shape (G,); defaults to the
-                  prompt spectrum of each material.
+                  -- or (M, I) per material (non-fissile rows are zeros).
+    decay       : decay constants lambda_i in 1/s, shape (I,). Always global:
+                  the precursor families are nuclear data shared by every
+                  material (a per-material lambda would make the families
+                  incompatible between regions).
+    chi_delayed : delayed emission spectrum: shape (G,) for a single spectrum,
+                  (I, G) for one spectrum per precursor family, or None to
+                  default to the prompt spectrum of each material.
+
+    Per-material tables (2D velocities/beta) index the materials list passed
+    to the transient solver's problem_at, whose order must therefore be stable
+    in time. Solvers without per-material support reject 2D tables.
     """
 
     velocities: np.ndarray
@@ -98,20 +109,33 @@ class Kinetics:
         self.velocities = np.atleast_1d(np.asarray(self.velocities, dtype=np.float64))
         self.beta = np.atleast_1d(np.asarray(self.beta, dtype=np.float64))
         self.decay = np.atleast_1d(np.asarray(self.decay, dtype=np.float64))
-        if self.beta.shape != self.decay.shape:
+        if self.velocities.ndim > 2 or self.beta.ndim > 2 or self.decay.ndim != 1:
+            raise ValueError("velocities/beta must be 1D or 2D (per-material), decay 1D")
+        if self.beta.shape[-1] != self.decay.shape[0]:
             raise ValueError("beta and decay must have one value per precursor family")
         if np.any(self.velocities <= 0) or np.any(self.decay <= 0) or np.any(self.beta < 0):
             raise ValueError("velocities and decay constants must be positive, beta non-negative")
         if self.chi_delayed is not None:
             self.chi_delayed = np.asarray(self.chi_delayed, dtype=np.float64)
-            self.chi_delayed = self.chi_delayed / self.chi_delayed.sum()
+            if self.chi_delayed.ndim == 2 and len(self.chi_delayed) != self.n_families:
+                raise ValueError("2D chi_delayed must have one spectrum per precursor family")
+            self.chi_delayed = (self.chi_delayed
+                                / self.chi_delayed.sum(axis=-1, keepdims=True))
 
     @property
     def n_families(self) -> int:
-        return len(self.beta)
+        return self.beta.shape[-1]
+
+    @property
+    def per_material(self) -> bool:
+        """True when velocities or beta carry a leading material axis."""
+        return self.velocities.ndim == 2 or self.beta.ndim == 2
 
     @property
     def beta_total(self) -> float:
+        if self.beta.ndim == 2:
+            raise ValueError("beta_total is undefined for per-material beta; "
+                             "the solver builds a spatial field instead")
         return float(self.beta.sum())
 
 
