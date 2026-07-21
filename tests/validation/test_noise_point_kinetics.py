@@ -13,9 +13,8 @@ folded into chi_eff(w), and the noise-source construction.
 import numpy as np
 import pytest
 
-from ndgpu import (DiffusionEigenSolver, Grid, Kinetics, Material, NoiseSolver,
-                   NoiseSource, zero_power_transfer_function)
-from ndgpu.perturbation import first_order_reactivity
+from ndgpu import (Grid, Kinetics, Material, NoiseSolver, NoiseSource,
+                   zero_power_transfer_function)
 
 
 def _critical_one_group():
@@ -28,29 +27,32 @@ def _critical_one_group():
     return mat, grid, "reflective"
 
 
+@pytest.mark.parametrize("angular", ["diffusion", "sp3", "sp5"])
 @pytest.mark.parametrize("families", [
     ([0.0065], [0.0784]),                         # one delayed family
     ([0.00021, 0.00142, 0.00127, 0.00257, 0.00075, 0.00027],
      [0.0124, 0.0305, 0.111, 0.301, 1.14, 3.01]),  # six-family U-235
 ])
-def test_zero_power_transfer_function(families):
+def test_zero_power_transfer_function(families, angular):
     beta, decay = families
     mat, grid, bc = _critical_one_group()
     kin = Kinetics(velocities=[2.2e5], beta=beta, decay=decay)
-    ns = NoiseSolver(grid, mat, kinetics=kin, bc=bc)
+    ns = NoiseSolver(grid, mat, kinetics=kin, bc=bc, angular=angular)
     assert abs(ns.k_eff - 1.0) < 1e-9
     Lam = ns.generation_time()
 
     # Reactivity of a uniform absorption bump, in the critically-scaled (F/k)
-    # normalization the noise solver uses: k * (1/k - 1/k'). (k = 1 here, so
-    # the factor is inert, but it makes the reference exact for any k.)
-    eps = 1e-6
+    # normalization the noise solver uses: k * (1/k - 1/k'). Finite difference
+    # on the eigenvalue -- solver-agnostic, so it also covers the SPN moment
+    # solvers (first_order_reactivity handles only scalar-flux solvers). Both
+    # the reactivity (exactly -eps/Sigma_a for this 1-group reflective medium)
+    # and the noise are linear in eps, so it cancels in the ratio below; eps is
+    # only kept large enough (1e-3) for the eigenvalue change to be resolvable.
+    eps = 1e-3
     matp = Material(name="p", diffusion=[1.2], sigma_a=[0.020 + eps],
                     nu_sigma_f=[0.020])
-    ref = ns.eig
-    fwd, adj = ref.solve(), ref.solve(adjoint=True)
-    pert = DiffusionEigenSolver(grid, matp, None, bc=bc)
-    d_rho = ns.k_eff * first_order_reactivity(ref, fwd, adj, pert)
+    k_pert = NoiseSolver(grid, matp, kinetics=kin, bc=bc, angular=angular).k_eff
+    d_rho = ns.k_eff * (1.0 / ns.k_eff - 1.0 / k_pert)
 
     src = NoiseSource(d_sigma_a=[eps])
     for f in (0.02, 0.2, 2.0, 20.0, 200.0):

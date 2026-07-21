@@ -337,6 +337,14 @@ the within-group operator is the same matrix-free `GroupOperator` built with a
 *complex* removal (complex-symmetric ⇒ solved by **COCG**), and the group/fission
 coupling is closed by the same Anderson-accelerated Gauss-Seidel sweep.
 
+The same solver runs the **SPN transport approximations** (`angular="sp3"`,
+`"sp5"`, `"sp7"`): `iω/v` enters the even-moment U-form block as its time term
+`θ`, the block stays complex-symmetric (COCG again), and the scalar flux drives
+the source/fission/scatter through the block weights. Vacuum boundaries use the
+exact **moment-coupled Marshak** condition (`marshak_vacuum=True`; diffusion's
+`α=½` vacuum already *is* the Marshak condition), so the SPN noise matches
+FEMFFUSION's `Full_SPN` vacuum treatment.
+
 ```python
 from ndgpu import NoiseSolver, NoiseSource
 import numpy as np
@@ -361,25 +369,30 @@ frequency and localizes around the perturbation as ω rises. See
 `tests/validation/test_noise_point_kinetics.py`.
 
 **Cross-checked against [FEMFFUSION](https://github.com/Zonni/FEMFFUSION)'s noise
-module** on its own 1D two-group regression case (`test/1D_noise_SPN`, diffusion:
-a 1 Hz absorption fluctuation in one cell of a 300 cm slab). The two codes share
-the formulation — critical adjustment (νΣ_f/k), `ω = 2πf`, and the identical
-effective spectrum `χ_eff,g(ω)` — so they differ only in spatial discretization
-(ndgpu's cell-centred finite volume vs FEMFFUSION's continuous-Galerkin FE):
+module** on its own 1D two-group regression case (`test/1D_noise_SPN`: a 1 Hz
+absorption fluctuation in one cell of a 300 cm slab), for both diffusion (vs
+FEMFFUSION diffusion) and SP3 with the coupled Marshak vacuum (vs FEMFFUSION
+`Full_SPN`, N=3). The two codes share the formulation — critical adjustment
+(νΣ_f/k), `ω = 2πf`, the identical effective spectrum `χ_eff,g(ω)`, and the
+Marshak vacuum boundary — so they differ only in spatial discretization (ndgpu's
+cell-centred finite volume vs FEMFFUSION's continuous-Galerkin FE):
 
-| mesh | Δk_eff | δφ rel-L2 (g1 / g2) | peak phase diff |
-|---|---|---|---|
-| 60 cells (reference) | 0.8 pcm | 4.1e-3 / 5.5e-3 | 0.03° |
-| 120 cells | 0.2 pcm | 1.0e-3 / 1.4e-3 | 0.008° |
+| case | mesh | Δk_eff | δφ rel-L2 (g1 / g2) | peak phase diff |
+|---|---|---|---|---|
+| diffusion | 60 cells | 0.8 pcm | 4.1e-3 / 5.5e-3 | 0.03° |
+| diffusion | 120 cells | 0.2 pcm | 1.0e-3 / 1.4e-3 | 0.008° |
+| SP3 Marshak | 60 cells | 0.5 pcm | 3.3e-3 / 5.7e-3 | 0.02° |
+| SP3 Marshak | 120 cells | 0.9 pcm | 0.8e-3 / 1.4e-3 | 0.01° |
 
 The field difference falls ~4× when the mesh halves — clean second-order
 convergence to the same continuum solution, confirming the residual is purely
 discretization. (Cost: FEMFFUSION assembles the coupled complex system and
 solves it monolithically with preconditioned GMRES, ~13 ms / 47 iters; ndgpu's
 matrix-free source iteration is slower on this near-critical, low-frequency case
-— its worst regime, where the fission fixed point is near-neutral — at ~90 ms.)
-See `examples/noise_femffusion.py`, `tests/validation/test_noise_femffusion.py`,
-and `ndgpu.benchmarks.build_femffusion_1d_noise`.
+— its worst regime, where the fission fixed point is near-neutral — at ~90 ms
+diffusion, ~210 ms SP3.) See `examples/noise_femffusion.py`,
+`tests/validation/test_noise_femffusion.py`, and
+`ndgpu.benchmarks.build_femffusion_1d_noise`.
 
 ## Benchmarks
 
@@ -409,7 +422,6 @@ run `notebooks/colab_gpu_benchmark.ipynb` or
 - Neutron noise: per-material kinetics (2D velocities/beta), δD leakage
   fluctuations, and a monolithic complex-Krylov solve for stiff near-critical /
   low-frequency cases (the source iteration's worst regime)
-- Marshak (vacuum/albedo) boundary conditions for SP3 and diffusion
 - Wielandt shift / Chebyshev acceleration of the power iteration
 - Geometric multigrid preconditioning for the inner solves
 - Fused RawKernel stencil (single kernel launch per apply)

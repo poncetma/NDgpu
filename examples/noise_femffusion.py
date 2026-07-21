@@ -15,14 +15,17 @@ import numpy as np
 
 from ndgpu import NoiseSolver, NoiseSource
 from ndgpu.benchmarks import build_femffusion_1d_noise
-from ndgpu.benchmarks.femffusion_noise import K_EFF_REF
 
 device = sys.argv[1] if len(sys.argv) > 1 else "auto"
 cells = int(sys.argv[2]) if len(sys.argv) > 2 else 60
+# "diffusion" vs FEMFFUSION diffusion; "sp3" vs FEMFFUSION Full_SPN (coupled
+# Marshak vacuum).
+angular = sys.argv[3] if len(sys.argv) > 3 else "diffusion"
 
-bench = build_femffusion_1d_noise(cells=cells)
+bench = build_femffusion_1d_noise(cells=cells, angular=angular)
 ns = NoiseSolver(bench.grid, bench.materials, bench.material_map,
-                 kinetics=bench.kinetics, bc=bench.bc, device=device)
+                 kinetics=bench.kinetics, bc=bench.bc, angular=bench.angular,
+                 marshak_vacuum=bench.marshak_vacuum, device=device)
 
 ts = []
 for _ in range(3):
@@ -39,12 +42,13 @@ xc = (np.arange(cells) + 0.5) * (300.0 / cells)
 xref = (np.arange(60) + 0.5) * 5.0
 interp = lambda z: np.interp(xref, xc, z.real) + 1j * np.interp(xref, xc, z.imag)
 phi1 = interp(np.asarray(ns.flux0[0]).ravel().astype(complex)).real
-scale = np.dot(bench.static_flux_ref[0], phi1) / np.dot(phi1, phi1)
+scale = np.dot(bench.static_flux_ref, phi1) / np.dot(phi1, phi1)
 
-print(f"FEMFFUSION 1D 2-group noise, {cells} cells, {bench.frequency_hz} Hz, "
-      f"on {ns.device}")
-print(f"  k_eff: ndgpu {ns.k_eff:.6f}  FEMFFUSION {K_EFF_REF:.6f}  "
-      f"(dk {abs(ns.k_eff - K_EFF_REF) * 1e5:.2f} pcm)")
+bnd = "Marshak vacuum" if bench.marshak_vacuum else "Robin vacuum"
+print(f"FEMFFUSION 1D 2-group noise, angular={angular} ({bnd}), {cells} cells, "
+      f"{bench.frequency_hz} Hz, on {ns.device}")
+print(f"  k_eff: ndgpu {ns.k_eff:.6f}  FEMFFUSION {bench.k_eff_ref:.6f}  "
+      f"(dk {abs(ns.k_eff - bench.k_eff_ref) * 1e5:.2f} pcm)")
 print(f"  noise solve: {t_solve * 1e3:.1f} ms, {res.sweeps} sweeps, "
       f"{res.inner_iterations} inner COCG iters   "
       f"(FEMFFUSION reference run: ~13 ms, 47 GMRES iters)")

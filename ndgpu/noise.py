@@ -41,6 +41,13 @@ whose amplitude follows the zero-power reactor transfer function exactly (see
 pins the i w/v term, the delayed-neutron feedback in chi_eff(w), and the source
 construction against point-kinetics theory.
 
+Angular approximations: diffusion (scalar flux) and the standard SPN family --
+SP3/SP5/SP7 in the diffusive U-form -- share this machinery. For SPN the time
+term i w/v enters the (complex-symmetric) even-moment block as theta and the
+scalar flux drives fission/scatter/source through the block's src/phi0 weights;
+the moment-coupled Marshak vacuum boundary is available (``marshak_vacuum``),
+and reduces to diffusion's alpha=1/2 Robin term at order 0.
+
 Scope: global kinetics data (velocities (G,), beta (I,), chi_delayed None / (G,)
 / (I, G)); the material_map and the optional mix arrays give full spatial
 heterogeneity. Per-material velocities/beta (2D kinetics tables) are not yet
@@ -59,8 +66,9 @@ from .backend import asnumpy, device_name, get_backend, synchronize
 from .grid import Grid
 from .linalg import cocg, neumann_preconditioner
 from .materials import Kinetics
-from .operator import BC_VACUUM, BC_ZERO_FLUX, GroupOperator
-from .solver import DiffusionEigenSolver
+from .operator import (BC_VACUUM, BC_ZERO_FLUX, GroupOperator, SDPNGroupOperator,
+                       _SPN_C, _SPN_G)
+from .solver import DiffusionEigenSolver, SPNEigenSolver
 
 
 def zero_power_transfer_function(omega, kinetics: Kinetics, generation_time: float):
@@ -196,17 +204,45 @@ class NoiseSolver:
     kinetics : Kinetics -- velocities (one per group), delayed families
         (beta, decay), and optional chi_delayed. Global data only (see module
         docstring).
+    angular : "diffusion" (default), "sp3", "sp5" or "sp7" -- the angular
+        approximation. The SPN orders carry M = (N+1)/2 even moments in the
+        diffusive U-form (the same block as :class:`~ndgpu.SPNEigenSolver`): the
+        frequency-domain time term i w/v enters the block as theta (exactly as
+        the transient's 1/(v dt) does) and the SPN block stays complex
+        symmetric, so the same COCG within-group solve applies. The noise
+        source, chi_eff(w) and scattering all act on the scalar flux phi0, so
+        only the operator, the moment state and the RHS distribution change. SPN
+        captures the transport effects (steep gradients, strong absorbers) that
+        diffusion noise misses.
+    marshak_vacuum : use the exact moment-coupled Marshak vacuum boundary on
+        vacuum faces (SPN only; the coupled -n.D grad U = (g (x) I) U condition
+        of the SPN family) instead of the per-moment Robin (alpha=1/2)
+        approximation. Diffusion's vacuum boundary already *is* the Marshak
+        condition (alpha=1/2), so the flag is inert there. Matches FEMFFUSION's
+        SPN noise boundary treatment; leaves reflective/zero-flux faces
+        unchanged.
     bc, device, dtype, active, mask_bc, precond_degree : as for the eigensolver.
     """
 
+    _SPN_ORDER = {"sp3": 1, "sp5": 2, "sp7": 3}
+
     def __init__(self, grid: Grid, materials, material_map=None,
-                 *, kinetics: Kinetics, bc=BC_ZERO_FLUX, device: str = "auto",
+                 *, kinetics: Kinetics, angular: str = "diffusion",
+                 marshak_vacuum: bool = False,
+                 bc=BC_ZERO_FLUX, device: str = "auto",
                  dtype=np.float64, active=None, mask_bc=BC_VACUUM,
                  mix_material=None, mix_weight=None, precond_degree: int = 0):
         if kinetics.per_material:
             raise NotImplementedError(
                 "NoiseSolver supports only global kinetics data; per-material "
                 "velocities/beta are not yet implemented (see module docstring)")
+        if angular != "diffusion" and angular not in self._SPN_ORDER:
+            raise ValueError("angular must be 'diffusion' or one of "
+                             f"{sorted(self._SPN_ORDER)}, got {angular!r}")
+        self.angular = angular
+        self._spn = angular != "diffusion"
+        self._order = self._SPN_ORDER.get(angular, 0)
+        self.marshak_vacuum = bool(marshak_vacuum)
         self.grid = grid
         self.kinetics = kinetics
         self.bc = bc
@@ -220,12 +256,20 @@ class NoiseSolver:
                                else np.complex128)
 
         # One static eigen-solve gives phi_0, k_eff and the cross-section
-        # fields; everything downstream reuses them (the maps are static).
-        self.eig = DiffusionEigenSolver(
-            grid, materials, material_map, bc=bc,
-            device="cpu" if xp is np else "gpu", dtype=self.dtype,
+        # fields; everything downstream reuses them (the maps are static). The
+        # SPN static solve runs at the same order and Marshak boundary as the
+        # noise operator, so phi_0 is a consistent equilibrium.
+        common = dict(
+            bc=bc, device="cpu" if xp is np else "gpu", dtype=self.dtype,
             active=active, mask_bc=mask_bc,
             mix_material=mix_material, mix_weight=mix_weight)
+        if self._spn:
+            eig_cls = type(f"_SPN{self._order}", (SPNEigenSolver,),
+                           {"_order": self._order})
+            self.eig = eig_cls(grid, materials, material_map,
+                               marshak_vacuum=self.marshak_vacuum, **common)
+        else:
+            self.eig = DiffusionEigenSolver(grid, materials, material_map, **common)
         res = self.eig.solve(tol_k=1e-9, tol_source=1e-8)
         if not res.converged:
             raise RuntimeError(f"static state did not converge: {res}")
@@ -237,6 +281,11 @@ class NoiseSolver:
         self.flux0 = [res.flux[g].copy() for g in range(G)]
         # Per-group 1/v (scalar per group; global velocities).
         self._inv_v = [1.0 / float(kinetics.velocities[g]) for g in range(G)]
+        # SPN U-form: how the scalar source spreads over moment rows and how the
+        # scalar flux is recovered (constant in frequency; from the static op).
+        if self._spn:
+            self._src_weights = list(self.eig.ops[0].src_weights)
+            self._phi0_weights = list(self.eig.ops[0].phi0_weights)
 
     # -- point-kinetics reference parameters --------------------------------
     def generation_time(self) -> float:
@@ -323,6 +372,56 @@ class NoiseSolver:
         return [chi[g] - complex(np.dot(cd[:, g], bc))
                 for g in range(self.n_groups)]
 
+    # -- angular approximation hooks (diffusion scalar flux vs SPN moments) ---
+    def _build_ops(self, xp, fields, omega, G):
+        """Per-group frequency-domain within-group operators. The time term
+        i w/v enters as the complex removal shift (diffusion) or the SPN block
+        time parameter theta; both stay complex symmetric. The Marshak vacuum
+        boundary matrix (SPN, when requested) couples the moments on vacuum
+        faces."""
+        if self._spn:
+            bg = _SPN_G[self._order] if self.marshak_vacuum else None
+            return [SDPNGroupOperator(
+                xp, self.grid, fields.diffusion[g], fields.sigma_t[g],
+                fields.removal[g], order=self._order, bc=self.bc,
+                active=self.active, mask_bc=self.mask_bc, coeffs=_SPN_C,
+                boundary_g=bg, theta=1j * omega * self._inv_v[g])
+                for g in range(G)]
+        return [GroupOperator(
+            xp, self.grid, fields.diffusion[g],
+            fields.removal[g] + 1j * omega * self._inv_v[g],
+            bc=self.bc, active=self.active, mask_bc=self.mask_bc)
+            for g in range(G)]
+
+    def _zero_state(self, xp):
+        """Complex zero solution state per group (scalar, or an (M, *grid)
+        even-moment block for SPN)."""
+        shape = ((self._order + 1,) + self.grid.shape) if self._spn else self.grid.shape
+        return [xp.zeros(shape, dtype=self.cdtype) for _ in range(self.n_groups)]
+
+    def _phi0(self, u):
+        """Scalar flux of one group's state: phi0 = phi0_weights . U for SPN
+        (the diffusive U-form recovers the scalar flux from the moments)."""
+        if not self._spn:
+            return u
+        w = self._phi0_weights
+        phi = w[0] * u[0]
+        for j in range(1, len(w)):
+            if w[j] != 0.0:
+                phi = phi + w[j] * u[j]
+        return phi
+
+    def _rhs(self, xp, q0):
+        """Distribute an isotropic source q0 over the group's moment rows by the
+        SPN source weights (src_weights); diffusion takes q0 as is."""
+        if not self._spn:
+            return q0
+        w = self._src_weights
+        rhs = xp.empty((self._order + 1,) + self.grid.shape, dtype=self.cdtype)
+        for i in range(len(w)):
+            rhs[i] = w[i] * q0
+        return rhs
+
     # -- the solve -----------------------------------------------------------
     def solve(self, source: NoiseSource, omega: float, *, tol: float = 1e-8,
               max_sweeps: int = 500, anderson_depth: int = 8,
@@ -356,20 +455,15 @@ class NoiseSolver:
         k0 = self.k_eff
         fscale = 1.0 / k0 if critical_adjust else 1.0
 
-        # Within-group operators: real diffusion/removal stencil plus the
-        # imaginary shift i w / v_g on the diagonal -> complex symmetric.
-        ops = [GroupOperator(xp, self.grid, fields.diffusion[g],
-                             fields.removal[g] + 1j * omega * self._inv_v[g],
-                             bc=self.bc, active=self.active, mask_bc=self.mask_bc)
-               for g in range(G)]
+        # Within-group operators carry the imaginary time shift i w/v_g (as the
+        # complex removal, or the SP3 block theta) -> complex symmetric.
+        ops = self._build_ops(xp, fields, omega, G)
         preconds = [neumann_preconditioner(op.apply, op.inv_diag,
                                             self.precond_degree) for op in ops]
         src_w = getattr(ops[0], "rhs_weight", None)   # cylindrical metric
 
         chi_eff = self._chi_eff(omega)
         Sn = self._noise_source(source, chi_eff)
-        if src_w is not None:
-            Sn = [s * src_w for s in Sn]
 
         has_upscatter = any(fields.sigma_s[gf][gt] is not None
                             for gt in range(G) for gf in range(gt + 1, G))
@@ -377,7 +471,10 @@ class NoiseSolver:
                  else (3 if has_upscatter else 1))
 
         rnorm = lambda u: float(xp.sqrt(xp.sum((u.conj() * u).real)))
-        phi = [xp.zeros(self.grid.shape, dtype=self.cdtype) for _ in range(G)]
+        # State per group (scalar flux, or the SP3 moment block); phi0 is the
+        # scalar flux that drives fission, scatter and the source.
+        u = self._zero_state(xp)
+        phi = [self._phi0(u[g]) for g in range(G)]
         S = fields.fission_source(phi) * fscale       # complex fission source, =0
         change = 1.0
         change_prev = np.inf
@@ -390,15 +487,17 @@ class NoiseSolver:
             rtol = min(1e-6, max(1e-3 * change, 1e-3 * tol, inner_rtol_floor))
             for _ in range(n_sub):
                 for g in range(G):
-                    q = chi_eff[g] * S + Sn[g]
+                    q0 = chi_eff[g] * S + Sn[g]
                     for gf in range(G):
                         s = fields.sigma_s[gf][g]
                         if gf != g and s is not None:
-                            q = q + s * phi[gf]
+                            q0 = q0 + s * phi[gf]
                     if src_w is not None:
-                        q = q * src_w
-                    phi[g], n_it = cocg(ops[g].apply, q, phi[g], ops[g].inv_diag,
-                                        xp, rtol=rtol, precond=preconds[g])
+                        q0 = q0 * src_w
+                    u[g], n_it = cocg(ops[g].apply, self._rhs(xp, q0), u[g],
+                                      ops[g].inv_diag, xp, rtol=rtol,
+                                      precond=preconds[g])
+                    phi[g] = self._phi0(u[g])
                     inner_total += n_it
             G_S = fields.fission_source(phi) * fscale
             delta = G_S - S
