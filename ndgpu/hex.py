@@ -24,8 +24,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .operator import (BC_VACUUM, face_alpha, harmonic_mean, normalize_bc,
-                       robin_face_term)
+from .stencil import (BC_VACUUM, face_alpha, harmonic_mean, normalize_bc,
+                      robin_face_term)
 from .solver import DiffusionEigenSolver
 
 

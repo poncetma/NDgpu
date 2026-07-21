@@ -29,8 +29,9 @@ import math
 from dataclasses import dataclass
 
 
-from .operator import (BC_VACUUM, SP3GroupOperator, face_alpha, harmonic_mean,
-                       normalize_bc, robin_face_term)
+from .sp3 import SP3GroupOperator
+from .stencil import (BC_VACUUM, face_alpha, harmonic_mean, normalize_bc,
+                      robin_face_term)
 from .solver import (DiffusionEigenSolver, SDPNEigenSolver, SP3EigenSolver,
                      SPNEigenSolver)
 

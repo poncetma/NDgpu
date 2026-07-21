@@ -66,8 +66,8 @@ from .backend import asnumpy, device_name, get_backend, synchronize
 from .grid import Grid
 from .linalg import cocg, neumann_preconditioner
 from .materials import Kinetics
-from .operator import (BC_VACUUM, BC_ZERO_FLUX, GroupOperator, SDPNGroupOperator,
-                       _SPN_C, _SPN_G)
+from .spn import SDPNGroupOperator, _SPN_C, _SPN_G
+from .stencil import BC_VACUUM, BC_ZERO_FLUX, GroupOperator
 from .solver import DiffusionEigenSolver, SPNEigenSolver
 
 

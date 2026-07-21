@@ -43,8 +43,9 @@ from .backend import asnumpy, device_name, get_backend, synchronize
 from .grid import Grid
 from .linalg import get_linear_solver, neumann_preconditioner
 from .materials import Kinetics
-from .operator import (BC_VACUUM, BC_ZERO_FLUX, GroupOperator,
-                       SDPNGroupOperator, SP3GroupOperator, _SPN_C)
+from .sp3 import SP3GroupOperator
+from .spn import SDPNGroupOperator, _SPN_C
+from .stencil import BC_VACUUM, BC_ZERO_FLUX, GroupOperator
 from .solver import (DiffusionEigenSolver, Fields, Result, SDP1EigenSolver,
                      SDPNEigenSolver)
 
@@ -662,7 +663,7 @@ class TransientSDPNSolver:
         # similarity) auto falls back to the congruence basis whenever the
         # boundary conditions allow it (reflective/zero-flux faces only, see
         # CongruentSDPNOperator).
-        from .operator import _SDPN_C, _congruence_available, _diag_similarity
+        from .spn import _SDPN_C, _congruence_available, _diag_similarity
         tabs = (self._coeffs if self._coeffs is not None else _SDPN_C)[self.order]
         r = _diag_similarity(tabs)
         identity = r is not None and all(abs(x - 1.0) < 1e-12 for x in r)
@@ -683,7 +684,7 @@ class TransientSDPNSolver:
 
     def _build_ops(self, xp, fields, inv_vdt, G):
         if self._symmetrize and not self._diag_sym:
-            from .operator import CongruentSDPNOperator
+            from .spn import CongruentSDPNOperator
             ops = [CongruentSDPNOperator(xp, self.grid, fields.diffusion[g],
                                          fields.sigma_t[g], fields.removal[g],
                                          order=self.order, bc=self.bc,

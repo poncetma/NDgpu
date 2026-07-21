@@ -39,10 +39,10 @@ from .backend import asnumpy, device_name, get_backend, synchronize
 from .grid import Grid
 from .linalg import get_linear_solver, neumann_preconditioner, pcg
 from .materials import Material
-from .operator import (BC_VACUUM, BC_ZERO_FLUX, CongruentSDPNOperator,
-                       GroupOperator, _SDPN_C, _SDPN_G, _SPN_C, _SPN_G,
-                       _congruence_available, _diag_similarity,
-                       SDPNGroupOperator, SP3GroupOperator)
+from .sp3 import SP3GroupOperator
+from .spn import (CongruentSDPNOperator, SDPNGroupOperator, _SDPN_C, _SDPN_G,
+                  _SPN_C, _SPN_G, _congruence_available, _diag_similarity)
+from .stencil import BC_VACUUM, BC_ZERO_FLUX, GroupOperator
 
 
 def _anderson_source(hist, raw, xp):

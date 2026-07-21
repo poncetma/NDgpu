@@ -34,7 +34,7 @@ from .grid import Grid
 from .hexraster import hex_site_xy, rasterize_hex_sites
 from .materials import Kinetics, Material
 from .mesh import UnstructuredDiffusionSolver, read_gmsh
-from .operator import face_alpha
+from .stencil import face_alpha
 from .solver import (DiffusionEigenSolver, SDP1EigenSolver, SDP2EigenSolver,
                      SDP3EigenSolver, SP1EigenSolver, SP3EigenSolver,
                      SP5EigenSolver, SP7EigenSolver)
