@@ -3,6 +3,7 @@ from .biblis import build_biblis
 from .c5g7 import K_REFERENCE_2D, build_c5g7_2d
 from .c5g7_td import (C5G7TD_CHI_DELAYED, C5G7TD_DECAY, CASES as C5G7TD_CASES,
                       build_c5g7_td)
+from .femffusion_noise import NoiseBenchmark, build_femffusion_1d_noise
 from .hpmr import (HPMR_KINETICS, build_hpmr2d, build_hpmr3d,
                   hpmr_endfb8_materials)
 from .iaea import build_iaea
@@ -17,6 +18,7 @@ __all__ = ["K_REFERENCE_2D", "build_anl8a1", "build_biblis", "build_c5g7_2d",
            "build_hpmr2d",
            "build_hpmr3d", "hpmr_endfb8_materials",
            "build_iaea", "build_langenbuch", "build_twigl", "build_vver440",
+           "build_femffusion_1d_noise", "NoiseBenchmark",
            "build_reflected_slab", "reflected_k", "bare_k",
            "SLAB_CORE", "SLAB_REFLECTOR",
            "ANL8A1_KINETICS", "HPMR_KINETICS", "LANGENBUCH_KINETICS", "TWIGL_KINETICS",

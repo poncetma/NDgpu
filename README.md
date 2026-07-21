@@ -360,6 +360,27 @@ frequency and localizes around the perturbation as ω rises. See
 `examples/noise_transfer_function.py` and
 `tests/validation/test_noise_point_kinetics.py`.
 
+**Cross-checked against [FEMFFUSION](https://github.com/Zonni/FEMFFUSION)'s noise
+module** on its own 1D two-group regression case (`test/1D_noise_SPN`, diffusion:
+a 1 Hz absorption fluctuation in one cell of a 300 cm slab). The two codes share
+the formulation — critical adjustment (νΣ_f/k), `ω = 2πf`, and the identical
+effective spectrum `χ_eff,g(ω)` — so they differ only in spatial discretization
+(ndgpu's cell-centred finite volume vs FEMFFUSION's continuous-Galerkin FE):
+
+| mesh | Δk_eff | δφ rel-L2 (g1 / g2) | peak phase diff |
+|---|---|---|---|
+| 60 cells (reference) | 0.8 pcm | 4.1e-3 / 5.5e-3 | 0.03° |
+| 120 cells | 0.2 pcm | 1.0e-3 / 1.4e-3 | 0.008° |
+
+The field difference falls ~4× when the mesh halves — clean second-order
+convergence to the same continuum solution, confirming the residual is purely
+discretization. (Cost: FEMFFUSION assembles the coupled complex system and
+solves it monolithically with preconditioned GMRES, ~13 ms / 47 iters; ndgpu's
+matrix-free source iteration is slower on this near-critical, low-frequency case
+— its worst regime, where the fission fixed point is near-neutral — at ~90 ms.)
+See `examples/noise_femffusion.py`, `tests/validation/test_noise_femffusion.py`,
+and `ndgpu.benchmarks.build_femffusion_1d_noise`.
+
 ## Benchmarks
 
 ```bash
@@ -386,7 +407,8 @@ run `notebooks/colab_gpu_benchmark.ipynb` or
 ## Roadmap
 
 - Neutron noise: per-material kinetics (2D velocities/beta), δD leakage
-  fluctuations, and a cross-check against FEMFFUSION's noise module
+  fluctuations, and a monolithic complex-Krylov solve for stiff near-critical /
+  low-frequency cases (the source iteration's worst regime)
 - Marshak (vacuum/albedo) boundary conditions for SP3 and diffusion
 - Wielandt shift / Chebyshev acceleration of the power iteration
 - Geometric multigrid preconditioning for the inner solves

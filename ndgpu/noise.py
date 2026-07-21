@@ -327,7 +327,7 @@ class NoiseSolver:
     def solve(self, source: NoiseSource, omega: float, *, tol: float = 1e-8,
               max_sweeps: int = 500, anderson_depth: int = 8,
               scatter_subsweeps: int | None = None,
-              inner_rtol_floor: float = 1e-12,
+              inner_rtol_floor: float = 1e-12, critical_adjust: bool = True,
               verbose: bool = False) -> NoiseResult:
         """Solve the noise problem at angular frequency ``omega`` (rad/s).
 
@@ -336,12 +336,25 @@ class NoiseSolver:
         within-group system is the complex-symmetric operator solved by COCG.
         ``scatter_subsweeps`` (auto: 3 with upscatter, else 1) and the Anderson
         restart safeguard play the same roles as in the transient step.
+
+        critical_adjust : divide the base fission production by k_eff so the
+            unperturbed static state is an exact equilibrium of the noise
+            operator (the physically correct critical reactor -- its noise
+            operator is singular at w=0, the DC resonance of point kinetics).
+            True by default, and the convention FEMFFUSION also uses (its
+            make_critical() scales nu_sigma_f by 1/k_eff before assembling the
+            noise operator). Set False to take the noise about the *un-adjusted*
+            fundamental eigenmode (raw nu_sigma_f); the two differ by
+            O(1 - 1/k_eff). The fission *perturbation* term in the source always
+            carries 1/k_eff, so this flag is inert for perturbations that do not
+            touch nu_sigma_f.
         """
         xp, G = self.xp, self.n_groups
         synchronize(xp)
         t0 = time.perf_counter()
         fields = self.fields
         k0 = self.k_eff
+        fscale = 1.0 / k0 if critical_adjust else 1.0
 
         # Within-group operators: real diffusion/removal stencil plus the
         # imaginary shift i w / v_g on the diagonal -> complex symmetric.
@@ -365,7 +378,7 @@ class NoiseSolver:
 
         rnorm = lambda u: float(xp.sqrt(xp.sum((u.conj() * u).real)))
         phi = [xp.zeros(self.grid.shape, dtype=self.cdtype) for _ in range(G)]
-        S = fields.fission_source(phi) / k0           # complex fission source, =0
+        S = fields.fission_source(phi) * fscale       # complex fission source, =0
         change = 1.0
         change_prev = np.inf
         hist: list = []
@@ -387,7 +400,7 @@ class NoiseSolver:
                     phi[g], n_it = cocg(ops[g].apply, q, phi[g], ops[g].inv_diag,
                                         xp, rtol=rtol, precond=preconds[g])
                     inner_total += n_it
-            G_S = fields.fission_source(phi) / k0
+            G_S = fields.fission_source(phi) * fscale
             delta = G_S - S
             denom = rnorm(G_S)
             change = rnorm(delta) / denom if denom > 0 else rnorm(delta)
