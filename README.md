@@ -312,6 +312,54 @@ worth by ~5%, as re-deriving that scheme shows — see
 erratum in the book), so the eigenvalue is validated tightly and the
 excursion tail within a quantified band.
 
+## Neutron noise (frequency domain)
+
+`NoiseSolver` computes the stationary flux fluctuations δφ(**r**, ω) that a
+fluctuating cross section δΣ(**r**, ω) induces on top of a critical mean flux —
+neutron noise analysis, the basis of core-monitoring diagnostics (detecting
+vibrating fuel/absorbers, coolant-density waves, unseated assemblies). Writing
+each quantity as mean + fluctuation, linearizing, and Fourier transforming in
+time (∂/∂t → iω) turns the time-dependent diffusion + precursor equations into
+a **fixed-source complex** problem, one linear solve per frequency:
+
+```
+[ -∇·D_g∇ + Σ_r,g + iω/v_g ] δφ_g − Σ_{g'≠g} Σ_s,g'→g δφ_g'
+    − (χ_eff,g(ω)/k) Σ_g' νΣ_f,g' δφ_g'  =  S_noise,g
+```
+
+with the frequency-dependent effective spectrum `χ_eff,g(ω) = χ_g − Σ_i χ_d,i,g
+β_i·iω/(iω+λ_i)` — the exact analog of the transient's backward-Euler weight
+(`1/(1+λΔt) → iω/(iω+λ)`) — and the noise source `S_noise,g = −δΣ_r,g φ_0,g + …`
+collecting every cross-section fluctuation multiplying the static flux. This is
+structurally the transient within-step fixed point with the real shift `1/(vΔt)`
+replaced by the imaginary shift `iω/v`, so the machinery is reused wholesale:
+the within-group operator is the same matrix-free `GroupOperator` built with a
+*complex* removal (complex-symmetric ⇒ solved by **COCG**), and the group/fission
+coupling is closed by the same Anderson-accelerated Gauss-Seidel sweep.
+
+```python
+from ndgpu import NoiseSolver, NoiseSource
+import numpy as np
+
+ns = NoiseSolver(grid, materials, material_map, kinetics=kin, bc=bc)
+absorber = np.zeros(grid.shape, dtype=complex); absorber[i, j, 0] = 5e-4
+src = NoiseSource(d_sigma_a=[np.zeros(grid.shape), absorber])   # vibrating thermal absorber
+res = ns.solve(src, omega=2*np.pi*1.0)     # 1 Hz
+dphi = res.relative()                       # δφ_g / φ_0,g  (complex, per group)
+```
+
+Validated against point-kinetics theory: for a homogeneous, fully reflected
+(leakage-free) one-group reactor a uniform absorption fluctuation drives a flat
+response whose complex amplitude is *exactly* the zero-power reactor transfer
+function `G(ω) = 1/[iω(Λ + Σ_i β_i/(iω+λ_i))]` times the perturbation reactivity
+— reproduced to **< 1e-6** (magnitude and phase) across five frequency decades
+with six delayed families, response flat to machine precision. In a heterogeneous
+near-critical core (2D TWIGL) a localized absorber shows the hallmark
+**global-to-local transition**: the response follows the fundamental mode at low
+frequency and localizes around the perturbation as ω rises. See
+`examples/noise_transfer_function.py` and
+`tests/validation/test_noise_point_kinetics.py`.
+
 ## Benchmarks
 
 ```bash
@@ -337,6 +385,8 @@ run `notebooks/colab_gpu_benchmark.ipynb` or
 
 ## Roadmap
 
+- Neutron noise: per-material kinetics (2D velocities/beta), δD leakage
+  fluctuations, and a cross-check against FEMFFUSION's noise module
 - Marshak (vacuum/albedo) boundary conditions for SP3 and diffusion
 - Wielandt shift / Chebyshev acceleration of the power iteration
 - Geometric multigrid preconditioning for the inner solves

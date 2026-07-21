@@ -18,6 +18,8 @@ from .mesh import (Mesh, MeshResult, UnstructuredDiffusionSolver, assemble_mesh,
                   assemble_mesh_3d, read_gmsh)
 from .model import (HexLattice, MeshModel, Model, ModelResult, ReactorResult,
                    TransientModelResult)
+from .noise import (NoiseResult, NoiseSolver, NoiseSource,
+                    zero_power_transfer_function)
 from .perturbation import first_order_reactivity
 from .solver import (DiffusionEigenSolver, Result, SDP1EigenSolver,
                      SDP2EigenSolver, SDP3EigenSolver, SP1EigenSolver,
@@ -64,6 +66,10 @@ __all__ = [
     "TransientSDP3Solver",
     "TransientSPNSolver",
     "TransientResult",
+    "NoiseSolver",
+    "NoiseSource",
+    "NoiseResult",
+    "zero_power_transfer_function",
     "Grid",
     "HexGrid",
     "offset_to_axial",

@@ -170,6 +170,60 @@ def gmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
     )
 
 
+def cocg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
+         precond=None):
+    """Solve A x = b with preconditioned COCG for *complex-symmetric* A.
+
+    Conjugate Orthogonal CG (van der Vorst & Melissen, IEEE Trans. Magn. 26
+    (1990) 706): the CG recurrence with the *bilinear* (unconjugated) inner
+    product ``(u, v) = sum_j u_j v_j`` in place of the Hermitian one. It solves
+    A x = b whenever A = A^T (complex symmetric) at CG's cost -- one apply and
+    two short vector updates per iteration, constant memory -- which is exactly
+    the frequency-domain within-group operator  -div(D grad .) + Sigma_r + i w/v
+    (a real SPD stencil plus a purely imaginary diagonal shift, so A = A^T but
+    not A = A^H). The convergence test still uses the *true* Euclidean norm
+    ||r|| = sqrt(sum |r_j|^2); only the recurrence coefficients use the
+    bilinear form. Same interface, warm start and stopping rule as :func:`pcg`
+    (to which it reduces for real A), so it slots into the same call sites.
+
+    COCG can break down if a bilinear product vanishes on a non-null vector;
+    that is rare for these near-SPD operators and is reported as a failure.
+
+    Returns (x, n_iterations).
+    """
+    bdot = lambda u, v: xp.sum(u * v)                 # bilinear (unconjugated)
+    rnorm = lambda u: float(xp.sqrt(xp.sum((u.conj() * u).real)))
+    M = precond if precond is not None else (lambda r: inv_diag * r)
+
+    x = x0.copy()
+    r = b - apply_A(x)
+    stop = max(rtol * rnorm(b), atol)
+    if rnorm(r) <= stop:
+        return x, 0
+
+    z = M(r)
+    p = z.copy()
+    rz = bdot(r, z)
+    for it in range(1, maxiter + 1):
+        Ap = apply_A(p)
+        pAp = bdot(p, Ap)
+        if pAp == 0:
+            raise RuntimeError("COCG breakdown (p^T A p = 0)")
+        alpha = rz / pAp
+        x += alpha * p
+        r -= alpha * Ap
+        if rnorm(r) <= stop:
+            return x, it
+        z = M(r)
+        rz_new = bdot(r, z)
+        p = z + (rz_new / rz) * p
+        rz = rz_new
+    raise RuntimeError(
+        f"COCG failed to converge in {maxiter} iterations "
+        f"(residual {rnorm(r):.3e}, target {stop:.3e})"
+    )
+
+
 def bicgstab(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
              precond=None):
     """Solve A x = b with preconditioned BiCGStab (van der Vorst).
@@ -250,7 +304,7 @@ def bicgstab(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
     )
 
 
-LINEAR_SOLVERS = {"cg": pcg, "gmres": gmres, "bicgstab": bicgstab}
+LINEAR_SOLVERS = {"cg": pcg, "cocg": cocg, "gmres": gmres, "bicgstab": bicgstab}
 
 
 def get_linear_solver(name):
