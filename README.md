@@ -306,6 +306,25 @@ with transport. (The coupling is accurate for a well-resolved isolated drum;
 tightly-packed multiple drums need a better interface reconstruction than the
 present isotropic-incoming/net-current model.)
 
+`ndgpu.TriSNTransportSolver` (`examples/hpmr_tri_sn.py`) puts discrete ordinates
+on the **body-fitted HP-MR triangular mesh** — so the microreactor has a true
+transport k-eigenvalue reference on the same grid and cross sections as
+diffusion and SP3, not a Cartesian stand-in. The structured equilateral-triangle
+lattice is what makes it tractable: rather than order the transport sweep by hand
+(and break cycles), the per-ordinate streaming+collision operator
+Ω·∇ + Σ_t is assembled sparse with upwind (step) differencing and factorized once
+— a "sweep" is then a triangular solve — with GMRES on the within-group scatter
+and an Anderson-accelerated fission power iteration. It reproduces k∞ exactly on
+a periodic homogeneous lattice (`test_tri_sn.py`). On the HP-MR it confirms the
+SP3 finding with true transport: the near-black B4C drum is self-shielded
+(flux-depressed), so transport resolves *less* drum worth than diffusion. Upwind
+differencing is robustly non-negative through the black absorber but only
+first-order, so at coarse mesh its numerical diffusion — worst where the drums
+are inserted and gradients steepest — corrupts the small worth correction (even
+flips its sign); refining (`hpmr_tri_sn.py` sweeps refine 4→6→8) converges the
+Sₙ worth correction to SP3's self-shielding direction. Still a CPU/numpy
+reference.
+
 ### Griffin and FEMFFUSION cross-section files
 
 - `ndgpu.read_griffin_library` / `read_griffin_material` parse Griffin/YakXs
