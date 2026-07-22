@@ -304,6 +304,89 @@ def bicgstab(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
     )
 
 
+def fgmres_c(apply_A, b, x0, xp, precond, rtol=1e-8, atol=0.0, maxiter=1000,
+             restart=50):
+    """Flexible, complex restarted GMRES for a general (non-symmetric) complex
+    operator A with a *variable / nonlinear* right preconditioner.
+
+    Unlike :func:`gmres` (real, linear preconditioner) this uses Hermitian inner
+    products and complex Givens rotations, and -- being *flexible* -- stores the
+    preconditioned basis Z_j = precond(V_j) so ``precond`` may itself be an
+    iterative solve (e.g. a block Gauss-Seidel sweep whose within-group systems
+    are solved by COCG). That is exactly the preconditioner the frequency-domain
+    neutron-noise operator wants: the block-diagonal within-group solves are
+    strong and cheap, and FGMRES/Krylov-accelerates the group (scatter/fission)
+    coupling, which the unaccelerated fixed point resolves only slowly near
+    criticality. ``precond`` need not be linear; the price over stored-basis
+    GMRES is a second set of ``restart`` vectors (the Z_j).
+
+    Returns (x, n_outer) with n_outer the number of A applies (Arnoldi steps).
+    """
+    hdot = lambda u, v: complex(xp.sum(u.conj() * v))
+    nrm = lambda u: float(xp.sqrt(xp.sum((u.conj() * u).real)))
+
+    x = x0.copy()
+    stop = max(rtol * nrm(b), atol)
+    r = b - apply_A(x)
+    res = nrm(r)
+    if res <= stop:
+        return x, 0
+    it = 0
+    while it < maxiter:
+        m = min(restart, maxiter - it)
+        V = [r / res]
+        Z = []
+        H = np.zeros((m + 1, m), dtype=np.complex128)
+        cs = np.zeros(m, dtype=np.complex128)
+        sn = np.zeros(m, dtype=np.complex128)
+        g = np.zeros(m + 1, dtype=np.complex128)
+        g[0] = res
+        k = 0
+        for j in range(m):
+            it += 1
+            zj = precond(V[j])                  # flexible: may be iterative
+            Z.append(zj)
+            w = apply_A(zj)
+            for i in range(j + 1):              # modified Gram-Schmidt (Hermitian)
+                H[i, j] = hdot(V[i], w)
+                w = w - H[i, j] * V[i]
+            hjj = nrm(w)
+            H[j + 1, j] = hjj
+            breakdown = hjj <= 1e-300
+            if not breakdown:
+                V.append(w / hjj)
+            for i in range(j):                  # apply stored Givens to column j
+                t1, t2 = H[i, j], H[i + 1, j]
+                H[i, j] = cs[i] * t1 + sn[i] * t2
+                H[i + 1, j] = -np.conj(sn[i]) * t1 + cs[i] * t2
+            a, bb = H[j, j], H[j + 1, j]         # complex Givens to zero H[j+1,j]
+            if bb == 0:
+                c, s, rr = 1.0, 0.0 + 0j, a
+            elif a == 0:
+                c, s, rr = 0.0, 1.0 + 0j, bb
+            else:
+                aa, ab = abs(a), abs(bb)
+                nu = np.hypot(aa, ab)
+                c, s, rr = aa / nu, (a / aa) * np.conj(bb) / nu, (a / aa) * nu
+            cs[j], sn[j] = c, s
+            H[j, j], H[j + 1, j] = rr, 0.0
+            g[j + 1] = -np.conj(s) * g[j]
+            g[j] = c * g[j]
+            k = j + 1
+            if abs(g[k]) <= stop or breakdown:
+                break
+        y = np.linalg.solve(H[:k, :k], g[:k])
+        for j in range(k):
+            x = x + complex(y[j]) * Z[j]
+        r = b - apply_A(x)
+        res = nrm(r)
+        if res <= stop:
+            return x, it
+    raise RuntimeError(
+        f"FGMRES failed to converge in {it} applies "
+        f"(residual {res:.3e}, target {stop:.3e})")
+
+
 LINEAR_SOLVERS = {"cg": pcg, "cocg": cocg, "gmres": gmres, "bicgstab": bicgstab}
 
 

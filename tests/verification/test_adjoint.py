@@ -107,3 +107,26 @@ def test_noise_adjoint_reciprocity(angular, f_hz):
     r_fwd = bilinear(psi_d, fwd.d_flux_numpy())     # <psi_d, delta-phi>
     r_adj = bilinear(adj.d_flux_numpy(), S)         # <psi*, S>
     assert abs(r_fwd - r_adj) / abs(r_fwd) < 1e-6
+
+
+@pytest.mark.parametrize("angular", ["diffusion", "sp3"])
+@pytest.mark.parametrize("f_hz", [0.1, 10.0])
+def test_noise_krylov_matches_source(angular, f_hz):
+    """The monolithic complex-GMRES noise solve (method='krylov') must return
+    the same delta-phi as the Anderson Gauss-Seidel source iteration. The
+    coupled operator is complex non-symmetric (scatter + fission), so this also
+    exercises fgmres_c and the block-Gauss-Seidel preconditioner; the PWR set's
+    downscatter makes the coupling genuinely triangular."""
+    from ndgpu import Kinetics, NoiseSolver, NoiseSource
+
+    grid = Grid(shape=(8, 8, 1), size=(40.0, 40.0, 1.0))
+    kin = Kinetics(velocities=[1.5e7, 4.0e5], beta=[0.0065], decay=[0.0784])
+    ns = NoiseSolver(grid, PWR_TWO_GROUP, kinetics=kin, bc="vacuum", angular=angular)
+    w = 2.0 * np.pi * f_hz
+    src = NoiseSource(d_sigma_a=[np.zeros(grid.shape), 1e-4 * np.ones(grid.shape)])
+
+    a = ns.solve(src, w, tol=1e-10, method="source")
+    b = ns.solve(src, w, tol=1e-10, method="krylov")
+    da = np.concatenate([np.asarray(x).ravel() for x in a.d_flux_numpy()])
+    db = np.concatenate([np.asarray(x).ravel() for x in b.d_flux_numpy()])
+    assert np.linalg.norm(da - db) / np.linalg.norm(da) < 1e-6

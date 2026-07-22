@@ -71,7 +71,7 @@ import numpy as np
 
 from .backend import asnumpy, device_name, get_backend, synchronize
 from .grid import Grid
-from .linalg import cocg, neumann_preconditioner
+from .linalg import cocg, fgmres_c, neumann_preconditioner
 from .materials import Kinetics
 from .spn import SDPNGroupOperator, _SPN_C, _SPN_G
 from .stencil import BC_VACUUM, BC_ZERO_FLUX, GroupOperator
@@ -461,17 +461,31 @@ class NoiseSolver:
     # -- the solve -----------------------------------------------------------
     def solve(self, source: NoiseSource = None, omega: float = None, *,
               adjoint: bool = False, fixed_source=None, tol: float = 1e-8,
-              max_sweeps: int = 500, anderson_depth: int = 8,
-              scatter_subsweeps: int | None = None,
+              method: str = "source", max_sweeps: int = 500,
+              anderson_depth: int = 8, scatter_subsweeps: int | None = None,
               inner_rtol_floor: float = 1e-12, critical_adjust: bool = True,
+              krylov_restart: int = 50, krylov_inner_rtol: float = 1e-2,
               verbose: bool = False) -> NoiseResult:
         """Solve the noise problem at angular frequency ``omega`` (rad/s).
 
-        The complex fission-source fixed point is closed by an
-        Anderson-accelerated Gauss-Seidel sweep over the groups; each
-        within-group system is the complex-symmetric operator solved by COCG.
-        ``scatter_subsweeps`` (auto: 3 with upscatter, else 1) and the Anderson
-        restart safeguard play the same roles as in the transient step.
+        method : "source" (default) or "krylov". "source" closes the complex
+            fission-source fixed point by an Anderson-accelerated Gauss-Seidel
+            sweep over the groups (each within-group system the complex-symmetric
+            operator solved by COCG); ``scatter_subsweeps`` (auto: 3 with
+            upscatter, else 1) and the Anderson restart safeguard play the same
+            roles as in the transient step. "krylov" instead solves the full
+            coupled multigroup operator monolithically with flexible complex
+            GMRES (:func:`ndgpu.linalg.fgmres_c`), right-preconditioned by one
+            block Gauss-Seidel sweep (the same COCG within-group solves, to the
+            loose ``krylov_inner_rtol``). The coupled operator is complex but
+            non-symmetric (scatter/fission coupling), so GMRES -- not COCG -- is
+            the outer solver; Krylov-accelerating the group coupling converges in
+            far fewer sweeps than the plain fixed point in the stiff regime
+            (near-critical + low frequency), where source iteration needs many
+            Anderson sweeps. Both methods return the same delta-phi to ``tol``.
+        krylov_restart, krylov_inner_rtol : GMRES restart length and the loose
+            relative tolerance of the preconditioner's within-group COCG solves
+            (method="krylov" only).
 
         adjoint : solve the transposed noise problem A^T psi = RHS instead of
             A phi = RHS. The noise operator is complex *symmetric* within each
@@ -554,6 +568,13 @@ class NoiseSolver:
         n_sub = (int(scatter_subsweeps) if scatter_subsweeps
                  else (3 if has_upscatter else 1))
 
+        if method == "krylov":
+            return self._solve_krylov(
+                xp, G, ops, preconds, src_w, Sn, emit, production, scat, fscale,
+                omega, k0, tol, krylov_restart, krylov_inner_rtol, t0, verbose)
+        if method != "source":
+            raise ValueError("method must be 'source' or 'krylov'")
+
         rnorm = lambda u: float(xp.sqrt(xp.sum((u.conj() * u).real)))
         # State per group (scalar flux, or the SP3 moment block); phi0 is the
         # scalar flux that drives fission, scatter and the source.
@@ -607,6 +628,69 @@ class NoiseSolver:
             converged=converged, sweeps=sweep, inner_iterations=inner_total,
             solve_seconds=time.perf_counter() - t0, device=self.device,
             change_history=hist_change)
+
+    def _solve_krylov(self, xp, G, ops, preconds, src_w, Sn, emit, production,
+                      scat, fscale, omega, k0, tol, restart, inner_rtol, t0,
+                      verbose):
+        """Monolithic solve of the coupled multigroup noise operator by flexible
+        complex GMRES, preconditioned by one block Gauss-Seidel sweep.
+
+        The stacked unknown X has shape (G,) + state_shape (state_shape = grid
+        shape for diffusion, (M, *grid) for the SPN moment block). The coupled
+        operator moves the scatter/fission coupling onto the left-hand side:
+        [A X]_g = ops[g].apply(X_g) - dist(coupling_g(phi)), phi_g = phi0(X_g),
+        so A X = b with b_g = dist(Sn_g); dist spreads the isotropic source over
+        the moment rows (SPN) and carries the cylindrical metric (src_w)."""
+        inner_total = [0]
+
+        def dist(scalar_q):
+            return self._rhs(xp, scalar_q * src_w if src_w is not None else scalar_q)
+
+        def coupling(phi, g, phiz=None):
+            """Scatter + fission source into group g from scalar fluxes phi
+            (fission uses production over all groups; GS uses updated phiz)."""
+            P = production(phiz if phiz is not None else phi) * fscale
+            q = emit[g] * P
+            for gf in range(G):
+                s = scat(gf, g)
+                if gf != g and s is not None:
+                    q = q + s * phi[gf]
+            return q
+
+        def apply_A(X):
+            phi = [self._phi0(X[g]) for g in range(G)]
+            out = xp.empty_like(X)
+            for g in range(G):
+                out[g] = ops[g].apply(X[g]) - dist(coupling(phi, g))
+            return out
+
+        def precond(R):
+            """One block Gauss-Seidel sweep approximating A^{-1} R: solve
+            ops[g] Z_g = R_g + dist(coupling from already-updated groups)."""
+            Z = [None] * G
+            phiz = [xp.zeros(self.grid.shape, dtype=self.cdtype) for _ in range(G)]
+            for g in range(G):
+                rhs = R[g] + dist(coupling(phiz, g, phiz=phiz))
+                Z[g], n_it = cocg(ops[g].apply, rhs, xp.zeros_like(R[g]),
+                                  ops[g].inv_diag, xp, rtol=inner_rtol,
+                                  precond=preconds[g])
+                phiz[g] = self._phi0(Z[g])
+                inner_total[0] += n_it
+            return xp.stack(Z)
+
+        b = xp.stack([dist(Sn[g]) for g in range(G)])
+        x0 = xp.stack(self._zero_state(xp))
+        x, n_outer = fgmres_c(apply_A, b, x0, xp, precond, rtol=tol,
+                              restart=restart, maxiter=10 * restart)
+        phi = [self._phi0(x[g]) for g in range(G)]
+        if verbose:
+            print(f"  krylov: {n_outer} GMRES applies, {inner_total[0]} inner COCG")
+        synchronize(xp)
+        return NoiseResult(
+            omega=float(omega), d_flux=phi, flux0=self.flux0, k_eff=k0,
+            converged=True, sweeps=n_outer, inner_iterations=inner_total[0],
+            solve_seconds=time.perf_counter() - t0, device=self.device,
+            change_history=[])
 
     def adjoint_importance(self, response, omega: float, **kw) -> NoiseResult:
         """Adjoint noise flux psi*(r, w): solve A^T psi* = ``response``.
