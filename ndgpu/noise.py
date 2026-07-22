@@ -48,6 +48,13 @@ scalar flux drives fission/scatter/source through the block's src/phi0 weights;
 the moment-coupled Marshak vacuum boundary is available (``marshak_vacuum``),
 and reduces to diffusion's alpha=1/2 Robin term at order 0.
 
+Geometry: the same machinery runs on the Cartesian/cylindrical structured grid
+and on the body-fitted triangular mesh (hex/prismatic cores such as HP-MR). The
+tri mesh only swaps the per-moment leakage stencil (TriGroupOperator) and the
+static eigensolver (TriDiffusionEigenSolver / TriSPNEigenSolver); the complex
+iw/v shift, COCG within-group solve, chi_eff(w) and Anderson fission fixed point
+are geometry-independent.
+
 Scope: global kinetics data (velocities (G,), beta (I,), chi_delayed None / (G,)
 / (I, G)); the material_map and the optional mix arrays give full spatial
 heterogeneity. Per-material velocities/beta (2D kinetics tables) are not yet
@@ -69,6 +76,8 @@ from .materials import Kinetics
 from .spn import SDPNGroupOperator, _SPN_C, _SPN_G
 from .stencil import BC_VACUUM, BC_ZERO_FLUX, GroupOperator
 from .solver import DiffusionEigenSolver, SPNEigenSolver
+from .tri import (TriGrid, TriGroupOperator, TriDiffusionEigenSolver,
+                  TriSPNEigenSolver)
 
 
 def zero_power_transfer_function(omega, kinetics: Kinetics, generation_time: float):
@@ -198,9 +207,12 @@ class NoiseSolver:
     :class:`~ndgpu.transient.TransientSolver`:
 
     grid, materials, material_map : the static reactor (fissile), as for the
-        eigensolver. materials may be a single Material or a list indexed by
-        material_map; mix_material / mix_weight add the same optional per-cell
-        two-material blend (static in frequency).
+        eigensolver. A Cartesian/cylindrical :class:`~ndgpu.Grid` or a
+        body-fitted :class:`~ndgpu.tri.TriGrid` (hex/prismatic cores such as
+        HP-MR) -- the tri mesh routes through TriGroupOperator and the tri
+        eigensolvers automatically. materials may be a single Material or a list
+        indexed by material_map; mix_material / mix_weight add the same optional
+        per-cell two-material blend (static in frequency).
     kinetics : Kinetics -- velocities (one per group), delayed families
         (beta, decay), and optional chi_delayed. Global data only (see module
         docstring).
@@ -242,6 +254,13 @@ class NoiseSolver:
         self.angular = angular
         self._spn = angular != "diffusion"
         self._order = self._SPN_ORDER.get(angular, 0)
+        # Geometry: the body-fitted triangular mesh (hex/prismatic cores, e.g.
+        # HP-MR) uses TriGroupOperator for the per-moment leakage; the Cartesian/
+        # cylindrical Grid uses GroupOperator. Both expose the same (apply,
+        # inv_diag) interface and flow the complex iw/v shift unchanged, so only
+        # the operator class and the static eigensolver differ.
+        self._tri = isinstance(grid, TriGrid)
+        self._op_cls = TriGroupOperator if self._tri else GroupOperator
         self.marshak_vacuum = bool(marshak_vacuum)
         self.grid = grid
         self.kinetics = kinetics
@@ -264,12 +283,14 @@ class NoiseSolver:
             active=active, mask_bc=mask_bc,
             mix_material=mix_material, mix_weight=mix_weight)
         if self._spn:
-            eig_cls = type(f"_SPN{self._order}", (SPNEigenSolver,),
+            base = TriSPNEigenSolver if self._tri else SPNEigenSolver
+            eig_cls = type(f"_SPN{self._order}", (base,),
                            {"_order": self._order})
             self.eig = eig_cls(grid, materials, material_map,
                                marshak_vacuum=self.marshak_vacuum, **common)
         else:
-            self.eig = DiffusionEigenSolver(grid, materials, material_map, **common)
+            diff_cls = TriDiffusionEigenSolver if self._tri else DiffusionEigenSolver
+            self.eig = diff_cls(grid, materials, material_map, **common)
         res = self.eig.solve(tol_k=1e-9, tol_source=1e-8)
         if not res.converged:
             raise RuntimeError(f"static state did not converge: {res}")
@@ -384,10 +405,10 @@ class NoiseSolver:
             return [SDPNGroupOperator(
                 xp, self.grid, fields.diffusion[g], fields.sigma_t[g],
                 fields.removal[g], order=self._order, bc=self.bc,
-                active=self.active, mask_bc=self.mask_bc, coeffs=_SPN_C,
-                boundary_g=bg, theta=1j * omega * self._inv_v[g])
+                active=self.active, mask_bc=self.mask_bc, op_cls=self._op_cls,
+                coeffs=_SPN_C, boundary_g=bg, theta=1j * omega * self._inv_v[g])
                 for g in range(G)]
-        return [GroupOperator(
+        return [self._op_cls(
             xp, self.grid, fields.diffusion[g],
             fields.removal[g] + 1j * omega * self._inv_v[g],
             bc=self.bc, active=self.active, mask_bc=self.mask_bc)

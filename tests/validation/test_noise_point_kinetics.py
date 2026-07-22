@@ -67,6 +67,61 @@ def test_zero_power_transfer_function(families, angular):
         assert abs(amp / predicted - 1.0) < 1e-6      # magnitude and phase
 
 
+@pytest.mark.parametrize("angular", ["diffusion", "sp3"])
+def test_zero_power_transfer_function_tri(angular):
+    """Same point-kinetics check on the body-fitted triangular mesh (HP-MR's
+    geometry): a homogeneous tri reactor with no active mask is fully reflected
+    in-plane (off-array edges carry no leakage) and, in 2D, has no z faces, so
+    it is leakage-free and flat -- the tri noise operator must reproduce G(w) *
+    delta-rho to solver precision, pinning that the i w/v shift, chi_eff(w) and
+    the source assembly flow through TriGroupOperator exactly as on the
+    Cartesian grid."""
+    from ndgpu.tri import TriGrid
+    mat = Material(name="crit", diffusion=[1.2], sigma_a=[0.020], nu_sigma_f=[0.020])
+    grid = TriGrid(shape=(4, 4, 2), side=10.0)
+    kin = Kinetics(velocities=[2.2e5], beta=[0.0065], decay=[0.0784])
+    ns = NoiseSolver(grid, mat, kinetics=kin, angular=angular)
+    assert abs(ns.k_eff - 1.0) < 1e-9
+    Lam = ns.generation_time()
+
+    eps = 1e-3
+    matp = Material(name="p", diffusion=[1.2], sigma_a=[0.020 + eps],
+                    nu_sigma_f=[0.020])
+    k_pert = NoiseSolver(grid, matp, kinetics=kin, angular=angular).k_eff
+    d_rho = ns.k_eff * (1.0 / ns.k_eff - 1.0 / k_pert)
+
+    src = NoiseSource(d_sigma_a=[eps])
+    for f in (0.02, 0.2, 2.0, 20.0, 200.0):
+        w = 2.0 * np.pi * f
+        res = ns.solve(src, w, tol=1e-11)
+        assert res.converged
+        rel = res.relative()[0]
+        amp = complex(np.mean(rel))
+        assert float(np.max(np.abs(rel - amp))) / abs(amp) < 1e-9
+        predicted = zero_power_transfer_function(w, kin, Lam) * d_rho
+        assert abs(amp / predicted - 1.0) < 1e-6
+
+
+def test_noise_tri_matches_cartesian_slab():
+    """Cross-geometry consistency: a 1D-like homogeneous slab noise problem
+    gives the same flat flux-noise amplitude whether discretized on the
+    Cartesian grid or the triangular mesh (both leakage-free and flat here), so
+    the tri path reproduces the Cartesian one to discretization-independent
+    agreement on this exact solution."""
+    from ndgpu.tri import TriGrid
+    mat = Material(name="crit", diffusion=[1.2], sigma_a=[0.020], nu_sigma_f=[0.020])
+    kin = Kinetics(velocities=[2.2e5], beta=[0.0065], decay=[0.0784])
+    src = NoiseSource(d_sigma_a=[1e-4])
+    w = 2.0 * np.pi * 1.0
+
+    ns_c = NoiseSolver(Grid(shape=(3, 3, 1), size=(15.0, 15.0, 15.0)), mat,
+                       kinetics=kin, bc="reflective")
+    ns_t = NoiseSolver(TriGrid(shape=(4, 4, 2), side=10.0), mat, kinetics=kin)
+    amp_c = complex(np.mean(ns_c.solve(src, w, tol=1e-11).relative()[0]))
+    amp_t = complex(np.mean(ns_t.solve(src, w, tol=1e-11).relative()[0]))
+    assert abs(amp_t / amp_c - 1.0) < 1e-9
+
+
 def test_high_frequency_prompt_asymptote():
     """Well above the delayed-neutron break frequencies the response follows the
     prompt transfer function G -> 1/(i w Lambda): |delta-phi/phi| ~ |d_rho|/(w
