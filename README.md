@@ -272,6 +272,40 @@ the gap a superhomogenization (SPH) correction removes; pass per-group SPH
 factors (from a transport/FEMFFUSION reference) via `hpmr_endfb8_materials(...,
 sph_fuel=…)` or `volume_homogenize(..., sph_factors=…)`.
 
+### Discrete-ordinates (Sₙ) transport reference and hybrid Sₙ/diffusion
+
+`ndgpu.SNTransportSolver` is a 2D Gauss-Legendre discrete-ordinates (Sₙ)
+k-eigenvalue solver — the 2D extension of the 1D Sₙ reference that scores the
+SDPN family (`examples/sdpn_benchmark_1d.py`). It uses a product quadrature
+(Gauss-Legendre in the polar cosine × uniform azimuthal), diamond differencing
+swept one ordinate at a time (each 2D sweep factored into a per-row 1D
+bidiagonal solve), GMRES on the within-group scattering fixed point, and an
+Anderson-accelerated reflective-boundary fixed point. Cross sections come from
+ndgpu `Material`s reconstructed into the transport problem whose P1 limit is
+exactly the diffusion data (Σ_t = 1/3D, within-group scatter Σ_t−Σ_a−Σ_out), so
+Sₙ, diffusion and SDPN score the same physics. It reproduces k∞ exactly on a
+reflective homogeneous box, matches diffusion in the scattering-dominated
+limit, and gives the transport k that SP3/SDPN bracket toward (`test_sn.py`).
+It's a CPU/numpy reference, not the GPU path.
+
+`ndgpu.HybridSNDiffusionSolver` (`examples/hybrid_sn_hpmr.py`) is the Sₙ
+counterpart of the hybrid SP3/diffusion solver: full transport (Sₙ) runs only
+in a masked subdomain — the control-drum absorber — and diffusion in the bulk.
+Because Sₙ and diffusion are genuinely different discretizations (angular
+unknowns + sweep vs a scalar stencil), this is a real domain decomposition: the
+drum is excised from the diffusion domain and the two are coupled by the
+interface **net current** (an Sₙ fixed-source solve on the drum box with
+incoming from the neighbouring diffusion flux; its outgoing current becomes a
+source on the ring of bulk diffusion cells). The limits are exact — an empty
+mask reproduces the diffusion solver bit-for-bit, a full mask reproduces Sₙ. On
+a 2D-Cartesian HP-MR-motivated drum core it closes ~80 % of the diffusion→Sₙ
+control-drum-worth error with transport in a few percent of the cells: diffusion
+over-predicts the near-black drum's worth (~+30 %) for want of the transport
+self-shielding, and the hybrid recovers most of it by resolving only the drum
+with transport. (The coupling is accurate for a well-resolved isolated drum;
+tightly-packed multiple drums need a better interface reconstruction than the
+present isotropic-incoming/net-current model.)
+
 ### Griffin and FEMFFUSION cross-section files
 
 - `ndgpu.read_griffin_library` / `read_griffin_material` parse Griffin/YakXs

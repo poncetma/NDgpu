@@ -177,7 +177,8 @@ class SNTransportSolver:
     """
 
     def __init__(self, grid: Grid, materials, material_map=None,
-                 n_polar: int = 3, n_azi: int = 12, bc: str = BC_VACUUM):
+                 n_polar: int = 3, n_azi: int = 12, bc: str = BC_VACUUM,
+                 require_fissile: bool = True):
         if grid.shape[2] != 1:
             raise ValueError("SNTransportSolver is 2D: grid must have nz == 1")
         if bc not in (BC_VACUUM, BC_REFLECTIVE):
@@ -216,7 +217,7 @@ class SNTransportSolver:
             for gt in range(G):
                 if gf != gt and np.any(sig_s[:, gf, gt]):
                     self.scatter[gf][gt] = sig_s[mmap, gf, gt]  # (nx, ny)
-        if not np.any(self.nsf):
+        if require_fissile and not np.any(self.nsf):
             raise ValueError("no fissile material: k-eigenvalue is undefined")
 
         self.mu, self.eta, self.w = quadrature_2d(n_polar, n_azi)
