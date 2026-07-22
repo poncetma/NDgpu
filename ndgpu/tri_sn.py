@@ -67,14 +67,32 @@ class TriSNTransportSolver:
                     ``bc`` boundary law. Defaults to all-active.
     n_polar, n_azi: product-quadrature sizes (n_azi a multiple of 4).
     bc            : "vacuum" (default) or "periodic" (torus / infinite medium).
+    scheme        : spatial differencing. "step" (default) -- upwind, robustly
+                    non-negative, first-order. "diamond" -- an EXPERIMENTAL
+                    edge-based scheme: eliminate the cell flux with the
+                    linear-average closure psi_c = mean(edge fluxes) and close the
+                    two-outflow case with equal outflow edges, giving a square,
+                    well-posed global edge system (exact for a flat flux, so k_inf
+                    is exact). It is NOT second-order in practice, though: the
+                    equal-outflow closure is not linear-consistent, so the measured
+                    spatial order is ~1 (like step) and it does not improve the
+                    HP-MR drum worth. A genuinely second-order tri scheme needs the
+                    extra first-moment equation, i.e. linear-discontinuous (LD)
+                    finite elements (see docs/hybrid_tri_sn_design.md notes). The
+                    edge machinery (_build_edges) is retained mainly because the
+                    hybrid tri-S_N/diffusion interface coupling reuses it.
     """
 
     def __init__(self, grid: TriGrid, materials, material_map=None, active=None,
-                 n_polar: int = 3, n_azi: int = 12, bc: str = "vacuum"):
+                 n_polar: int = 3, n_azi: int = 12, bc: str = "vacuum",
+                 scheme: str = "step"):
         if len(grid.shape) != 3 or grid.shape[2] != 2:
             raise ValueError("TriSNTransportSolver is 2D: grid shape (nr, nc, 2)")
         if bc not in ("vacuum", "periodic"):
             raise ValueError("bc must be 'vacuum' or 'periodic'")
+        if scheme not in ("step", "diamond"):
+            raise ValueError("scheme must be 'step' or 'diamond'")
+        self.scheme = scheme
         self.grid = grid
         self.nr, self.nc = grid.shape[0], grid.shape[1]
         self.bc = bc
@@ -114,6 +132,13 @@ class TriSNTransportSolver:
         self._prefactor()
 
     def _prefactor(self):
+        if self.scheme == "diamond":
+            self._build_edges()
+            self._prefactor_diamond()
+        else:
+            self._prefactor_step()
+
+    def _prefactor_step(self):
         """Assemble and LU-factorize L_Omega = Omega.grad + Sigma_t (upwind) for
         every ordinate and group, once."""
         h, area = self.h, self.area
@@ -167,11 +192,119 @@ class TriSNTransportSolver:
 
     def _sweep(self, g, src_flat):
         """phi = Sum_m w_m L_Omega^-1 (src * area) for an isotropic source."""
+        if self.scheme == "diamond":
+            return self._sweep_diamond(g, src_flat)
         rhs = src_flat * self.area
         rhs = np.where(self._act_flat, rhs, 0.0)
         phi = np.zeros(self.N)
         for m in range(self.M):
             phi += self.w[m] * self._solvers[g][m](rhs)
+        return phi
+
+    # ---- diamond (edge-based linear-average closure) -----------------------
+    def _build_edges(self):
+        """Enumerate mesh edges once (direction-independent). Each interior edge
+        (shared by an active down and up cell) gets one id from both sides via a
+        canonical key; each boundary edge (facing an excised/void/off-mesh cell)
+        gets its own. Builds edge_of[cell, local_edge] and the per-(type,edge)
+        outward normals."""
+        nr, nc, N = self.nr, self.nc, self.N
+        cell, act = self._cell, self.active
+        self._nrm = np.array([[_EDGES[3 * t + e][4] for e in range(3)]
+                              for t in range(2)])          # (2 types, 3 edges, 2)
+        BIG = np.int64(N) + 1
+        cell_key = np.full((N, 3), -1, dtype=np.int64)
+        cell_bdry = np.zeros((N, 3), bool)
+        ii, jj = np.meshgrid(np.arange(nr), np.arange(nc), indexing="ij")
+        for k in range(6):
+            t, di, dj, tn, _ = _EDGES[k]
+            e = k % 3
+            ni, nj = ii + di, jj + dj
+            if self.bc == "periodic":
+                ni, nj = ni % nr, nj % nc
+                inb = np.ones_like(ni, bool)
+            else:
+                inb = (ni >= 0) & (ni < nr) & (nj >= 0) & (nj < nc)
+            srcid = cell[:, :, t]
+            nbrid = np.full((nr, nc), -1)
+            nbrid[inb] = cell[ni[inb], nj[inb], tn]
+            nbr_act = np.zeros((nr, nc), bool)
+            nbr_act[inb] = act[ni[inb], nj[inb], tn]
+            src_act = act[:, :, t]
+            interior = src_act & nbr_act
+            a = np.minimum(srcid, np.where(nbrid >= 0, nbrid, srcid)).astype(np.int64)
+            b = np.maximum(srcid, np.where(nbrid >= 0, nbrid, srcid)).astype(np.int64)
+            key = np.where(interior, a * BIG + b,
+                           BIG * BIG + srcid.astype(np.int64) * 3 + e)
+            sel = src_act
+            cell_key[srcid[sel], e] = key[sel]
+            cell_bdry[srcid[sel], e] = ~interior[sel]
+        flat = cell_key.reshape(-1)
+        mask = flat >= 0
+        uniq, inv = np.unique(flat[mask], return_inverse=True)
+        edge_of = np.full(N * 3, -1)
+        edge_of[np.where(mask)[0]] = inv
+        self._edge_of = edge_of.reshape(N, 3)
+        self._cell_bdry = cell_bdry
+        self.n_edges = len(uniq)
+        self._active_cells = np.where(self._act_flat)[0]
+        self._cell_type = np.arange(N) % 2
+
+    def _prefactor_diamond(self):
+        """Per ordinate and group, assemble the square edge system
+        (balance + linear-average closure eliminated psi_c, plus equal-outflow
+        and vacuum-inflow closures) and factorize it once."""
+        area, h = self.area, self.h
+        ac = self._active_cells
+        K = ac.size
+        eo = self._edge_of[ac]                              # (K, 3) global edge ids
+        nrm = self._nrm[self._cell_type[ac]]                # (K, 3, 2)
+        bdry = self._cell_bdry[ac]                          # (K, 3)
+        tol = 1e-12
+        self._diam = {"ac": ac, "eo": eo, "K": K}
+        self._solvers = [[None] * self.M for _ in range(self.G)]
+        for g in range(self.G):
+            st_ac = self.st[g].reshape(-1)[ac]              # (K,)
+            for m in range(self.M):
+                On = self.mu[m] * nrm[:, :, 0] + self.eta[m] * nrm[:, :, 1]  # (K,3) Omega.n
+                rows, cols, vals = [], [], []
+                # balance rows 0..K-1: Sum_e [(Omega.n) h + Sigma_t A/3] psi_e = S A
+                coeff = On * h + (st_ac * area / 3.0)[:, None]
+                rr = np.repeat(np.arange(K), 3)
+                rows.append(rr); cols.append(eo.reshape(-1)); vals.append(coeff.reshape(-1))
+                row = K
+                outflow = On > tol
+                n_out = outflow.sum(1)
+                # equal-outflow closure for cells with two outflow edges
+                two = np.where(n_out == 2)[0]
+                for c in two:
+                    oe = eo[c, outflow[c]]
+                    rows.append(np.array([row, row]))
+                    cols.append(oe[:2]); vals.append(np.array([1.0, -1.0]))
+                    row += 1
+                # vacuum on inflow (or grazing) boundary edges
+                vac = bdry & ~outflow
+                vc, ve = np.where(vac)
+                nvac = vc.size
+                rows.append(np.arange(row, row + nvac))
+                cols.append(eo[vc, ve]); vals.append(np.ones(nvac))
+                row += nvac
+                assert row == self.n_edges, (row, self.n_edges)
+                A = sp.csr_matrix((np.concatenate(vals),
+                                   (np.concatenate(rows), np.concatenate(cols))),
+                                  shape=(self.n_edges, self.n_edges))
+                self._solvers[g][m] = factorized(A.tocsc())
+
+    def _sweep_diamond(self, g, src_flat):
+        d = self._diam
+        ac, eo, K = d["ac"], d["eo"], d["K"]
+        rhs = np.zeros(self.n_edges)
+        rhs[:K] = src_flat[ac] * self.area                  # source into balance rows
+        phi = np.zeros(self.N)
+        for m in range(self.M):
+            psi_e = self._solvers[g][m](rhs)                # edge fluxes
+            psi_c = psi_e[eo].mean(1)                       # cell = mean of its edges
+            phi[ac] += self.w[m] * psi_c
         return phi
 
     def _solve_group(self, g, qext_flat, phi0, tol):

@@ -31,11 +31,14 @@ M2 = Material(diffusion=[1.4, 0.4], sigma_a=[0.01, 0.10],
               chi=[1.0, 0.0], name="m2")
 
 
+@pytest.mark.parametrize("scheme", ["step", "diamond"])
 @pytest.mark.parametrize("mat", [M1, M2])
-def test_periodic_homogeneous_is_kinf(mat):
+def test_periodic_homogeneous_is_kinf(mat, scheme):
+    # Flat flux makes both schemes exact (the diamond edge-average and
+    # equal-outflow closures are both satisfied by a constant flux).
     grid = TriGrid(shape=(6, 6, 2), side=3.0)
-    r = TriSNTransportSolver(grid, mat, n_polar=2, n_azi=8,
-                             bc="periodic").solve(tol_k=1e-9, tol_source=1e-9)
+    r = TriSNTransportSolver(grid, mat, n_polar=2, n_azi=8, bc="periodic",
+                             scheme=scheme).solve(tol_k=1e-9, tol_source=1e-9)
     assert r.converged
     assert r.k_eff == pytest.approx(k_infinite(mat), abs=2e-6)   # < 0.2 pcm
     flux = r.flux[0]
