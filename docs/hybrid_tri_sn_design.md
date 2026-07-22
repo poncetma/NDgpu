@@ -101,14 +101,14 @@ source on the ring of bulk cells), *not* by pinning the drum scalar flux
 * **Cost.** Each drum's Sₙ solve is over a handful of cells, so the hybrid should
   be far cheaper than the full-core tri-Sₙ — the actual payoff of the method.
 * **Differencing.** The drum Sₙ wants a genuinely second-order scheme so the
-  transport worth is resolved without pushing refinement as high as step needs
-  (see `examples/hpmr_tri_sn.py`). The experimental `scheme="diamond"`
-  (edge-average + equal-outflow closure) is **not** it — measured spatial order
-  is ~1 because the equal-outflow closure is not linear-consistent, and it does
-  not improve the HP-MR worth. A real second-order tri scheme needs the extra
-  first-moment equation, i.e. **linear-discontinuous (LD)** finite elements: 3
-  DoF per cell (average + two slopes) with the transport equation enforced
-  against the test functions {1, ξ, η}, upwind edge fluxes taken from the
-  neighbour's linear flux at the shared edge. That is the correct follow-on to
-  the step solver; the `_build_edges` edge map already gives the connectivity it
-  needs.
+  transport worth is resolved without pushing refinement as high as step needs.
+  Use `scheme="scb"` (simple corner balance): a second-order finite-volume scheme
+  — three corner sub-volumes per triangle, cell-boundary half-edges upwinded to
+  the neighbour's corner at the shared vertex, interior corner faces carrying the
+  average of the two corner fluxes. It is exact for a flat flux, stays linear
+  (factorizes once), and reaches the correct HP-MR drum-worth sign about two
+  refinements sooner than step (`examples/hpmr_tri_sn.py`). (An earlier
+  edge-average + equal-outflow "diamond" attempt was only ~1st order — the
+  equal-outflow closure is not linear-consistent — and was replaced by SCB.) In
+  the hybrid, the drum Sₙ region should use SCB, and its corner-boundary
+  half-edges on the drum↔bulk interface carry the net current to the bulk.

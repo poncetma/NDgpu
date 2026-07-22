@@ -68,19 +68,17 @@ class TriSNTransportSolver:
     n_polar, n_azi: product-quadrature sizes (n_azi a multiple of 4).
     bc            : "vacuum" (default) or "periodic" (torus / infinite medium).
     scheme        : spatial differencing. "step" (default) -- upwind, robustly
-                    non-negative, first-order. "diamond" -- an EXPERIMENTAL
-                    edge-based scheme: eliminate the cell flux with the
-                    linear-average closure psi_c = mean(edge fluxes) and close the
-                    two-outflow case with equal outflow edges, giving a square,
-                    well-posed global edge system (exact for a flat flux, so k_inf
-                    is exact). It is NOT second-order in practice, though: the
-                    equal-outflow closure is not linear-consistent, so the measured
-                    spatial order is ~1 (like step) and it does not improve the
-                    HP-MR drum worth. A genuinely second-order tri scheme needs the
-                    extra first-moment equation, i.e. linear-discontinuous (LD)
-                    finite elements (see docs/hybrid_tri_sn_design.md notes). The
-                    edge machinery (_build_edges) is retained mainly because the
-                    hybrid tri-S_N/diffusion interface coupling reuses it.
+                    non-negative, first-order. "scb" -- simple corner balance, a
+                    second-order finite-volume scheme: each triangle is split into
+                    three corner sub-volumes (3 unknowns per cell), with the cell
+                    boundary half-edges upwinded to the neighbour's corner at the
+                    shared vertex and the interior corner faces carrying the
+                    average of the two corner fluxes. It is a genuine finite-volume
+                    balance (not a difference stencil), stays linear so it
+                    factorizes once, is exact for a flat flux (k_inf exact), and --
+                    unlike the earlier edge-average scheme -- reaches second-order
+                    convergence, resolving the HP-MR drum worth at far coarser mesh
+                    than step. Costs ~3x the unknowns of step.
     """
 
     def __init__(self, grid: TriGrid, materials, material_map=None, active=None,
@@ -90,8 +88,8 @@ class TriSNTransportSolver:
             raise ValueError("TriSNTransportSolver is 2D: grid shape (nr, nc, 2)")
         if bc not in ("vacuum", "periodic"):
             raise ValueError("bc must be 'vacuum' or 'periodic'")
-        if scheme not in ("step", "diamond"):
-            raise ValueError("scheme must be 'step' or 'diamond'")
+        if scheme not in ("step", "scb"):
+            raise ValueError("scheme must be 'step' or 'scb'")
         self.scheme = scheme
         self.grid = grid
         self.nr, self.nc = grid.shape[0], grid.shape[1]
@@ -132,9 +130,9 @@ class TriSNTransportSolver:
         self._prefactor()
 
     def _prefactor(self):
-        if self.scheme == "diamond":
-            self._build_edges()
-            self._prefactor_diamond()
+        if self.scheme == "scb":
+            self._build_corners()
+            self._prefactor_scb()
         else:
             self._prefactor_step()
 
@@ -192,8 +190,8 @@ class TriSNTransportSolver:
 
     def _sweep(self, g, src_flat):
         """phi = Sum_m w_m L_Omega^-1 (src * area) for an isotropic source."""
-        if self.scheme == "diamond":
-            return self._sweep_diamond(g, src_flat)
+        if self.scheme == "scb":
+            return self._sweep_scb(g, src_flat)
         rhs = src_flat * self.area
         rhs = np.where(self._act_flat, rhs, 0.0)
         phi = np.zeros(self.N)
@@ -201,110 +199,114 @@ class TriSNTransportSolver:
             phi += self.w[m] * self._solvers[g][m](rhs)
         return phi
 
-    # ---- diamond (edge-based linear-average closure) -----------------------
-    def _build_edges(self):
-        """Enumerate mesh edges once (direction-independent). Each interior edge
-        (shared by an active down and up cell) gets one id from both sides via a
-        canonical key; each boundary edge (facing an excised/void/off-mesh cell)
-        gets its own. Builds edge_of[cell, local_edge] and the per-(type,edge)
-        outward normals."""
-        nr, nc, N = self.nr, self.nc, self.N
-        cell, act = self._cell, self.active
-        self._nrm = np.array([[_EDGES[3 * t + e][4] for e in range(3)]
-                              for t in range(2)])          # (2 types, 3 edges, 2)
-        BIG = np.int64(N) + 1
-        cell_key = np.full((N, 3), -1, dtype=np.int64)
-        cell_bdry = np.zeros((N, 3), bool)
-        ii, jj = np.meshgrid(np.arange(nr), np.arange(nc), indexing="ij")
-        for k in range(6):
-            t, di, dj, tn, _ = _EDGES[k]
-            e = k % 3
-            ni, nj = ii + di, jj + dj
-            if self.bc == "periodic":
-                ni, nj = ni % nr, nj % nc
-                inb = np.ones_like(ni, bool)
-            else:
-                inb = (ni >= 0) & (ni < nr) & (nj >= 0) & (nj < nc)
-            srcid = cell[:, :, t]
-            nbrid = np.full((nr, nc), -1)
-            nbrid[inb] = cell[ni[inb], nj[inb], tn]
-            nbr_act = np.zeros((nr, nc), bool)
-            nbr_act[inb] = act[ni[inb], nj[inb], tn]
-            src_act = act[:, :, t]
-            interior = src_act & nbr_act
-            a = np.minimum(srcid, np.where(nbrid >= 0, nbrid, srcid)).astype(np.int64)
-            b = np.maximum(srcid, np.where(nbrid >= 0, nbrid, srcid)).astype(np.int64)
-            key = np.where(interior, a * BIG + b,
-                           BIG * BIG + srcid.astype(np.int64) * 3 + e)
-            sel = src_act
-            cell_key[srcid[sel], e] = key[sel]
-            cell_bdry[srcid[sel], e] = ~interior[sel]
-        flat = cell_key.reshape(-1)
-        mask = flat >= 0
-        uniq, inv = np.unique(flat[mask], return_inverse=True)
-        edge_of = np.full(N * 3, -1)
-        edge_of[np.where(mask)[0]] = inv
-        self._edge_of = edge_of.reshape(N, 3)
-        self._cell_bdry = cell_bdry
-        self.n_edges = len(uniq)
-        self._active_cells = np.where(self._act_flat)[0]
-        self._cell_type = np.arange(N) % 2
+    # ---- simple corner balance (SCB), second-order ------------------------
+    def _build_corners(self):
+        """Corner connectivity for SCB (direction-independent). Each active cell
+        is split into three corner sub-volumes (one per vertex); each corner has
+        two external half-edges (upwind-coupled to the neighbour cell's corner at
+        the shared vertex) and two internal faces (to the cell's other corners).
+        Builds, per corner, the external half-edge normals + neighbour corner ids
+        and the internal face normals + same-cell corner ids."""
+        s = _SQRT3_2
+        # per cell type: for each edge -> (corner set, outward normal, neighbour
+        # rhombus offset (di,dj,type), and this->neighbour local-corner map).
+        edge_spec = {
+            0: [({1, 2}, (s, 0.5), (0, 0, 1), {1: 0, 2: 1}),      # down hyp -> up(i,j)
+                ({0, 1}, (0.0, -1.0), (-1, 0, 1), {0: 1, 1: 2}),  # down bot -> up(i-1,j)
+                ({0, 2}, (-s, 0.5), (0, -1, 1), {0: 0, 2: 2})],   # down left -> up(i,j-1)
+            1: [({0, 1}, (-s, -0.5), (0, 0, 0), {0: 1, 1: 2}),    # up hyp -> down(i,j)
+                ({1, 2}, (0.0, 1.0), (1, 0, 0), {1: 0, 2: 1}),    # up top -> down(i+1,j)
+                ({0, 2}, (s, -0.5), (0, 1, 0), {0: 0, 2: 2})],    # up right -> down(i,j+1)
+        }
+        # internal face normal from corner v toward corner w = unit(w - v).
+        int_dir = {
+            0: {(0, 1): (1.0, 0.0), (0, 2): (0.5, s), (1, 0): (-1.0, 0.0),
+                (1, 2): (-0.5, s), (2, 0): (-0.5, -s), (2, 1): (0.5, -s)},
+            1: {(0, 1): (-0.5, s), (0, 2): (0.5, s), (1, 0): (0.5, -s),
+                (1, 2): (1.0, 0.0), (2, 0): (-0.5, -s), (2, 1): (-1.0, 0.0)},
+        }
+        ext_tab, int_tab = {}, {}
+        for t in (0, 1):
+            for lc in (0, 1, 2):
+                ext_tab[(t, lc)] = [(nrm, off, cmap[lc]) for (cs, nrm, off, cmap)
+                                    in edge_spec[t] if lc in cs]
+                others = [w for w in (0, 1, 2) if w != lc]
+                int_tab[(t, lc)] = [(w, int_dir[t][(lc, w)]) for w in others]
 
-    def _prefactor_diamond(self):
-        """Per ordinate and group, assemble the square edge system
-        (balance + linear-average closure eliminated psi_c, plus equal-outflow
-        and vacuum-inflow closures) and factorize it once."""
-        area, h = self.area, self.h
-        ac = self._active_cells
+        nr, nc = self.nr, self.nc
+        cell = self._cell
+        act = self.active
+        ac = np.where(self._act_flat)[0]
         K = ac.size
-        eo = self._edge_of[ac]                              # (K, 3) global edge ids
-        nrm = self._nrm[self._cell_type[ac]]                # (K, 3, 2)
-        bdry = self._cell_bdry[ac]                          # (K, 3)
-        tol = 1e-12
-        self._diam = {"ac": ac, "eo": eo, "K": K}
+        aidx = np.full(self.N, -1)
+        aidx[ac] = np.arange(K)
+        ext_n = np.zeros((K, 3, 2, 2))                       # [corner-cell, lc, face, xy]
+        ext_nbr = np.full((K, 3, 2), -1)                    # neighbour corner global id
+        int_n = np.zeros((K, 3, 2, 2))
+        int_w = np.zeros((K, 3, 2), int)                    # same-cell corner global id
+        for r in range(K):
+            c = ac[r]
+            i, j, t = c // (nc * 2), (c // 2) % nc, c % 2
+            for lc in range(3):
+                for f, (nrm, (di, dj, tn), nbr_lc) in enumerate(ext_tab[(t, lc)]):
+                    ext_n[r, lc, f] = nrm
+                    ni, nj = i + di, j + dj
+                    if self.bc == "periodic":
+                        ni, nj = ni % nr, nj % nc
+                        ok = True
+                    else:
+                        ok = 0 <= ni < nr and 0 <= nj < nc
+                    if ok:
+                        nc_cell = cell[ni, nj, tn]
+                        if act.reshape(-1)[nc_cell]:
+                            ext_nbr[r, lc, f] = aidx[nc_cell] * 3 + nbr_lc
+                for f, (w, nrm) in enumerate(int_tab[(t, lc)]):
+                    int_n[r, lc, f] = nrm
+                    int_w[r, lc, f] = r * 3 + w
+        self._scb = {"ac": ac, "K": K, "ext_n": ext_n, "ext_nbr": ext_nbr,
+                     "int_n": int_n, "int_w": int_w}
+
+    def _prefactor_scb(self):
+        """Assemble and factorize the 3*K corner system per ordinate and group."""
+        d = self._scb
+        K = d["K"]
+        h2 = self.h / 2.0                                    # external half-edge length
+        hi = self.h / (2.0 * np.sqrt(3.0))                  # internal face length
+        A3 = self.area / 3.0                                 # corner volume
+        row = (np.arange(K)[:, None, None] * 3 + np.arange(3)[None, :, None])
+        row = np.broadcast_to(row, (K, 3, 2))
         self._solvers = [[None] * self.M for _ in range(self.G)]
         for g in range(self.G):
-            st_ac = self.st[g].reshape(-1)[ac]              # (K,)
+            st_c = self.st[g].reshape(-1)[d["ac"]]           # (K,)
             for m in range(self.M):
-                On = self.mu[m] * nrm[:, :, 0] + self.eta[m] * nrm[:, :, 1]  # (K,3) Omega.n
-                rows, cols, vals = [], [], []
-                # balance rows 0..K-1: Sum_e [(Omega.n) h + Sigma_t A/3] psi_e = S A
-                coeff = On * h + (st_ac * area / 3.0)[:, None]
-                rr = np.repeat(np.arange(K), 3)
-                rows.append(rr); cols.append(eo.reshape(-1)); vals.append(coeff.reshape(-1))
-                row = K
-                outflow = On > tol
-                n_out = outflow.sum(1)
-                # equal-outflow closure for cells with two outflow edges
-                two = np.where(n_out == 2)[0]
-                for c in two:
-                    oe = eo[c, outflow[c]]
-                    rows.append(np.array([row, row]))
-                    cols.append(oe[:2]); vals.append(np.array([1.0, -1.0]))
-                    row += 1
-                # vacuum on inflow (or grazing) boundary edges
-                vac = bdry & ~outflow
-                vc, ve = np.where(vac)
-                nvac = vc.size
-                rows.append(np.arange(row, row + nvac))
-                cols.append(eo[vc, ve]); vals.append(np.ones(nvac))
-                row += nvac
-                assert row == self.n_edges, (row, self.n_edges)
-                A = sp.csr_matrix((np.concatenate(vals),
-                                   (np.concatenate(rows), np.concatenate(cols))),
-                                  shape=(self.n_edges, self.n_edges))
-                self._solvers[g][m] = factorized(A.tocsc())
+                oe = self.mu[m] * d["ext_n"][..., 0] + self.eta[m] * d["ext_n"][..., 1]
+                oi = self.mu[m] * d["int_n"][..., 0] + self.eta[m] * d["int_n"][..., 1]
+                # diagonal: collision + outflow external + internal self-share
+                diag = st_c[:, None] * A3                    # (K, 3)
+                diag = diag + (np.where(oe > 0, oe, 0.0) * h2).sum(2)
+                diag = diag + (oi * hi * 0.5).sum(2)
+                rid = (np.arange(K)[:, None] * 3 + np.arange(3)[None, :]).ravel()
+                rows = [rid]; cols = [rid]; vals = [diag.ravel()]
+                # external inflow -> neighbour corner (skip vacuum/void boundary)
+                inflow = (oe < 0) & (d["ext_nbr"] >= 0)
+                rows.append(row[inflow]); cols.append(d["ext_nbr"][inflow])
+                vals.append((oe * h2)[inflow])
+                # internal faces -> other-corner share
+                rows.append(row.ravel()); cols.append(d["int_w"].ravel())
+                vals.append((oi * hi * 0.5).ravel())
+                Amat = sp.csr_matrix((np.concatenate(vals),
+                                      (np.concatenate(rows), np.concatenate(cols))),
+                                     shape=(3 * K, 3 * K))
+                self._solvers[g][m] = factorized(Amat.tocsc())
 
-    def _sweep_diamond(self, g, src_flat):
-        d = self._diam
-        ac, eo, K = d["ac"], d["eo"], d["K"]
-        rhs = np.zeros(self.n_edges)
-        rhs[:K] = src_flat[ac] * self.area                  # source into balance rows
+    def _sweep_scb(self, g, src_flat):
+        d = self._scb
+        ac, K = d["ac"], d["K"]
+        rhs = np.repeat(src_flat[ac] * (self.area / 3.0), 3)  # source into each corner
         phi = np.zeros(self.N)
         for m in range(self.M):
-            psi_e = self._solvers[g][m](rhs)                # edge fluxes
-            psi_c = psi_e[eo].mean(1)                       # cell = mean of its edges
-            phi[ac] += self.w[m] * psi_c
+            psi = self._solvers[g][m](rhs).reshape(K, 3)
+            phi[ac] += self.w[m] * psi.mean(1)                # cell flux = mean of corners
         return phi
 
     def _solve_group(self, g, qext_flat, phi0, tol):

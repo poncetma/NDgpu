@@ -317,13 +317,16 @@ lattice is what makes it tractable: rather than order the transport sweep by han
 and an Anderson-accelerated fission power iteration. It reproduces k∞ exactly on
 a periodic homogeneous lattice (`test_tri_sn.py`). On the HP-MR it confirms the
 SP3 finding with true transport: the near-black B4C drum is self-shielded
-(flux-depressed), so transport resolves *less* drum worth than diffusion. Upwind
-differencing is robustly non-negative through the black absorber but only
-first-order, so at coarse mesh its numerical diffusion — worst where the drums
-are inserted and gradients steepest — corrupts the small worth correction (even
-flips its sign); refining (`hpmr_tri_sn.py` sweeps refine 4→6→8) converges the
-Sₙ worth correction to SP3's self-shielding direction. Still a CPU/numpy
-reference.
+(flux-depressed), so transport resolves *less* drum worth than diffusion. Two
+spatial schemes: `scheme="step"` (upwind — robustly non-negative but only
+first-order) and `scheme="scb"` (**simple corner balance** — a genuine
+second-order finite-volume scheme that splits each triangle into three corner
+sub-volumes, still factorizes once, and is exact for a flat flux). The worth
+correction is small, so the scheme matters: at coarse mesh step's numerical
+diffusion — worst where the inserted drums make the steepest gradients — corrupts
+it and even flips the sign, whereas SCB reaches the correct (positive,
+self-shielding) sign about two refinements sooner (`hpmr_tri_sn.py` runs both
+across refine 4→6→8). Still a CPU/numpy reference.
 
 ### Griffin and FEMFFUSION cross-section files
 

@@ -31,11 +31,11 @@ M2 = Material(diffusion=[1.4, 0.4], sigma_a=[0.01, 0.10],
               chi=[1.0, 0.0], name="m2")
 
 
-@pytest.mark.parametrize("scheme", ["step", "diamond"])
+@pytest.mark.parametrize("scheme", ["step", "scb"])
 @pytest.mark.parametrize("mat", [M1, M2])
 def test_periodic_homogeneous_is_kinf(mat, scheme):
-    # Flat flux makes both schemes exact (the diamond edge-average and
-    # equal-outflow closures are both satisfied by a constant flux).
+    # Flat flux makes both schemes exact -- for SCB because each corner is a
+    # closed sub-volume (its face normals sum to zero), so streaming vanishes.
     grid = TriGrid(shape=(6, 6, 2), side=3.0)
     r = TriSNTransportSolver(grid, mat, n_polar=2, n_azi=8, bc="periodic",
                              scheme=scheme).solve(tol_k=1e-9, tol_source=1e-9)
@@ -43,6 +43,29 @@ def test_periodic_homogeneous_is_kinf(mat, scheme):
     assert r.k_eff == pytest.approx(k_infinite(mat), abs=2e-6)   # < 0.2 pcm
     flux = r.flux[0]
     assert flux.min() / flux.max() > 0.9999                     # flat
+
+
+def test_scb_converges_faster_than_step():
+    # On a smooth vacuum tile both schemes approach the same fine-mesh limit, but
+    # the second-order SCB is closer to it than first-order step at equal mesh.
+    m = Material(diffusion=[1.0], sigma_a=[0.05], nu_sigma_f=[0.07],
+                 sigma_s=[[0.0]], name="smooth")
+    size = 12.0
+
+    def k(scheme, nrc):
+        g = TriGrid(shape=(nrc, nrc, 2), side=size / nrc)
+        return TriSNTransportSolver(g, m, n_polar=2, n_azi=8, bc="vacuum",
+                                    scheme=scheme).solve(tol_k=1e-8,
+                                                         tol_source=1e-7).k_eff
+
+    ref = k("scb", 32)                                          # fine reference
+    e_step = abs(k("step", 8) - ref)
+    e_scb = abs(k("scb", 8) - ref)
+    # On this small, boundary-layer-dominated tile the observed order is
+    # pre-asymptotic, so SCB is ~1.7x more accurate here; the full second-order
+    # payoff (correct HP-MR drum-worth sign two refinements sooner than step) is
+    # in examples/hpmr_tri_sn.py.
+    assert e_scb < 0.7 * e_step
 
 
 def test_vacuum_tile_leaks_and_refines_toward_kinf():
