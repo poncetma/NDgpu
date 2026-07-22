@@ -24,6 +24,7 @@ from .perturbation import first_order_reactivity
 from .solver import (DiffusionEigenSolver, Result, SDP1EigenSolver,
                      SDP2EigenSolver, SDP3EigenSolver, SP1EigenSolver,
                      SP3EigenSolver, SP5EigenSolver, SP7EigenSolver)
+from .sn import SNResult, SNTransportSolver, quadrature_2d
 from .sph import (SphResult, flux_weighted_homogenize, region_average,
                   sph_correct)
 from .tri import (TriDiffusionEigenSolver, TriGrid, TriSDP1EigenSolver,
@@ -98,6 +99,9 @@ __all__ = [
     "region_average",
     "sph_correct",
     "SphResult",
+    "SNTransportSolver",
+    "SNResult",
+    "quadrature_2d",
     "read_material_xml",
     "read_xsec",
     "read_griffin_library",
