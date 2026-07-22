@@ -16,9 +16,17 @@ This module builds the pipeline in pieces:
 * the SPH factor solve (added incrementally) -- iterate mu until the coarse
   diffusion region fluxes match the reference.
 
-The transport reference is any ndgpu eigensolver's scalar-flux Result -- e.g.
-SP3EigenSolver or TriSP3EigenSolver, the "transport" NDgpu offers above
-diffusion.
+The transport reference is any ndgpu eigensolver's scalar-flux Result -- any of
+the simplified-transport families NDgpu offers above diffusion: SP3/TriSP3, the
+double-PN SDP1 and SDP2/TriSDP1, TriSDP2, or the standard SPN orders. For every
+one of these the Result carries the *physical* scalar flux phi0 (the
+reconstructed 0th angular moment: SP3 forms phi0 = Phi1 - 2 phi2, SDPN dots the
+even-moment vector with its phi0 closure weights), which is exactly the field
+that drives the isotropic reaction rates SPH preserves -- so swapping the
+reference between families feeds SPH genuinely different angular closures of the
+same problem rather than a re-extraction of one field. See
+examples/hpmr_sph_reference_families.py for an SP3-vs-SDP1-vs-SDP2 comparison on
+the HP-MR drum arc.
 """
 
 from __future__ import annotations
