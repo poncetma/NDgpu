@@ -70,3 +70,40 @@ def test_adjoint_weights_first_order_perturbation_theory():
     assert drho_exact < 0                          # adding poison drops reactivity
     rel = abs(drho_pt - drho_exact) / abs(drho_exact)
     assert rel < 0.02, f"PT estimate {drho_pt:.3e} vs exact {drho_exact:.3e} (rel {rel:.1e})"
+
+
+@pytest.mark.parametrize("angular", ["diffusion", "sp3"])
+@pytest.mark.parametrize("f_hz", [0.1, 10.0])
+def test_noise_adjoint_reciprocity(angular, f_hz):
+    """Frequency-domain adjoint noise: NoiseSolver.solve(adjoint=True) must be
+    the transpose of the forward noise operator, which reciprocity pins exactly.
+    For any source S and detector response psi_d the forward reading
+    <psi_d, A^-1 S> must equal the adjoint reading <A^-T psi_d, S> to solver
+    precision. The noise operator is complex-symmetric within a group but its
+    group coupling (downscatter, chi<->nuSigma_f fission) is not, so the
+    transpose is nontrivial; this also exercises the SPN moment block."""
+    from ndgpu import Kinetics, NoiseSolver
+
+    grid = Grid(shape=(6, 6, 1), size=(30.0, 30.0, 1.0))
+    kin = Kinetics(velocities=[1.5e7, 4.0e5], beta=[0.0065], decay=[0.0784])
+    ns = NoiseSolver(grid, PWR_TWO_GROUP, kinetics=kin, bc="vacuum",
+                     angular=angular)
+    w = 2.0 * np.pi * f_hz
+
+    rng = np.random.default_rng(3)
+    S = [rng.standard_normal(grid.shape) + 1j * rng.standard_normal(grid.shape)
+         for _ in range(2)]
+    psi_d = [np.zeros(grid.shape), np.zeros(grid.shape)]
+    psi_d[1][4, 3, 0] = 1.0                         # thermal point detector
+
+    fwd = ns.solve(fixed_source=S, omega=w, tol=1e-11)
+    adj = ns.adjoint_importance(psi_d, w, tol=1e-11)
+    assert fwd.converged and adj.converged
+
+    def bilinear(a, b):
+        return complex(sum(np.sum(np.asarray(x) * np.asarray(y))
+                           for x, y in zip(a, b)))
+
+    r_fwd = bilinear(psi_d, fwd.d_flux_numpy())     # <psi_d, delta-phi>
+    r_adj = bilinear(adj.d_flux_numpy(), S)         # <psi*, S>
+    assert abs(r_fwd - r_adj) / abs(r_fwd) < 1e-6

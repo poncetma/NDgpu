@@ -335,6 +335,21 @@ class NoiseSolver:
                              f"shape {self.grid.shape}")
         return arr
 
+    def _ensure_field(self, val):
+        """A full grid-shaped complex array (None -> zeros; scalars broadcast).
+        Used for a raw fixed source (e.g. an adjoint detector response) that,
+        unlike the mechanisms of a NoiseSource, is given directly per group."""
+        xp = self.xp
+        if val is None:
+            return xp.zeros(self.grid.shape, dtype=self.cdtype)
+        arr = xp.asarray(np.asarray(val), dtype=self.cdtype)
+        if arr.ndim == 0:
+            return arr + xp.zeros(self.grid.shape, dtype=self.cdtype)
+        if arr.shape != self.grid.shape:
+            raise ValueError(f"source field shape {arr.shape} != grid "
+                             f"shape {self.grid.shape}")
+        return arr
+
     def _noise_source(self, source: NoiseSource, chi_eff):
         """Assemble S_noise,g from the cross-section fluctuations and phi_0."""
         xp, G = self.xp, self.n_groups
@@ -444,7 +459,8 @@ class NoiseSolver:
         return rhs
 
     # -- the solve -----------------------------------------------------------
-    def solve(self, source: NoiseSource, omega: float, *, tol: float = 1e-8,
+    def solve(self, source: NoiseSource = None, omega: float = None, *,
+              adjoint: bool = False, fixed_source=None, tol: float = 1e-8,
               max_sweeps: int = 500, anderson_depth: int = 8,
               scatter_subsweeps: int | None = None,
               inner_rtol_floor: float = 1e-12, critical_adjust: bool = True,
@@ -456,6 +472,22 @@ class NoiseSolver:
         within-group system is the complex-symmetric operator solved by COCG.
         ``scatter_subsweeps`` (auto: 3 with upscatter, else 1) and the Anderson
         restart safeguard play the same roles as in the transient step.
+
+        adjoint : solve the transposed noise problem A^T psi = RHS instead of
+            A phi = RHS. The noise operator is complex *symmetric* within each
+            group (leakage, removal and the i w/v shift are self-transpose), so
+            the adjoint reuses the identical within-group operators and COCG;
+            only the group coupling transposes -- scattering g'->g becomes g->g'
+            and fission swaps its roles (emission by nu_sigma_f, the flux
+            weighted into the fission source by chi_eff(w)). Under the physical
+            (bilinear, non-conjugated) detector pairing this A^T is the plain
+            transpose, so a detector reading obeys reciprocity
+            <psi_d, A^-1 S> = <A^-T psi_d, S>: see :meth:`adjoint_importance`.
+        fixed_source : use this list of G per-group complex fields directly as
+            the right-hand side, instead of assembling it from a ``NoiseSource``.
+            The path for adjoint importance / Green's-function work, where the
+            RHS is a detector response function rather than a cross-section
+            fluctuation. Exactly one of ``source`` / ``fixed_source`` is given.
 
         critical_adjust : divide the base fission production by k_eff so the
             unperturbed static state is an exact equilibrium of the noise
@@ -483,11 +515,42 @@ class NoiseSolver:
                                             self.precond_degree) for op in ops]
         src_w = getattr(ops[0], "rhs_weight", None)   # cylindrical metric
 
+        if omega is None:
+            raise ValueError("omega (rad/s) is required")
+        if (source is None) == (fixed_source is None):
+            raise ValueError("pass exactly one of source / fixed_source")
         chi_eff = self._chi_eff(omega)
-        Sn = self._noise_source(source, chi_eff)
+        if fixed_source is not None:
+            if len(fixed_source) != G:
+                raise ValueError(f"fixed_source must have {G} groups")
+            Sn = [self._ensure_field(fixed_source[g]) for g in range(G)]
+        else:
+            Sn = self._noise_source(source, chi_eff)
 
-        has_upscatter = any(fields.sigma_s[gf][gt] is not None
-                            for gt in range(G) for gf in range(gt + 1, G))
+        # Group coupling: forward, or its transpose for the adjoint. The fission
+        # source is production . flux; in the sweep each group's fission term is
+        # emit[g] * production(flux). Forward emits chi_eff and produces by
+        # nu_sigma_f; the transpose swaps them. Scattering into group g is the
+        # forward in-scatter sigma_s[gf][g], or its transpose sigma_s[g][gf].
+        if adjoint:
+            emit = [fields.nu_sigma_f[g] for g in range(G)]
+
+            def production(ph):
+                acc = xp.zeros(self.grid.shape, dtype=self.cdtype)
+                for g in range(G):
+                    acc = acc + chi_eff[g] * ph[g]
+                return acc
+
+            scat = lambda gf, g: fields.sigma_s[g][gf]
+            # transposed coupling: the adjoint's "upscatter" is forward downscatter
+            has_upscatter = any(fields.sigma_s[gt][gf] is not None
+                                for gt in range(G) for gf in range(gt + 1, G))
+        else:
+            emit = chi_eff
+            production = fields.fission_source
+            scat = lambda gf, g: fields.sigma_s[gf][g]
+            has_upscatter = any(fields.sigma_s[gf][gt] is not None
+                                for gt in range(G) for gf in range(gt + 1, G))
         n_sub = (int(scatter_subsweeps) if scatter_subsweeps
                  else (3 if has_upscatter else 1))
 
@@ -496,7 +559,7 @@ class NoiseSolver:
         # scalar flux that drives fission, scatter and the source.
         u = self._zero_state(xp)
         phi = [self._phi0(u[g]) for g in range(G)]
-        S = fields.fission_source(phi) * fscale       # complex fission source, =0
+        S = production(phi) * fscale                  # complex fission source, =0
         change = 1.0
         change_prev = np.inf
         hist: list = []
@@ -508,9 +571,9 @@ class NoiseSolver:
             rtol = min(1e-6, max(1e-3 * change, 1e-3 * tol, inner_rtol_floor))
             for _ in range(n_sub):
                 for g in range(G):
-                    q0 = chi_eff[g] * S + Sn[g]
+                    q0 = emit[g] * S + Sn[g]
                     for gf in range(G):
-                        s = fields.sigma_s[gf][g]
+                        s = scat(gf, g)
                         if gf != g and s is not None:
                             q0 = q0 + s * phi[gf]
                     if src_w is not None:
@@ -520,7 +583,7 @@ class NoiseSolver:
                                       precond=preconds[g])
                     phi[g] = self._phi0(u[g])
                     inner_total += n_it
-            G_S = fields.fission_source(phi) * fscale
+            G_S = production(phi) * fscale
             delta = G_S - S
             denom = rnorm(G_S)
             change = rnorm(delta) / denom if denom > 0 else rnorm(delta)
@@ -544,3 +607,32 @@ class NoiseSolver:
             converged=converged, sweeps=sweep, inner_iterations=inner_total,
             solve_seconds=time.perf_counter() - t0, device=self.device,
             change_history=hist_change)
+
+    def adjoint_importance(self, response, omega: float, **kw) -> NoiseResult:
+        """Adjoint noise flux psi*(r, w): solve A^T psi* = ``response``.
+
+        ``response`` is a per-group (length G) detector response function -- the
+        field a detector integrates against the flux to produce its reading
+        (e.g. the detector's macroscopic cross section over the cells it
+        occupies, in the group(s) it sees). The returned NoiseResult carries
+        psi* in ``d_flux``.
+
+        psi* is the frequency-domain *importance*: by reciprocity, a detector
+        with response psi_d reads
+
+            R = <psi_d, delta-phi> = <psi*_d, S_noise>
+
+        for *any* noise source S_noise, computed from a single adjoint solve. So
+        psi*_d,g(r) is that detector's sensitivity to an isotropic source in
+        group g at r, and psi*_d,g(r) * phi0,g(r) is its sensitivity to a
+        group-g cross-section fluctuation there -- a ready-made source-
+        localization kernel. Building a detector-vs-location transfer matrix
+        costs one adjoint solve per *detector* (independent of how many
+        candidate source locations are scanned), versus one forward solve per
+        *source location*.
+        """
+        G = self.n_groups
+        if len(response) != G:
+            raise ValueError(f"response must have {G} groups, got {len(response)}")
+        return self.solve(fixed_source=list(response), omega=omega,
+                          adjoint=True, **kw)
