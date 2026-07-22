@@ -270,13 +270,24 @@ class _PowerIterationSolver:
                  bc: str = BC_ZERO_FLUX, device: str = "auto", dtype=np.float64,
                  active=None, mask_bc=BC_VACUUM, precond_degree: int = 0,
                  mix_material=None, mix_weight=None, linear_solver="cg",
-                 symmetric_operator: bool = True):
+                 symmetric_operator: bool = True, hybrid_mask=None,
+                 hybrid_confine: bool = False):
         self.grid = grid
         self.xp = xp = get_backend(device)
         self.device = device_name(xp)
         self.dtype = np.dtype(dtype)
         self.active = active
         self.mask_bc = mask_bc
+        # Hybrid transport/diffusion: a per-cell bool mask marking the cells that
+        # keep the full angular block (e.g. the control-drum absorber); every
+        # other cell runs pure diffusion. The angular blocks restrict their
+        # higher moments to this mask, so the driver must likewise zero the
+        # higher-moment rows of the RHS outside it (see _rhs). None (default) =
+        # the uniform angular approximation everywhere. Diffusion has no higher
+        # moments, so it ignores the mask.
+        self.hybrid_mask = (None if hybrid_mask is None
+                            else xp.asarray(hybrid_mask).astype(self.dtype))
+        self.hybrid_confine = bool(hybrid_confine)
         self.symmetric_operator = bool(symmetric_operator)
         self._linsolve = get_linear_solver(linear_solver)
         if (not self.symmetric_operator and self._linsolve is pcg
@@ -468,6 +479,10 @@ class DiffusionEigenSolver(_PowerIterationSolver):
     """Multigroup neutron diffusion k-eigenvalue solver (see base for args)."""
 
     def _build_operators(self, grid, diffusion, sigma_t, removal, bc):
+        if self.hybrid_mask is not None:
+            raise ValueError("hybrid_mask has no effect on the diffusion solver "
+                             "(diffusion has no higher moments); use an SP3/SDPN "
+                             "solver to run transport on the masked subdomain")
         self.ops = [GroupOperator(self.xp, grid, diffusion[g], removal[g], bc=bc,
                                   active=self.active, mask_bc=self.mask_bc,
                                   symmetric=self.symmetric_operator)
@@ -502,7 +517,9 @@ class SP3EigenSolver(_PowerIterationSolver):
                              "SP3 block symmetrization assumes SPD moment operators")
         self.ops = [SP3GroupOperator(self.xp, grid, diffusion[g], sigma_t[g],
                                      removal[g], bc=bc, variant=self._sp_variant,
-                                     active=self.active, mask_bc=self.mask_bc)
+                                     active=self.active, mask_bc=self.mask_bc,
+                                     hybrid_mask=self.hybrid_mask,
+                                     hybrid_confine=self.hybrid_confine)
                     for g in range(self.n_groups)]
 
     def _initial_state(self):
@@ -514,10 +531,14 @@ class SP3EigenSolver(_PowerIterationSolver):
         return state
 
     def _rhs(self, g, q0):
-        # Symmetrized block RHS: (q0, 5 * (-2/5) q0).
+        # Symmetrized block RHS: (q0, 5 * (-2/5) q0). Hybrid: the phi2 source is
+        # confined to the phi2 subdomain (zero elsewhere), so phi2 stays exactly
+        # zero outside it and the first row is pure diffusion there.
         rhs = self.xp.empty((2,) + self.grid.shape, dtype=self.dtype)
         rhs[0] = q0
         rhs[1] = -2.0 * q0
+        if self.hybrid_mask is not None:
+            rhs[1] = rhs[1] * self.hybrid_mask
         return rhs
 
     def _phi(self, state_g):
@@ -617,15 +638,26 @@ class SDPNEigenSolver(_PowerIterationSolver):
         coeffs = self._coeffs if self._coeffs is not None else _SDPN_C
         r = _diag_similarity(coeffs[self._order])
         identity = r is not None and all(abs(x - 1.0) < 1e-12 for x in r)
+        # The symmetrizing congruence (SDP3 CG path) mixes the moments over the
+        # whole domain, so it cannot carry a per-moment hybrid mask; the plain
+        # non-symmetric block can. Diagonal-similarity symmetrization (SDP1/SDP2)
+        # keeps the moments separable and stays compatible.
+        hybrid = kwargs.get("hybrid_mask") is not None
         if symmetrize is None:
             if r is not None:
                 symmetrize = not identity and not self.marshak_vacuum
+            elif hybrid:
+                symmetrize = False
             else:
                 grid, bc, active, mask_bc = _peek_base_args(args, kwargs)
                 symmetrize = (not self.marshak_vacuum and
                               _congruence_available(self._order, grid, bc,
                                                     active, mask_bc,
                                                     coeffs=self._coeffs))
+        if hybrid and symmetrize and r is None:
+            raise ValueError("hybrid_mask cannot use the symmetrizing-congruence "
+                             "path (it mixes moments across the whole domain); "
+                             "pass symmetrize=False for a hybrid SDP3 solve")
         self._symmetrize = bool(symmetrize)
         self._diag_sym = r is not None                # similarity vs congruence
         if self._symmetrize and self.marshak_vacuum:
@@ -662,7 +694,9 @@ class SDPNEigenSolver(_PowerIterationSolver):
                                       active=self.active, mask_bc=self.mask_bc,
                                       op_cls=self._moment_op_cls,
                                       coeffs=self._coeffs, boundary_g=bg,
-                                      symmetrize=self._symmetrize)
+                                      symmetrize=self._symmetrize,
+                                      hybrid_mask=self.hybrid_mask,
+                                      hybrid_confine=self.hybrid_confine)
                     for g in range(self.n_groups)]
         if self._spn_precond:
             # Matched-order standard-SPN companion blocks (symmetric tables,
@@ -672,7 +706,9 @@ class SDPNEigenSolver(_PowerIterationSolver):
                 self.xp, grid, diffusion[g], sigma_t[g], removal[g],
                 order=self._order, bc=bc, active=self.active,
                 mask_bc=self.mask_bc, op_cls=self._moment_op_cls,
-                coeffs=_SPN_C, boundary_g=bg_spn)
+                coeffs=_SPN_C, boundary_g=bg_spn,
+                hybrid_mask=self.hybrid_mask,
+                hybrid_confine=self.hybrid_confine)
                 for g in range(self.n_groups)]
 
     # Spatial stencil for each moment (overridden by the triangular solver).
@@ -695,6 +731,10 @@ class SDPNEigenSolver(_PowerIterationSolver):
         rhs = self.xp.empty((M,) + self.grid.shape, dtype=self.dtype)
         for i in range(M):
             rhs[i] = w[i] * q0
+            # Hybrid: confine the higher-moment source to the subdomain so those
+            # moments stay exactly zero (pure diffusion) outside it.
+            if i > 0 and self.hybrid_mask is not None:
+                rhs[i] = rhs[i] * self.hybrid_mask
         return rhs
 
     def _phi(self, state_g):

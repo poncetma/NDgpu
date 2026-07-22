@@ -452,7 +452,9 @@ class SDPNGroupOperator:
 
     def __init__(self, xp, grid, D1, sigma_t, removal, order, bc=BC_ZERO_FLUX,
                  active=None, mask_bc=BC_VACUUM, op_cls=None, coeffs=None,
-                 boundary_g=None, theta=None, symmetrize=False):
+                 boundary_g=None, theta=None, symmetrize=False,
+                 hybrid_mask=None, hybrid_mask_bc=BC_REFLECTIVE,
+                 hybrid_confine=False):
         coeffs = coeffs if coeffs is not None else _SDPN_C
         if order not in coeffs:
             raise ValueError(f"order must be one of {sorted(coeffs)}, got {order!r}")
@@ -526,9 +528,39 @@ class SDPNGroupOperator:
         self.marshak = None
         if boundary_g is not None:
             bc_mom = _strip_vacuum(bc_mom)
-        self.moments = [op_cls(xp, grid, D_list[i], A(i, i), bc=bc_mom,
-                               active=active, mask_bc=mask_bc)
-                        for i in range(M)]
+        # Hybrid transport/diffusion: generate the higher moments (i >= 1) only
+        # in a masked subdomain -- the mask zeroes their source rows (driver
+        # _rhs) and the inter-moment coupling (below) outside itself -- so there
+        # the block collapses to -div(D1 grad U0) + Sigma_0 U0 = q0, i.e. exactly
+        # the diffusion solver (moment 0 stays one global operator, so the net
+        # current is continuous). The masked subdomain keeps the full SDPN
+        # equations. hybrid_confine=False (default) keeps every moment's
+        # spatial operator global, so the unsourced higher moments decay
+        # smoothly out of the region (the SDPN boundary layer, no interface
+        # closure, well-posed on the tri mesh); True excises them outside the
+        # mask (pinned to zero, bit-exact diffusion there) with hybrid_mask_bc
+        # on the interface -- see SP3GroupOperator for the trade-off.
+        # Incompatible with the coupled Marshak boundary (its g couples moments
+        # on the domain surface).
+        self.hybrid_mask = None
+        self.hybrid_confine = bool(hybrid_confine)
+        if hybrid_mask is not None:
+            if boundary_g is not None:
+                raise ValueError("hybrid_mask is incompatible with the coupled "
+                                 "Marshak boundary")
+            hm = xp.asarray(hybrid_mask).astype(bool)
+            if hm.shape != grid.shape:
+                raise ValueError(f"hybrid_mask shape {hm.shape} != grid shape "
+                                 f"{grid.shape}")
+            self.hybrid_mask = hm.astype(D1.dtype)
+        confined = hybrid_mask is not None and self.hybrid_confine
+        hi_active = (active if not confined else
+                     (hm if active is None else xp.asarray(active).astype(bool) & hm))
+        self.moments = [
+            op_cls(xp, grid, D_list[i], A(i, i), bc=bc_mom,
+                   active=(active if i == 0 or not confined else hi_active),
+                   mask_bc=(mask_bc if i == 0 or not confined else hybrid_mask_bc))
+            for i in range(M)]
         # Off-diagonal reaction coupling A_ij (i != j) is a cell term, so it
         # carries the same metric weight as the moment operators' removal.
         w = getattr(self.moments[0], "rhs_weight", None)
@@ -537,7 +569,12 @@ class SDPNGroupOperator:
             for j in range(M):
                 if i != j:
                     a = A(i, j)
-                    self.coupling[(i, j)] = a if w is None else a * w
+                    a = a if w is None else a * w
+                    # Every off-diagonal coupling touches a higher moment, so it
+                    # is confined to the hybrid subdomain (zero elsewhere).
+                    if self.hybrid_mask is not None:
+                        a = a * self.hybrid_mask
+                    self.coupling[(i, j)] = a
         self.rhs_weight = w
         diag = xp.stack([m.diag for m in self.moments])   # (M, *grid)
         if boundary_g is not None:

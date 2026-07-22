@@ -418,6 +418,35 @@ def build_hpmr2d(refine: int = 4, drum_angle_deg=0.0,
                        mix_material=mix_material, mix_weight=mix_weight)
 
 
+def hpmr_transport_mask(problem: HpmrProblem, region: str = "drum") -> np.ndarray:
+    """Cells that keep the full transport (SP3/SDPN) block in a hybrid solve;
+    every other cell runs pure diffusion. Pass the result as ``hybrid_mask`` to
+    a Tri SP3/SDPN eigen-solver.
+
+    region
+        "drum" (default): the whole rotating drum body -- the beryllium plus
+            its B4C arc. Running transport over the entire drum gives a Be
+            buffer around the strong absorber, so the reflective hybrid
+            interface at the drum/reflector boundary sees an already-decayed
+            second moment; this is the recommended, closure-insensitive choice.
+        "absorber": only the B4C arc cells (raster: material == DRUM_ABSORBER;
+            polar: the volume-mixed cells, mix_weight > 0). The tightest
+            transport region -- fewest transport cells, but the reflective
+            interface then sits right at the absorber edge.
+    """
+    mmap = np.asarray(problem.material_map)
+    if region == "drum":
+        mask = (mmap == DRUM_BE) | (mmap == DRUM_ABSORBER)
+    elif region == "absorber":
+        if problem.mix_weight is not None:         # polar: arc is volume-mixed
+            mask = np.asarray(problem.mix_weight) > 0.0
+        else:                                      # raster: arc is its own id
+            mask = mmap == DRUM_ABSORBER
+    else:
+        raise ValueError(f"region must be 'drum' or 'absorber', got {region!r}")
+    return mask & (mmap > 0)                        # never mark excised void cells
+
+
 def build_hpmr3d(refine: int = 4, nz: int = 20, drum_angle_deg=0.0,
                  materials: list | None = None,
                  absorber: str = "raster", samples: int = 10) -> HpmrProblem:

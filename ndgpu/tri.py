@@ -208,7 +208,9 @@ class TriSP3EigenSolver(SP3EigenSolver):
         self.ops = [SP3GroupOperator(self.xp, grid, diffusion[g], sigma_t[g],
                                      removal[g], bc=bc, active=self.active,
                                      variant=self._sp_variant,
-                                     mask_bc=self.mask_bc, op_cls=TriGroupOperator)
+                                     mask_bc=self.mask_bc, op_cls=TriGroupOperator,
+                                     hybrid_mask=self.hybrid_mask,
+                                     hybrid_confine=self.hybrid_confine)
                     for g in range(self.n_groups)]
 
 

@@ -9,7 +9,7 @@ their transient/triangular subclasses.
 
 from __future__ import annotations
 
-from .stencil import BC_VACUUM, BC_ZERO_FLUX, GroupOperator
+from .stencil import BC_REFLECTIVE, BC_VACUUM, BC_ZERO_FLUX, GroupOperator
 
 
 class SP3GroupOperator:
@@ -48,9 +48,50 @@ class SP3GroupOperator:
 
     def __init__(self, xp, grid, D1, sigma_t, removal, bc=BC_ZERO_FLUX,
                  active=None, mask_bc=BC_VACUUM, op_cls=None, variant="sp3",
-                 theta=None):
+                 theta=None, hybrid_mask=None, hybrid_mask_bc=BC_REFLECTIVE,
+                 hybrid_confine=False):
         self.xp = xp
         op_cls = op_cls or GroupOperator
+        # Hybrid SP3/diffusion: run transport (the second moment phi2) only where
+        # a per-cell mask marks it -- e.g. the control-drum absorber -- and plain
+        # diffusion elsewhere. The mask zeroes phi2's *source* and the moment
+        # coupling outside itself (below and in the driver's _rhs), so there the
+        # block's first row is exactly -div(D1 grad Phi1) + Sig0 Phi1 = q0 with
+        # phi0 = Phi1: identical to the diffusion solver. The transport
+        # correction is therefore *generated* only in the masked region; Phi1
+        # (the net-current-carrying moment) stays one global operator, so it is
+        # continuous across the interface.
+        #
+        # hybrid_confine chooses what phi2 does outside the mask:
+        #   False (default, "faithful"): phi2 keeps its full-domain operator, so
+        #     with no source it relaxes to -div(D2 grad phi2) + Sig2 phi2 = 0 and
+        #     decays smoothly out of the drum -- exactly the SP3 boundary layer,
+        #     no interface closure to choose, and well-posed on the triangular
+        #     mesh (no void border needed). This tracks full SP3 closely because
+        #     the only physics dropped is phi2 sourcing in the near-diffusive
+        #     bulk. This is the recommended method.
+        #   True ("confined"): phi2's operator is excised outside the mask
+        #     (pinned to exactly zero), so the scalar flux is bit-for-bit the
+        #     diffusion solution there. Cheaper in principle (fewer live
+        #     unknowns) but introduces an interface closure -- hybrid_mask_bc,
+        #     reflective by default (zero phi2 current; the only law the tri
+        #     stencil admits for an interior region without a void border) --
+        #     which over/under-predicts the drum worth unless the region is
+        #     extended until phi2 has decayed at its boundary.
+        # hybrid_mask=None recovers the ordinary full-domain SP3 block.
+        hm = None
+        self.hybrid_confine = bool(hybrid_confine)
+        if hybrid_mask is not None:
+            hm = xp.asarray(hybrid_mask).astype(bool)
+            if hm.shape != grid.shape:
+                raise ValueError(f"hybrid_mask shape {hm.shape} != grid shape "
+                                 f"{grid.shape}")
+        if hm is not None and self.hybrid_confine:
+            hi_active = hm if active is None else (
+                xp.asarray(active).astype(bool) & hm)
+            hi_mask_bc = hybrid_mask_bc
+        else:
+            hi_active, hi_mask_bc = active, mask_bc
         # Time-dependent term: a backward-Euler step adds theta = 1/(v*dt) times
         # the moments' time derivatives, with the odd-moment time derivatives
         # neglected (the standard quasi-static closure of time-SP3 kinetics).
@@ -92,7 +133,7 @@ class SP3GroupOperator:
             # 5x-scaled row 1 carries 9*theta*phi2 -> 9/5 on the unscaled row.
             m2_reaction = m2_reaction + 1.8 * theta
         self.moment2 = op_cls(xp, grid, D2, m2_reaction, bc=bc,
-                              active=active, mask_bc=mask_bc)
+                              active=hi_active, mask_bc=hi_mask_bc)
         # The moment-coupling term is a cell (volume) term, so it carries the
         # same metric weight as the moment operators' removal (1 on Cartesian).
         w = getattr(self.moment1, "rhs_weight", None)
@@ -105,6 +146,14 @@ class SP3GroupOperator:
         # [[1,-2],[-2,9]] is positive definite), and CG still applies.
         c = 2.0 * removal if theta is None else 2.0 * (removal + theta)
         self.coupling = c * wt
+        # Hybrid: zero the moment coupling outside the phi2 subdomain, so the
+        # first row degenerates to plain diffusion there (row 0 loses its phi2
+        # term and row 1 becomes 5*phi2 = 0). Kept as a float field the driver
+        # also uses to mask the phi2 source row of the RHS.
+        self.hybrid_mask = None
+        if hm is not None:
+            self.hybrid_mask = hm.astype(self.coupling.dtype)
+            self.coupling = self.coupling * self.hybrid_mask
         self.rhs_weight = w
         self.inv_diag = xp.stack([self.moment1.inv_diag, self.moment2.inv_diag / 5.0])
 

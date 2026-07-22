@@ -227,6 +227,24 @@ from a much better coarse-mesh value, and runs below the raster's refine floor
 (the 1 cm annulus is represented even when it is thinner than a triangle). Both
 agree at fine mesh (~2720 pcm), so the polar treatment is unbiased.
 
+`python examples/hpmr_hybrid.py [refine] [device]` — a **hybrid SP3/diffusion**
+solve: transport (the SP3 second moment) runs *only* in the rotating drum
+bodies (~1/5 of the core) and plain diffusion everywhere else, via the
+`hybrid_mask=` argument on any SP3/SDPN eigen-solver (build the mask with
+`ndgpu.benchmarks.hpmr_transport_mask`). The mask zeroes the higher-moment
+source and moment coupling outside itself, so the transport correction is
+*generated* only at the near-black B4C arcs — where the steep angular flux
+lives — and decays into the surrounding graphite, while the net-current-carrying
+moment stays one global operator (continuous across the interface). An all-True
+mask reproduces full SP3 bit-for-bit; an empty mask reproduces diffusion. Since
+control-drum worth is a reactivity *difference*, the angle-independent global
+transport correction (outer-boundary/reflector leakage) cancels and the
+drum-local self-shielding the hybrid captures dominates: it closes ~55 % of the
+diffusion→SP3 worth error with transport in 22 % of the cells. (Default
+"faithful" mode keeps every moment global and closure-free; `hybrid_confine=True`
+instead pins the higher moments to exactly zero outside the mask — bit-exact
+diffusion there — at the cost of an interface closure.)
+
 `python examples/hpmr_3d.py [refine] [nz] [absorber] [device]` — the same core
 extruded to full height as triangular *prisms* (160 cm fueled + 20 cm Be axial
 reflectors, drums running the full height, vacuum z faces): the tri lattice
