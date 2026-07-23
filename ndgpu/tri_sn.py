@@ -338,22 +338,27 @@ class TriSNTransportSolver:
                     ready[hit[lvl_of[m, hit] < 0]] = True
                 l += 1
         # (m, cell) pairs grouped by level, concatenated across ordinates.
+        # Everything below is stored PER LEVEL, pre-gathered, so the sweep loop
+        # is a short fixed sequence of allocation-free out= kernels per level
+        # (few launches, and safe to record into a CUDA graph on cupy).
         mm, cc = np.where(lvl_of >= 0)
         lv = lvl_of[mm, cc]
         order = np.argsort(lv, kind="stable")
         mm, cc, lv = mm[order], cc[order], lv[order]
         bounds = np.searchsorted(lv, np.arange(int(lv.max()) + 2))
+        spans = list(zip(bounds[:-1], bounds[1:]))
+        i32 = np.int32
         self._w_xp = xp.asarray(self.w)
         self._lv_group = {}
+        self._graphs = {}
+        self.graphs_active = None                # None until a GPU sweep runs
         if scb:
             d = self._scb
             ac, K = d["ac"], d["K"]
             aidx = np.full(N, -1, np.int64)
             aidx[ac] = np.arange(K)
             rr = aidx[cc]
-            self._levels = [(xp.asarray(mm[a:b] * K + rr[a:b]),
-                             xp.asarray(rr[a:b]))
-                            for a, b in zip(bounds[:-1], bounds[1:])]
+            pidx = mm * K + rr
             # inflow gather tables per (m, corner-cell, corner, face)
             extn, nbr = d["ext_n"], d["ext_nbr"]
             oe = (self.mu[:, None, None, None] * extn[None, ..., 0]
@@ -361,29 +366,58 @@ class TriSNTransportSolver:
             coef = np.where((oe < 0.0) & (nbr >= 0)[None],
                             -oe * (h / 2.0), 0.0)              # (M, K, 3, 2)
             off = (np.arange(M) * (3 * K))[:, None, None, None]
-            nbr_f = np.where(coef > 0.0, off + np.maximum(nbr, 0)[None], 0)
-            self._lv_nbr = xp.asarray(nbr_f.reshape(M * K, 3, 2))
-            self._lv_coef = xp.asarray(coef.reshape(M * K, 3, 2))
-            self._lv_oe = oe                                   # host, for Binv
+            nbr_f = np.where(coef > 0.0, off + np.maximum(nbr, 0)[None],
+                             0).reshape(M * K, 3, 2)
+            coef = coef.reshape(M * K, 3, 2)
+            self._lv_oe = oe                                   # host, Binv + iface
+            self._levels = []
+            for a, b in spans:
+                p = pidx[a:b]
+                sidx = ((p[:, None] * 3) + np.arange(3)).ravel()
+                self._levels.append((xp.asarray(rr[a:b].astype(i32)),
+                                     xp.asarray(p.astype(i32)),
+                                     xp.asarray(sidx.astype(i32)),
+                                     xp.asarray(nbr_f[p].astype(i32)),
+                                     xp.asarray(coef[p])))
+            n_max = max(b - a for a, b in spans)
+            self._bufs = dict(
+                psi=xp.zeros(M * K * 3), rhs=xp.zeros(K),
+                IF=xp.zeros((M * K, 3)),
+                mk=xp.zeros((M, K)), phk=xp.zeros((1, K)),
+                w3row=xp.asarray(self.w[None, :] / 3.0),
+                work=[(xp.zeros((n, 3, 2)), xp.zeros((n, 3)), xp.zeros(n),
+                       xp.zeros((n, 3)), xp.zeros((n, 3, 1)))
+                      for n in (b - a for a, b in spans)])
         else:
-            self._levels = [(xp.asarray(mm[a:b] * N + cc[a:b]),
-                             xp.asarray(cc[a:b]))
-                            for a, b in zip(bounds[:-1], bounds[1:])]
+            pidx = mm * N + cc
             off = (np.arange(M) * N)[:, None, None]
-            nbr_f = np.where(in_coef > 0.0, off + in_nbr, 0)
-            self._lv_nbr = xp.asarray(nbr_f.reshape(M * N, 3))
-            self._lv_coef = xp.asarray(in_coef.reshape(M * N, 3))
+            nbr_f = np.where(in_coef > 0.0, off + in_nbr, 0).reshape(M * N, 3)
+            coef = in_coef.reshape(M * N, 3)
             self._lv_out = outsum                              # host, per-group denom
+            self._levels = []
+            for a, b in spans:
+                p = pidx[a:b]
+                self._levels.append((xp.asarray(cc[a:b].astype(i32)),
+                                     xp.asarray(p.astype(i32)),
+                                     xp.asarray(nbr_f[p].astype(i32)),
+                                     xp.asarray(coef[p])))
+            self._bufs = dict(
+                psi=xp.zeros(M * N), rhs=xp.zeros(N),
+                phiM=xp.zeros((1, N)), wrow=xp.asarray(self.w[None, :]),
+                work=[(xp.zeros((n, 3)), xp.zeros(n), xp.zeros(n))
+                      for n in (b - a for a, b in spans)])
 
     def _lv_tables(self, g):
-        """Group-dependent sweep tables: the step denominator, or the SCB
-        per-cell 3x3 corner-block inverses (batched), per ordinate."""
+        """Group-dependent sweep tables, pre-gathered per level: the step
+        denominator, or the SCB per-cell 3x3 corner-block inverses (batched),
+        per ordinate."""
         if g in self._lv_group:
             return self._lv_group[g]
         xp, M = self.xp, self.M
         if self.scheme == "step":
-            denom = self.st[g].reshape(-1)[None, :] * self.area + self._lv_out
-            out = xp.asarray(denom.reshape(-1))
+            denom = (self.st[g].reshape(-1)[None, :] * self.area
+                     + self._lv_out).reshape(-1)
+            out = [xp.asarray(denom[asnumpy(lev[1])]) for lev in self._levels]
         else:
             d = self._scb
             K = d["K"]
@@ -406,53 +440,127 @@ class TriSNTransportSolver:
                     for f in range(2):
                         B[rK, lc, wloc[:, lc, f]] += oi[m, :, lc, f] * hi * 0.5
                 Binv[m] = np.linalg.inv(B)
-            out = xp.asarray(Binv.reshape(M * K, 3, 3))
+            Binv = Binv.reshape(M * K, 3, 3)
+            out = [xp.asarray(Binv[asnumpy(lev[1])]) for lev in self._levels]
         self._lv_group[g] = out
         return out
 
+    def _run_levels(self, g, iface):
+        """The level loop proper: a fixed sequence of allocation-free out=
+        kernels on the persistent buffers (recordable into a CUDA graph).
+        Inputs are read from bufs['rhs'] (+ bufs['IF']); outputs land in
+        bufs['psi'] and the phi reduction buffer."""
+        xp = self.xp
+        bufs = self._bufs
+        tab = self._lv_tables(g)
+        psi = bufs["psi"]
+        psi.fill(0.0)
+        if self.scheme == "step":
+            rhs = bufs["rhs"]
+            for (cc, pidx, nbr, coef), den, (gl, red, rg) in zip(
+                    self._levels, tab, bufs["work"]):
+                xp.take(psi, nbr, out=gl)
+                xp.multiply(gl, coef, out=gl)
+                xp.sum(gl, axis=1, out=red)
+                xp.take(rhs, cc, out=rg)
+                xp.add(red, rg, out=red)
+                xp.divide(red, den, out=red)
+                xp.put(psi, pidx, red)
+            xp.matmul(bufs["wrow"], psi.reshape(self.M, self.N),
+                      out=bufs["phiM"])
+            return
+        base = bufs["rhs"]
+        IF = bufs["IF"]
+        for (rr, pidx, sidx, nbr, coef), Binv, (gl, b2, bb, ifl, p3) in zip(
+                self._levels, tab, bufs["work"]):
+            xp.take(psi, nbr, out=gl)
+            xp.multiply(gl, coef, out=gl)
+            xp.sum(gl, axis=2, out=b2)
+            xp.take(base, rr, out=bb)
+            xp.add(b2, bb[:, None], out=b2)
+            if iface:
+                xp.take(IF, pidx, axis=0, out=ifl)
+                xp.add(b2, ifl, out=b2)
+            xp.matmul(Binv, b2.reshape(-1, 3, 1), out=p3)
+            xp.put(psi, sidx, p3)
+        K = self._scb["K"]
+        xp.sum(psi.reshape(self.M, K, 3), axis=2, out=bufs["mk"])
+        xp.matmul(bufs["w3row"], bufs["mk"], out=bufs["phk"])
+
+    def _levels_exec(self, g, iface):
+        """Execute the level loop -- directly on numpy; on cupy, captured once
+        per (group, iface) into a CUDA graph and replayed as a single launch
+        per sweep (the loop's kernels and buffer addresses are identical every
+        sweep; only the input buffers' contents change). Any capture failure
+        falls back permanently to the plain loop."""
+        xp = self.xp
+        if xp is np:
+            self._run_levels(g, iface)
+            return
+        key = (g, iface)
+        entry = self._graphs.get(key)
+        if entry == "fallback":
+            self._run_levels(g, iface)
+            return
+        if entry is None:
+            self._lv_tables(g)                   # build outside the capture
+            try:
+                stream = xp.cuda.Stream(non_blocking=True)
+                with stream:
+                    stream.begin_capture()
+                    self._run_levels(g, iface)
+                    graph = stream.end_capture()
+                self._graphs[key] = graph
+                self.graphs_active = True
+            except Exception:
+                try:
+                    stream.end_capture()
+                except Exception:
+                    pass
+                self._graphs[key] = "fallback"
+                if self.graphs_active is None:
+                    self.graphs_active = False
+                self._run_levels(g, iface)
+                return
+            entry = self._graphs[key]
+        entry.launch()                           # replays on the current stream
+
+    def _buf_set(self, buf, values):
+        """Copy host values into a (possibly device) persistent buffer."""
+        if self.xp is np:
+            np.copyto(buf, values)
+        else:
+            buf.set(np.ascontiguousarray(values))
+
     def _sweep_levels(self, g, src_flat, iface_in=None):
         """One batched level-scheduled sweep; returns (phi, psi) with psi the
-        full per-ordinate angular flux (backend array) for current folds.
-        iface_in (SCB only) enters as a fixed source on the inflow interface
-        half-edges, exactly as in the LU engine's ``_iface_rhs`` -- interface
-        faces are boundary faces (no dependency edges), so the level schedule
-        is unchanged."""
-        xp = self.xp
+        full per-ordinate angular flux (backend array, a reused buffer -- read
+        it before the next sweep) for current folds. iface_in (SCB only)
+        enters as a fixed source on the inflow interface half-edges, exactly
+        as in the LU engine's ``_iface_rhs`` -- interface faces are boundary
+        faces (no dependency edges), so the level schedule is unchanged."""
+        bufs = self._bufs
         if self.scheme == "step":
             if iface_in is not None:
                 raise ValueError("iface_in is SCB-only")
-            denom = self._lv_tables(g)
-            rhs = xp.asarray(np.where(self._act_flat, src_flat * self.area, 0.0))
-            psi = xp.zeros(self.M * self.N)
-            for pidx, cc in self._levels:
-                inflow = (self._lv_coef[pidx] * psi[self._lv_nbr[pidx]]).sum(1)
-                psi[pidx] = (rhs[cc] + inflow) / denom[pidx]
-            phi = asnumpy((self._w_xp[:, None]
-                           * psi.reshape(self.M, self.N)).sum(0))
-            return phi, psi
+            self._buf_set(bufs["rhs"],
+                          np.where(self._act_flat, src_flat * self.area, 0.0))
+            self._levels_exec(g, False)
+            return asnumpy(bufs["phiM"]).ravel().copy(), bufs["psi"]
         d = self._scb
         ac, K = d["ac"], d["K"]
-        Binv = self._lv_tables(g)
-        base = xp.asarray(src_flat[ac] * (self.area / 3.0))
-        IF = None
-        if iface_in is not None:
+        self._buf_set(bufs["rhs"], src_flat[ac] * (self.area / 3.0))
+        iface = iface_in is not None
+        if iface:
             psi_in, is_iface = iface_in
             cif = np.where(is_iface[None] & (self._lv_oe < 0.0),
                            -self._lv_oe * (self.h / 2.0), 0.0)  # (M, K, 3, 2)
-            IF = xp.asarray((cif * psi_in[None]).sum(3).reshape(self.M * K, 3))
-        psi = xp.zeros(self.M * K * 3)
-        three = xp.arange(3)
-        for pidx, rr in self._levels:
-            b = base[rr][:, None] + (self._lv_coef[pidx]
-                                     * psi[self._lv_nbr[pidx]]).sum(2)
-            if IF is not None:
-                b = b + IF[pidx]
-            p = xp.einsum("nij,nj->ni", Binv[pidx], b)
-            psi[pidx[:, None] * 3 + three] = p
+            self._buf_set(bufs["IF"],
+                          (cif * psi_in[None]).sum(3).reshape(self.M * K, 3))
+        self._levels_exec(g, iface)
         phi = np.zeros(self.N)
-        phi[ac] = asnumpy((self._w_xp[:, None]
-                           * psi.reshape(self.M, K, 3).mean(2)).sum(0))
-        return phi, psi
+        phi[ac] = asnumpy(bufs["phk"]).ravel()
+        return phi, bufs["psi"]
 
     def _currents_from_psi(self, g, psi):
         """Fold the level-swept angular fluxes into the per-cell-edge net
