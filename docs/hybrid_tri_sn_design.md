@@ -1,5 +1,15 @@
 # Hybrid tri-Sₙ / tri-diffusion solver — design & steps
 
+> **Status: implemented** as `ndgpu.HybridTriSNDiffusionSolver`
+> (`ndgpu/hybrid_tri_sn.py`), following the steps below with the SCB drum scheme
+> and the interface net-current coupling. The limits are exact (empty mask =
+> `TriDiffusionEigenSolver`, full mask = `TriSNTransportSolver`) and an isolated
+> drum recovers ~all of the diffusion→Sₙ correction
+> (`tests/verification/test_hybrid_tri_sn.py`). On the 12-drum HP-MR it captures
+> the self-shielding sign but the isotropic interface reconstruction
+> over-predicts the worth magnitude — the open item below (P1 incoming / buffer
+> ring). Both Schwarz and the fission outer are Anderson-accelerated.
+
 Goal: on the body-fitted HP-MR triangular mesh, run discrete-ordinates transport
 (`TriSNTransportSolver`) **only in the control-drum cells** and diffusion
 (`ndgpu.tri`) everywhere else, coupled at the interface — the triangular-mesh

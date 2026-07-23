@@ -328,6 +328,21 @@ it and even flips the sign, whereas SCB reaches the correct (positive,
 self-shielding) sign about two refinements sooner (`hpmr_tri_sn.py` runs both
 across refine 4→6→8). Still a CPU/numpy reference.
 
+`ndgpu.HybridTriSNDiffusionSolver` (`examples/hybrid_tri_sn_hpmr.py`) is the
+triangular-mesh culmination: full transport (SCB) runs **only in the control-drum
+cells** and diffusion in the bulk, on the real HP-MR mesh. The drums are excised
+from the diffusion domain and the two regions are coupled by the interface **net
+current** (an Sₙ drum solve with incoming reconstructed from the bulk flux, its
+outgoing current sourcing the adjacent bulk cells; Schwarz-iterated, Anderson-
+accelerated, inside the fission power iteration). The limits are exact — an empty
+drum mask reproduces `TriDiffusionEigenSolver`, a full mask reproduces
+`TriSNTransportSolver` — and for an isolated drum it recovers essentially all of
+the diffusion→Sₙ correction. On the 12-drum HP-MR it captures the drum
+self-shielding (the worth correction has the right sign) with transport in ~1/5
+of the cells, though the isotropic interface reconstruction over-predicts the
+worth magnitude for tightly-packed drums (a P1 incoming or a buffer ring would
+tighten it — see the example).
+
 ### Griffin and FEMFFUSION cross-section files
 
 - `ndgpu.read_griffin_library` / `read_griffin_material` parse Griffin/YakXs

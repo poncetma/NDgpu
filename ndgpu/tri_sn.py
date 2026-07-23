@@ -83,7 +83,7 @@ class TriSNTransportSolver:
 
     def __init__(self, grid: TriGrid, materials, material_map=None, active=None,
                  n_polar: int = 3, n_azi: int = 12, bc: str = "vacuum",
-                 scheme: str = "step"):
+                 scheme: str = "step", require_fissile: bool = True):
         if len(grid.shape) != 3 or grid.shape[2] != 2:
             raise ValueError("TriSNTransportSolver is 2D: grid shape (nr, nc, 2)")
         if bc not in ("vacuum", "periodic"):
@@ -120,7 +120,7 @@ class TriSNTransportSolver:
             for gt in range(self.G):
                 if gf != gt and np.any(sig_s[:, gf, gt]):
                     self.scatter[gf][gt] = sig_s[mmap, gf, gt]
-        if not np.any(self.nsf):
+        if require_fissile and not np.any(self.nsf):
             raise ValueError("no fissile material: k-eigenvalue is undefined")
 
         self.mu, self.eta, self.w = quadrature_2d(n_polar, n_azi)
@@ -188,10 +188,11 @@ class TriSNTransportSolver:
                 # zero any stray couplings out of inactive rows
                 self._solvers[g][m] = factorized(A.tocsc())
 
-    def _sweep(self, g, src_flat):
-        """phi = Sum_m w_m L_Omega^-1 (src * area) for an isotropic source."""
+    def _sweep(self, g, src_flat, iface_in=None):
+        """phi = Sum_m w_m L_Omega^-1 (src * area) for an isotropic source.
+        iface_in (SCB only) injects a hybrid incoming flux on interface edges."""
         if self.scheme == "scb":
-            return self._sweep_scb(g, src_flat)
+            return self._sweep_scb(g, src_flat, iface_in)
         rhs = src_flat * self.area
         rhs = np.where(self._act_flat, rhs, 0.0)
         phi = np.zeros(self.N)
@@ -242,6 +243,7 @@ class TriSNTransportSolver:
         aidx[ac] = np.arange(K)
         ext_n = np.zeros((K, 3, 2, 2))                       # [corner-cell, lc, face, xy]
         ext_nbr = np.full((K, 3, 2), -1)                    # neighbour corner global id
+        ext_cell = np.full((K, 3, 2), -1)                   # full-mesh neighbour cell id
         int_n = np.zeros((K, 3, 2, 2))
         int_w = np.zeros((K, 3, 2), int)                    # same-cell corner global id
         for r in range(K):
@@ -258,13 +260,14 @@ class TriSNTransportSolver:
                         ok = 0 <= ni < nr and 0 <= nj < nc
                     if ok:
                         nc_cell = cell[ni, nj, tn]
+                        ext_cell[r, lc, f] = nc_cell
                         if act.reshape(-1)[nc_cell]:
                             ext_nbr[r, lc, f] = aidx[nc_cell] * 3 + nbr_lc
                 for f, (w, nrm) in enumerate(int_tab[(t, lc)]):
                     int_n[r, lc, f] = nrm
                     int_w[r, lc, f] = r * 3 + w
         self._scb = {"ac": ac, "K": K, "ext_n": ext_n, "ext_nbr": ext_nbr,
-                     "int_n": int_n, "int_w": int_w}
+                     "ext_cell": ext_cell, "int_n": int_n, "int_w": int_w}
 
     def _prefactor_scb(self):
         """Assemble and factorize the 3*K corner system per ordinate and group."""
@@ -299,22 +302,51 @@ class TriSNTransportSolver:
                                      shape=(3 * K, 3 * K))
                 self._solvers[g][m] = factorized(Amat.tocsc())
 
-    def _sweep_scb(self, g, src_flat):
+    def _iface_rhs(self, m, iface_in):
+        """Per-ordinate corner RHS contribution from a prescribed incoming flux on
+        interface half-edges (hybrid coupling): an inflow interface face moves its
+        known incoming to the RHS, -(Omega.n)(h/2) psi_in. Returns (K,3)."""
+        d = self._scb
+        psi_in, is_iface = iface_in
+        oe = self.mu[m] * d["ext_n"][..., 0] + self.eta[m] * d["ext_n"][..., 1]
+        contrib = np.where(is_iface & (oe < 0), -oe * (self.h / 2.0) * psi_in, 0.0)
+        return contrib.sum(2), oe
+
+    def _sweep_scb(self, g, src_flat, iface_in=None):
         d = self._scb
         ac, K = d["ac"], d["K"]
-        rhs = np.repeat(src_flat[ac] * (self.area / 3.0), 3)  # source into each corner
+        base = np.repeat(src_flat[ac] * (self.area / 3.0), 3)  # source into each corner
         phi = np.zeros(self.N)
         for m in range(self.M):
+            rhs = base if iface_in is None else base + self._iface_rhs(m, iface_in)[0].ravel()
             psi = self._solvers[g][m](rhs).reshape(K, 3)
             phi[ac] += self.w[m] * psi.mean(1)                # cell flux = mean of corners
         return phi
 
-    def _solve_group(self, g, qext_flat, phi0, tol):
+    def interface_currents(self, g, cell_source, iface_in):
+        """Net current (drum -> bulk, outward-normal positive) on each interface
+        half-edge, given the converged within-group source per cell (scatter +
+        external) and the incoming from the bulk. Returns (K, 3, 2)."""
+        d = self._scb
+        ac, K = d["ac"], d["K"]
+        base = np.repeat(cell_source[ac] * (self.area / 3.0), 3)
+        is_iface = iface_in[1]
+        J = np.zeros((K, 3, 2))
+        for m in range(self.M):
+            add, oe = self._iface_rhs(m, iface_in)
+            psi = self._solvers[g][m](base + add.ravel()).reshape(K, 3)
+            # outflow face uses this corner's flux; inflow uses the incoming.
+            face_flux = np.where(oe > 0, psi[:, :, None], iface_in[0])
+            J += self.w[m] * np.where(is_iface, oe * (self.h / 2.0) * face_flux, 0.0)
+        return J
+
+    def _solve_group(self, g, qext_flat, phi0, tol, iface_in=None):
         """Within-group GMRES on (I - T) phi = b, T = one sweep of the scatter
         source; the boundary is vacuum/periodic (folded into L_Omega), so no
-        boundary fixed point is needed."""
+        boundary fixed point is needed. iface_in injects a hybrid incoming flux
+        on interface half-edges (a fixed source, so only b carries it)."""
         ss = self.ss_self[g].reshape(-1)
-        b = self._sweep(g, qext_flat)                        # source-only response
+        b = self._sweep(g, qext_flat, iface_in)              # source-only response
 
         def op(x):                                           # (I - T) x, T = scatter sweep
             return x - self._sweep(g, ss * x)

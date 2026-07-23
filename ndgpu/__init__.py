@@ -25,6 +25,7 @@ from .solver import (DiffusionEigenSolver, Result, SDP1EigenSolver,
                      SDP2EigenSolver, SDP3EigenSolver, SP1EigenSolver,
                      SP3EigenSolver, SP5EigenSolver, SP7EigenSolver)
 from .hybrid_sn import HybridSNDiffusionSolver, HybridSNResult
+from .hybrid_tri_sn import HybridTriSNDiffusionSolver
 from .sn import SNResult, SNTransportSolver, quadrature_2d
 from .tri_sn import TriSNTransportSolver
 from .sph import (SphResult, flux_weighted_homogenize, region_average,
@@ -107,6 +108,7 @@ __all__ = [
     "quadrature_2d",
     "HybridSNDiffusionSolver",
     "HybridSNResult",
+    "HybridTriSNDiffusionSolver",
     "read_material_xml",
     "read_xsec",
     "read_griffin_library",
