@@ -110,3 +110,31 @@ def test_hybrid_tracks_sn_drum_worth_better_than_diffusion():
     assert abs(w_diff) > abs(w_sn)                          # diffusion over-predicts worth
     # the hybrid's worth error vs S_N is at most half of diffusion's.
     assert abs(w_hyb - w_sn) < 0.5 * abs(w_diff - w_sn)
+
+
+def test_krylov_coupling_matches_schwarz():
+    # The monolithic Krylov interface solve and the alternating Schwarz fixed
+    # point share the same fixed point: identical k, far fewer sweeps.
+    n = 24
+    grid = Grid(shape=(n, n, 1), size=(24.0, 24.0, 1.0))
+    fuel = Material(diffusion=[1.1], sigma_a=[0.012], nu_sigma_f=[0.026],
+                    sigma_s=[[0.0]], name="fuel")
+    absb = Material(diffusion=[0.9], sigma_a=[0.20], nu_sigma_f=[0.0],
+                    sigma_s=[[0.0]], name="absorber")
+    mmap = np.zeros((n, n, 1), int)
+    lo, hi = int(n * 0.4), int(n * 0.6)
+    mmap[lo:hi, lo:hi, 0] = 1
+    mask = mmap[:, :, 0] == 1
+
+    def run(coupling):
+        h = HybridSNDiffusionSolver(grid, [fuel, absb], material_map=mmap,
+                                    sn_mask=mask, n_polar=2, n_azi=8,
+                                    bc="vacuum", coupling=coupling)
+        r = h.solve(tol_k=1e-7, tol_source=1e-6)
+        return r, sum(b["sn"]._sweep_count for b in h.boxes)
+
+    r_s, sweeps_s = run("schwarz")
+    r_k, sweeps_k = run("krylov")
+    assert r_s.converged and r_k.converged
+    assert r_k.k_eff == pytest.approx(r_s.k_eff, abs=1e-6)
+    assert sweeps_k * 3 < sweeps_s

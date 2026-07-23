@@ -84,3 +84,23 @@ def test_drum_hybrid_captures_the_localized_transport_correction():
     assert gap * 1e5 > 1000.0                                # real transport effect
     # the transport is confined to the drum, so the hybrid recovers ~all of it
     assert abs(k_hyb - k_sn) < 0.1 * abs(gap)
+
+
+def test_krylov_coupling_matches_schwarz():
+    # The monolithic Krylov interface solve (one fused drum sweep + one bulk
+    # diffusion backsolve per matvec) shares the Schwarz fixed point: identical
+    # k, fewer transport sweeps.
+    grid, mmap, active, drum = _problem()
+
+    def run(coupling):
+        h = HybridTriSNDiffusionSolver(grid, [FUEL, ABSB], mmap, sn_mask=drum,
+                                       active=active, mask_bc="vacuum",
+                                       coupling=coupling, **QUAD)
+        r = h.solve(**TIGHT)
+        return r, h.sn._sweep_count
+
+    r_s, sweeps_s = run("schwarz")
+    r_k, sweeps_k = run("krylov")
+    assert r_s.converged and r_k.converged
+    assert r_k.k_eff == pytest.approx(r_s.k_eff, abs=1e-6)
+    assert sweeps_k < sweeps_s

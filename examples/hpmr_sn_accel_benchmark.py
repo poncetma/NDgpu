@@ -4,10 +4,13 @@ Runs the ``hybrid_tri_sn_hpmr`` pipeline -- tri diffusion, full tri-S_N (SCB)
 and the hybrid S_N/diffusion, drums inserted (0 deg) and withdrawn (180 deg),
 polar volume-mixed absorber -- twice:
 
-  * original    : the pre-acceleration schemes -- within-group GMRES everywhere
-                  and the Anderson power outer (full S_N and hybrid boxes);
-  * accelerated : the current defaults -- DSA within groups everywhere, plus
-                  the CMFD outer on the full-S_N solves.
+  * original    : the pre-acceleration schemes -- within-group GMRES everywhere,
+                  the Anderson power outer, and the alternating Schwarz
+                  interface coupling in the hybrid;
+  * accelerated : the current defaults -- DSA within groups, the CMFD outer on
+                  the full-S_N solves, and the monolithic Krylov interface
+                  coupling in the hybrid (one fused drum sweep + one bulk
+                  diffusion backsolve per matvec, drum-DSA preconditioned).
 
 Both configurations discretize the identical problem, so k and the drum worth
 must agree to the convergence tolerance; the cost columns are the point.
@@ -34,9 +37,9 @@ TOL = dict(tol_k=5e-7, tol_source=5e-6, max_outer=200)
 
 CONFIGS = {
     "original": dict(sn=dict(acceleration="gmres", outer_acceleration="power"),
-                     hyb=dict(acceleration="gmres")),
+                     hyb=dict(acceleration="gmres", coupling="schwarz")),
     "accelerated": dict(sn=dict(acceleration="dsa", outer_acceleration="cmfd"),
-                        hyb=dict(acceleration="dsa-gmres")),
+                        hyb=dict(coupling="krylov")),
 }
 
 

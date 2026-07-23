@@ -374,6 +374,28 @@ class TriSNTransportSolver:
             phi[ac] += self.w[m] * psi.mean(1)                # cell flux = mean of corners
         return phi
 
+    def _sweep_iface(self, g, src_flat, iface_in):
+        """One SCB sweep that also accumulates the interface half-edge net
+        currents from the same per-ordinate solves (the fused form of
+        ``_sweep`` + ``interface_currents`` for the monolithic hybrid
+        coupling). Returns (phi, J) with J shaped like interface_currents'."""
+        if self.scheme != "scb":
+            raise ValueError("_sweep_iface is SCB-only (hybrid drum boxes)")
+        self._sweep_count += 1
+        d = self._scb
+        ac, K = d["ac"], d["K"]
+        base = np.repeat(src_flat[ac] * (self.area / 3.0), 3)
+        psi_in, is_iface = iface_in
+        phi = np.zeros(self.N)
+        J = np.zeros((K, 3, 2))
+        for m in range(self.M):
+            add, oe = self._iface_rhs(m, iface_in)
+            psi = self._solvers[g][m](base + add.ravel()).reshape(K, 3)
+            phi[ac] += self.w[m] * psi.mean(1)
+            face_flux = np.where(oe > 0, psi[:, :, None], psi_in)
+            J += self.w[m] * np.where(is_iface, oe * (self.h / 2.0) * face_flux, 0.0)
+        return phi, J
+
     def interface_currents(self, g, cell_source, iface_in):
         """Net current (drum -> bulk, outward-normal positive) on each interface
         half-edge, given the converged within-group source per cell (scatter +

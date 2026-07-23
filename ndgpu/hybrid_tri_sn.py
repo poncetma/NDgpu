@@ -24,7 +24,7 @@ import time
 
 import numpy as np
 import scipy.sparse as sp
-from scipy.sparse.linalg import factorized
+from scipy.sparse.linalg import LinearOperator, factorized, gmres
 
 from .materials import Material
 from .sn import SNResult, _anderson
@@ -101,11 +101,16 @@ class HybridTriSNDiffusionSolver:
     def __init__(self, grid: TriGrid, materials, material_map=None, sn_mask=None,
                  active=None, mask_bc="vacuum", n_polar: int = 3, n_azi: int = 12,
                  mix_material=None, mix_weight=None,
-                 acceleration: str = "dsa-gmres"):
-        # Default "dsa-gmres": the Schwarz loop re-solves each warm-started drum
-        # box against a changing interface source, which suits a DSA-
-        # preconditioned Krylov far better than DSA source iteration (HP-MR
-        # refine=4: 15 s vs 50 s; plain gmres 25 s).
+                 acceleration: str = "dsa-gmres", coupling: str = "krylov"):
+        # acceleration applies to the coupling="schwarz" path only (the nested
+        # drum-box within-group solves); default "dsa-gmres" there because the
+        # Schwarz loop re-solves each warm-started box against a changing
+        # interface source, which suits a DSA-preconditioned Krylov far better
+        # than DSA source iteration (HP-MR refine=4: 15 s vs 50 s; plain gmres
+        # 25 s). coupling="krylov" (default) has no nested solves at all.
+        if coupling not in ("krylov", "schwarz"):
+            raise ValueError("coupling must be 'krylov' or 'schwarz'")
+        self.coupling = coupling
         self.grid = grid
         self.nr, self.nc = grid.shape[0], grid.shape[1]
         self.N = self.nr * self.nc * 2
@@ -142,7 +147,10 @@ class HybridTriSNDiffusionSolver:
             grid, self.D[g], self.removal[g], self.bulk, self.active,
             self.sn_mask, mask_bc)) for g in range(self.G)]
 
-        # drum S_N (SCB) and the interface map
+        # drum S_N (SCB) and the interface map. coupling="krylov" solves the
+        # coupled within-group system monolithically (one fused drum sweep +
+        # one bulk diffusion backsolve per GMRES matvec, drum-DSA
+        # preconditioned); "schwarz" is the original alternating fixed point.
         self._has_drum = bool(self.sn_mask.any())
         if self._has_drum:
             self.sn = TriSNTransportSolver(grid, mats, material_map=mmap,
@@ -165,11 +173,60 @@ class HybridTriSNDiffusionSolver:
         bulk scalar flux (0 on non-interface boundary faces)."""
         return np.where(self._is_iface, phi_bulk[self._iface_cell], 0.0)
 
+    def _apply_step(self, g, phi, qext):
+        """One coupled interface step, jointly affine in (phi, qext): a single
+        fused drum sweep (incoming reconstructed from the bulk flux, interface
+        half-edge currents accumulated from the same per-ordinate solves)
+        followed by one bulk diffusion backsolve with those currents as
+        sources. Its fixed point is exactly the Schwarz limit."""
+        ss = self.sn.ss_self[g].reshape(-1)
+        drum_flat = self.sn_mask.reshape(-1)
+        iface_in = (self._bulk_incoming(phi), self._is_iface)
+        src = ss * np.where(drum_flat, phi, 0.0) + qext
+        drum_phi, J = self.sn._sweep_iface(g, src, iface_in)
+        bulk_src = qext * self.bulk.reshape(-1)
+        np.add.at(bulk_src, self._iface_cell[self._is_iface],
+                  J[self._is_iface] / self.area)
+        out = self._dfac[g](bulk_src).reshape(self.N)
+        out[drum_flat] = drum_phi[drum_flat]
+        return out
+
+    def _solve_group_krylov(self, g, qext, phi, tol):
+        """Monolithic within-group solve: GMRES on the fixed point of
+        ``_apply_step``, (I - L) phi = c -- one fused drum sweep + one bulk
+        diffusion backsolve per matvec, no nested drum solves. Left-
+        preconditioned with the drum DSA operator (the interface error
+        equation is zero-incoming on the drum faces, so the drum solver's
+        vacuum-Robin diffusion LU is the right correction)."""
+        ss = self.sn.ss_self[g].reshape(-1)
+        drum_flat = self.sn_mask.reshape(-1)
+        N = self.N
+        c = self._apply_step(g, np.zeros(N), qext)
+        zero = np.zeros(N)
+
+        def op(x):
+            return x - self._apply_step(g, x, zero)
+
+        fac = self.sn._dsa_factor(g)
+
+        def prec(x):
+            return x + fac(ss * np.where(drum_flat, x, 0.0))
+
+        A = LinearOperator((N, N), matvec=op, dtype=float)
+        M = LinearOperator((N, N), matvec=prec, dtype=float)
+        phi_v, _ = gmres(A, c, x0=phi, M=M, rtol=min(tol, 1e-4), atol=0.0,
+                         maxiter=400)
+        return phi_v
+
     def _solve_group(self, g, qext, phi, tol):
-        """Coupled within-group solve: Schwarz between the drum S_N (incoming from
-        the bulk) and the bulk diffusion (drum interface current as a source)."""
+        """Coupled within-group solve: the drum S_N (incoming from the bulk)
+        against the bulk diffusion (drum interface current as a source) -- the
+        monolithic Krylov solve (coupling="krylov") or the alternating Schwarz
+        fixed point (coupling="schwarz")."""
         if not self._has_drum:
             return self._dfac[g](qext).reshape(self.N)
+        if self.coupling == "krylov":
+            return self._solve_group_krylov(g, qext, phi, tol)
         ss = self.sn.ss_self[g].reshape(-1)
         drum_flat = self.sn_mask.reshape(-1)
         bulk_flat = self.bulk.reshape(-1)

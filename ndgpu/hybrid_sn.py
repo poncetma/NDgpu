@@ -7,17 +7,25 @@ solvers). Where SP3 is a moment method that shares diffusion's stencil (so the
 hybrid was a masking), S_N has its own angular unknowns and spatial sweep, so the
 two discretizations are genuinely different and must be coupled at the interface.
 
-Coupling -- non-overlapping domain decomposition, Dirichlet--Dirichlet Schwarz
-with a one-cell overlap:
+Coupling -- non-overlapping domain decomposition:
 
-  * the transport subdomain is the mask's bounding box; an S_N fixed-source solve
-    runs there with the incoming angular flux on each box face reconstructed
-    (isotropically) from the neighbouring diffusion scalar flux;
-  * the diffusion problem is solved on the whole grid by a finite-volume stencil
-    that matches ndgpu's (harmonic face D, Marshak alpha=1/2 vacuum), with the
-    masked cells pinned (Dirichlet) to the transport scalar flux;
-  * the two alternate to a fixed point each within-group solve, inside the
-    fission power iteration.
+  * the transport subdomain is the mask's bounding box; the incoming angular
+    flux on each box face is reconstructed (isotropically) from the
+    neighbouring diffusion scalar flux, and the box's boundary net currents
+    feed the diffusion problem as sources (the masked cells are excised from
+    the diffusion domain);
+  * ``coupling="krylov"`` (default): the coupled within-group system is solved
+    monolithically -- GMRES on the fixed point of one affine interface step
+    (a single current-accumulating wavefront sweep per box + one bulk
+    diffusion backsolve), DSA-preconditioned in the boxes. No nested
+    iterations: the scattering and interface fixed points collapse into one
+    Krylov loop whose matvec is a fixed, small number of large batched
+    (device-side, ``device=``) sweep kernels -- the GPU-friendly shape.
+  * ``coupling="schwarz"``: the original alternating fixed point -- each box
+    within-group solve converged per step, then the diffusion refresh --
+    kept as a cross-check (same fixed point, more sweeps).
+
+  Either way the coupling sits inside the fission power iteration.
 
 Limits are exact by construction: an empty mask is pure diffusion (no transport
 subdomain); a full mask makes every diffusion cell Dirichlet to the transport
@@ -35,8 +43,9 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.sparse.linalg import factorized
+from scipy.sparse.linalg import LinearOperator, factorized, gmres
 
+from .backend import asnumpy
 from .grid import Grid
 from .materials import Material
 from .sn import SNResult, SNTransportSolver, diffusion_matrix
@@ -58,7 +67,12 @@ class HybridSNDiffusionSolver:
 
     def __init__(self, grid: Grid, materials, material_map=None, sn_mask=None,
                  n_polar: int = 3, n_azi: int = 12, bc: str = "vacuum",
-                 acceleration: str = "dsa"):
+                 acceleration: str = "dsa", coupling: str = "krylov",
+                 device: str = "cpu"):
+        if coupling not in ("krylov", "schwarz"):
+            raise ValueError("coupling must be 'krylov' or 'schwarz'")
+        self.coupling = coupling
+        self.device = device
         if grid.shape[2] != 1:
             raise ValueError("hybrid solver is 2D: grid must have nz == 1")
         self.grid = grid
@@ -128,7 +142,8 @@ class HybridSNDiffusionSolver:
             bmap = self.mmap[i0:i1, j0:j1].reshape(bnx, bny, 1)
             sn = SNTransportSolver(bgrid, mats, material_map=bmap, n_polar=n_polar,
                                    n_azi=n_azi, bc="vacuum", require_fissile=False,
-                                   acceleration=self.acceleration)
+                                   acceleration=self.acceleration,
+                                   device=self.device)
             self.boxes.append({"span": (i0, i1, j0, j1), "sn": sn,
                                "phi": [None] * self.G,
                                "J": [None] * self.G})       # face net currents
@@ -168,12 +183,83 @@ class HybridSNDiffusionSolver:
         return (np.sum(wm * psi_x0, 0), np.sum(wm * psi_x1, 0),
                 np.sum(wme * psi_y0, 0), np.sum(wme * psi_y1, 0))
 
+    def _apply_step(self, g, phi, qext):
+        """One coupled interface step, jointly affine in (phi, qext): a single
+        current-accumulating wavefront sweep per box (incoming reconstructed
+        from the bulk flux, boundary-face net currents read straight off the
+        sweep) followed by one bulk diffusion backsolve with those currents as
+        sources. Its fixed point is exactly the Schwarz limit -- at the fixed
+        point the box flux reproduces itself under one sweep, i.e. the box
+        scattering iteration is converged too."""
+        nx, ny = self.nx, self.ny
+        rhs = (qext * self._active).copy()
+        phi_boxes = []
+        for box in self.boxes:
+            i0, i1, j0, j1 = box["span"]
+            sn = box["sn"]
+            inc = self._box_incoming(box, g, phi)
+            src = sn.ss_self[g] * phi[i0:i1, j0:j1] + qext[i0:i1, j0:j1]
+            p, _, (Jx, Jy) = sn._sweep(src, sn.st[g], inc, currents=True)
+            phi_boxes.append(asnumpy(p))
+            Jx, Jy = asnumpy(Jx), asnumpy(Jy)
+            if i0 > 0:
+                rhs[i0 - 1, j0:j1] += -Jx[0] / self.hx
+            if i1 < nx:
+                rhs[i1, j0:j1] += Jx[-1] / self.hx
+            if j0 > 0:
+                rhs[i0:i1, j0 - 1] += -Jy[:, 0] / self.hy
+            if j1 < ny:
+                rhs[i0:i1, j1] += Jy[:, -1] / self.hy
+        new = self._dfac[g](rhs.ravel()).reshape(nx, ny)
+        for box, pb in zip(self.boxes, phi_boxes):
+            i0, i1, j0, j1 = box["span"]
+            new[i0:i1, j0:j1] = pb
+        return new
+
+    def _solve_group_krylov(self, g, qext, phi_g, tol):
+        """Monolithic within-group solve: GMRES on the fixed point of
+        ``_apply_step``, (I - L) phi = c with c the source-only step. Collapses
+        the nested Schwarz/scattering iterations into one Krylov loop whose
+        matvec is one (device-side) sweep per box + one diffusion backsolve --
+        the GPU-friendly shape: a fixed, small number of large batched kernels
+        per iteration. Left-preconditioned with each box's DSA operator (the
+        interface error equation is zero-incoming, so the boxes' vacuum-BC
+        diffusion LUs are the right correction)."""
+        nx, ny = self.nx, self.ny
+        n = nx * ny
+        zero = np.zeros((nx, ny))
+        c = self._apply_step(g, zero, qext)
+        n_iter = [0]
+
+        def op(x):
+            n_iter[0] += 1
+            return x - self._apply_step(g, x.reshape(nx, ny), zero).ravel()
+
+        def prec(x):
+            out = x.copy().reshape(nx, ny)
+            for box in self.boxes:
+                i0, i1, j0, j1 = box["span"]
+                sn = box["sn"]
+                r = sn.ss_self[g] * x.reshape(nx, ny)[i0:i1, j0:j1]
+                out[i0:i1, j0:j1] += asnumpy(sn._dsa_apply(g, r))
+            return out.ravel()
+
+        A = LinearOperator((n, n), matvec=op, dtype=float)
+        M = LinearOperator((n, n), matvec=prec, dtype=float)
+        phi_v, _ = gmres(A, c.ravel(), x0=phi_g.ravel(), M=M,
+                         rtol=min(tol, 1e-4), atol=0.0, maxiter=400)
+        return phi_v.reshape(nx, ny), n_iter[0]
+
     def _solve_group(self, g, qext, phi_g, tol):
-        """Coupled within-group solve for group g: Schwarz between each box's S_N
-        transport and the shared bulk diffusion, coupled by the interface net
-        current (the transport regions are excised from the diffusion domain)."""
+        """Coupled within-group solve for group g: the transport boxes against
+        the shared bulk diffusion, coupled by the interface net current (the
+        transport regions are excised from the diffusion domain) -- either the
+        monolithic Krylov solve (coupling="krylov") or the alternating
+        Dirichlet--Neumann Schwarz fixed point (coupling="schwarz")."""
         if not self.boxes:                                  # pure diffusion
             return self._dfac[g](qext.ravel()).reshape(self.nx, self.ny), 0
+        if self.coupling == "krylov":
+            return self._solve_group_krylov(g, qext, phi_g, tol)
         n_schwarz = 0
         for _ in range(80):
             n_schwarz += 1
