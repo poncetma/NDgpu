@@ -38,13 +38,13 @@ def solve(angle):
     return p, res
 
 
-p, r_out = solve(0.0)
+p, r_out = solve(180.0)                        # 180 deg = arcs outward (withdrawn)
 print(f"HP-MR 3D, refine={refine}, nz={nz} (dz={p.grid.dz:g} cm), "
       f"{p.grid.n_cells} cells, absorber={absorber!r}, device={device}\n")
-print(f"drums out (0°):   k_eff = {r_out.k_eff:.5f}   [{r_out.solve_seconds:.1f} s]")
-_, r_in = solve(180.0)
+print(f"drums out (180°): k_eff = {r_out.k_eff:.5f}   [{r_out.solve_seconds:.1f} s]")
+_, r_in = solve(0.0)                            # 0 deg = arcs at the core (inserted)
 worth = (1 / r_in.k_eff - 1 / r_out.k_eff) * 1e5
-print(f"drums in (180°):  k_eff = {r_in.k_eff:.5f}   [{r_in.solve_seconds:.1f} s]")
+print(f"drums in (0°):    k_eff = {r_in.k_eff:.5f}   [{r_in.solve_seconds:.1f} s]")
 print(f"total drum worth: {worth:.0f} pcm\n")
 
 fuel = p.material_map == FUEL

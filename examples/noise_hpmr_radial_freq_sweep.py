@@ -36,7 +36,7 @@ THERMAL = 1
 NOISE = 0.10                                # measurement noise (fraction of signal)
 FREQS = [1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0]
 
-p = build_hpmr3d(refine=refine, nz=nz, absorber="polar", drum_angle_deg=0.0)
+p = build_hpmr3d(refine=refine, nz=nz, absorber="polar", drum_angle_deg=180.0)
 mmap = np.asarray(p.material_map)
 nzt = mmap.shape[3]
 TOPLAYER = nzt - 1

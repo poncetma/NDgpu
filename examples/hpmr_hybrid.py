@@ -63,7 +63,7 @@ for a in angles:
 
 
 def rho(k, a):
-    return (1.0 / k[0] - 1.0 / k[a]) * 1e5           # pcm worth vs withdrawn
+    return (1.0 / k[0] - 1.0 / k[a]) * 1e5           # pcm reactivity vs inserted (0 deg)
 
 
 print(f"{'drum':>5} {'--- k_eff ---':^26} {'--- worth vs 0 (pcm) ---':^28}")

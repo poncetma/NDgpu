@@ -42,7 +42,7 @@ THERMAL = 1
 NOISE = 0.10
 w = 2.0 * np.pi * f_hz
 
-p = build_hpmr2d(refine=refine, drum_angle_deg=0.0)
+p = build_hpmr2d(refine=refine, drum_angle_deg=180.0)
 mmap = np.asarray(p.material_map)
 N, D = len(_FUEL_SITES), len(_BE_SITES)
 allsites = {(0, 0)} | set(_FUEL_SITES) | set(_BE_SITES) | set(_DRUM_SITES)

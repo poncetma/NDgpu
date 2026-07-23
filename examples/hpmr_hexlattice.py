@@ -7,8 +7,8 @@ B4C absorber arc that rotates to change reactivity. All of this maps onto
 ndgpu.HexLattice: set_site for the assemblies, and set_drum for the drums, whose
 arc is volume-mixed by area fraction and rotated with the angle_deg argument.
 
-Sweeping every drum's angle from 0 (arc withdrawn, facing outward) to 180 (arc
-inserted, facing the core) gives the drum-worth curve -- the reactivity the drums
+Sweeping every drum's angle from 0 (arc inserted, facing the core) to 180 (arc
+withdrawn, facing outward) gives the drum-worth curve -- the reactivity the drums
 can hold down.
 
 Usage: python examples/hpmr_hexlattice.py [refine] [cpu|gpu|auto]
@@ -46,7 +46,7 @@ def hpmr(drum_angle_deg):
 
 
 print(f"HP-MR via HexLattice, refine={refine}, {len(_DRUM_SITES)} control drums, on {device}\n")
-print(f"  {'drum angle':>10}  {'k_eff':>9}  {'reactivity vs withdrawn (pcm)':>30}")
+print(f"  {'drum angle':>10}  {'k_eff':>9}  {'reactivity vs inserted (0 deg) (pcm)':>36}")
 res0 = hpmr(0.0)
 k0 = res0.k_eff
 for angle in (0.0, 45.0, 90.0, 135.0, 180.0):

@@ -7,7 +7,7 @@ grid and the same cross sections.
 
 For each drum angle the script solves the core three ways -- triangular diffusion,
 triangular SP3, and triangular S_N -- and reports the control-drum worth
-(reactivity, withdrawn 0 deg -> inserted 180 deg). The physics question is the
+(reactivity, inserted 0 deg -> withdrawn 180 deg). The physics question is the
 sign of the transport correction to that worth: diffusion treats the near-black
 B4C arc as fully absorbing, while transport self-shields it (the flux is depressed
 inside the arc, so it absorbs less), which resolves *less* drum worth. SP3 already

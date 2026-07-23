@@ -39,7 +39,7 @@ refine, nz = 3, 10
 THERMAL = 1
 w = 2.0 * np.pi * f_hz
 
-p = build_hpmr3d(refine=refine, nz=nz, absorber="polar", drum_angle_deg=0.0)
+p = build_hpmr3d(refine=refine, nz=nz, absorber="polar", drum_angle_deg=180.0)
 mmap = np.asarray(p.material_map)
 nzt = mmap.shape[3]
 TOPLAYER = nzt - 1

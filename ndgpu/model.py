@@ -646,9 +646,9 @@ class HexLattice:
 
         The absorber occupies the annular sector between ``inner_radius`` and
         ``outer_radius`` (cm from the hex centre) spanning ``arc_deg`` degrees.
-        ``angle_deg`` rotates it about the hex centre, measured from the outward
-        radial direction: 0 points away from the core (withdrawn), 180 toward the
-        core centre (inserted). Any number of drums may be placed, each rotated
+        ``angle_deg`` rotates it about the hex centre, measured from the inward
+        radial direction: 0 points at the core centre (inserted), 180 away from
+        the core (withdrawn). Any number of drums may be placed, each rotated
         independently -- the drum-worth curve is swept by rerunning with different
         ``angle_deg``.
         """
@@ -707,7 +707,7 @@ class HexLattice:
                 x, y = hex_site_xy(rc[0], rc[1], self.pitch)
                 specs.append(dict(rc=rc, inner=dm["inner"], outer=dm["outer"],
                                   arc_half=dm["arc_half"],
-                                  arc_az=math.atan2(y, x) + math.radians(dm["angle_deg"]),
+                                  arc_az=math.atan2(y, x) + math.radians(180.0 + dm["angle_deg"]),
                                   absorber_id=id_of[id(dm["absorber"])]))
             mix_material, mix_weight = _drum_absorber_mix(raster, self.pitch, specs, samples)
 

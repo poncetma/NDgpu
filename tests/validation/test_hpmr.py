@@ -47,11 +47,12 @@ def test_wrong_material_count_raises():
 
 
 def test_drum_rotation_worth_is_monotone():
-    # Rotating all 12 arcs toward the core inserts increasingly negative
-    # reactivity: k(0) > k(90) > k(180).
+    # Convention: 0 = arcs at the core centre (inserted), 180 = outward
+    # (withdrawn). Withdrawing the arcs removes negative reactivity, so k rises
+    # monotonically: k(0) < k(90) < k(180).
     k0, k90, k180 = (_k(4, a) for a in (0.0, 90.0, 180.0))
-    assert k0 > k90 > k180
-    worth_pcm = (1 / k180 - 1 / k0) * 1e5
+    assert k0 < k90 < k180
+    worth_pcm = (1 / k0 - 1 / k180) * 1e5    # magnitude of the insertion worth
     assert worth_pcm > 500          # all-drums worth is far above mesh noise
 
 
@@ -68,8 +69,8 @@ def test_scalar_angle_broadcasts():
 
 
 def test_k_stable_under_refinement():
-    # Drums-out k moves < 100 pcm from refine 4 to 6 (placeholder XS).
-    assert abs(_k(4, 0.0) - _k(6, 0.0)) < 1e-3
+    # Drums-out (angle 180, withdrawn) k moves < 100 pcm from refine 4 to 6.
+    assert abs(_k(4, 180.0) - _k(6, 180.0)) < 1e-3
 
 
 def _k_polar(refine, drum_angle_deg, samples=10):
@@ -98,8 +99,8 @@ def test_polar_builds_below_raster_floor():
 
 def test_polar_worth_ordering_and_symmetry():
     k0, k90, k180 = (_k_polar(4, a) for a in (0.0, 90.0, 180.0))
-    assert k0 > k90 > k180                     # arcs toward core = negative worth
-    assert (1 / k180 - 1 / k0) * 1e5 > 500
+    assert k0 < k90 < k180                     # 0 = inserted (arcs at core) = min k
+    assert (1 / k0 - 1 / k180) * 1e5 > 500
     a, b = np.zeros(12), np.zeros(12)
     a[0], b[3] = 180.0, 180.0                  # a drum and its diametral opposite
     assert _k_polar(4, a) == pytest.approx(_k_polar(4, b), abs=1e-9)
@@ -148,7 +149,7 @@ def test_3d_polar_worth_resolved_at_coarse_mesh():
         assert r.converged
         return r.k_eff
 
-    k_out, k_in = k3(0.0), k3(180.0)
+    k_in, k_out = k3(0.0), k3(180.0)             # 0 = inserted, 180 = withdrawn
     assert k_out > k_in
     assert (1 / k_in - 1 / k_out) * 1e5 > 2000   # above the raster's coarse value
 
@@ -190,10 +191,10 @@ def test_3d_axial_leakage_worth_and_symmetry():
         assert res.converged
         return p, res
 
-    p_out, r_out = k3(0.0)
-    _, r_in = k3(180.0)
+    p_out, r_out = k3(180.0)                     # 180 = arcs out (withdrawn)
+    _, r_in = k3(0.0)                            # 0 = arcs at the core (inserted)
     # axial leakage: 3D k below the 2D radial slice, but well above shutdown
-    assert r_out.k_eff < _k(4, 0.0)
+    assert r_out.k_eff < _k(4, 180.0)
     assert r_out.k_eff > 1.0
     # drums still worth thousands of pcm in 3D
     assert (1 / r_in.k_eff - 1 / r_out.k_eff) * 1e5 > 500

@@ -37,6 +37,7 @@ from scipy.sparse.linalg import LinearOperator, factorized, gmres
 
 from .materials import Material
 from .sn import SNResult, _anderson, quadrature_2d
+from .solver import Fields
 from .tri import TriGrid
 
 _SQRT3_2 = np.sqrt(3.0) / 2.0
@@ -83,7 +84,8 @@ class TriSNTransportSolver:
 
     def __init__(self, grid: TriGrid, materials, material_map=None, active=None,
                  n_polar: int = 3, n_azi: int = 12, bc: str = "vacuum",
-                 scheme: str = "step", require_fissile: bool = True):
+                 scheme: str = "step", require_fissile: bool = True,
+                 mix_material=None, mix_weight=None):
         if len(grid.shape) != 3 or grid.shape[2] != 2:
             raise ValueError("TriSNTransportSolver is 2D: grid shape (nr, nc, 2)")
         if bc not in ("vacuum", "periodic"):
@@ -105,21 +107,24 @@ class TriSNTransportSolver:
         self.active = (np.ones(grid.shape, bool) if active is None
                        else np.asarray(active).reshape(grid.shape))
 
-        def per_group(fn):
-            table = np.array([fn(m) for m in mats])
-            return np.stack([table[mmap, g] for g in range(self.G)])  # (G, nr, nc, 2)
-
-        self.st = per_group(lambda m: np.asarray(m.sigma_t, float))
-        removal = per_group(lambda m: np.asarray(m.removal, float))
+        # Per-cell fields via the validated Fields blend, so the optional polar
+        # volume-mixing (mix_material/mix_weight) that dilutes the thin B4C arc
+        # into the drum cells applies to S_N exactly as it does to diffusion:
+        # cross sections mix linearly, D harmonically, chi by fission share. With
+        # Sigma_t = 1/(3D) (no explicit total) the linear Sigma_t mix equals the
+        # harmonic-D mix, so S_N stays P1-consistent with the diffusion reference.
+        f = Fields(np, grid, mats, mmap, np.float64,
+                   mix_material=mix_material, mix_weight=mix_weight)
+        self.st = np.stack(f.sigma_t)                        # (G, nr, nc, 2)
+        removal = np.stack(f.removal)
         self.ss_self = np.maximum(self.st - removal, 0.0)
-        self.nsf = per_group(lambda m: np.asarray(m.nu_sigma_f, float))
-        self.chi = per_group(lambda m: np.asarray(m.chi, float))
-        sig_s = np.array([m.sigma_s for m in mats])
+        self.nsf = np.stack(f.nu_sigma_f)
+        self.chi = np.stack(f.chi)
         self.scatter = [[None] * self.G for _ in range(self.G)]
         for gf in range(self.G):
             for gt in range(self.G):
-                if gf != gt and np.any(sig_s[:, gf, gt]):
-                    self.scatter[gf][gt] = sig_s[mmap, gf, gt]
+                if gf != gt and f.sigma_s[gf][gt] is not None:
+                    self.scatter[gf][gt] = np.asarray(f.sigma_s[gf][gt])
         if require_fissile and not np.any(self.nsf):
             raise ValueError("no fissile material: k-eigenvalue is undefined")
 

@@ -2,8 +2,8 @@
 
 Assembly-level radial model of the ANL/INL heat-pipe microreactor (VTB
 reference design) on a body-fitted triangular mesh, with the 12 control
-drums' B4C arcs rotated together from fully withdrawn (0 deg, arcs facing
-outward) to fully inserted (180 deg, arcs facing the core).
+drums' B4C arcs rotated together from fully inserted (0 deg, arcs facing the
+core) to fully withdrawn (180 deg, arcs facing outward).
 
     python examples/hpmr_2d.py [refine] [absorber] [device]
 

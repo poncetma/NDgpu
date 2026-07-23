@@ -328,5 +328,5 @@ def test_hexlattice_drum_arc_matches_polar_benchmark():
     ks = {a: api_k(a) for a in (0.0, 90.0, 180.0)}
     for a in (0.0, 90.0, 180.0):
         assert ks[a] == pytest.approx(ref_k(a), abs=1e-6)     # exact match to the benchmark
-    assert ks[0.0] > ks[90.0] > ks[180.0]                     # inserting the arc lowers k
-    assert (1.0 / ks[180.0] - 1.0 / ks[0.0]) * 1e5 > 1000.0   # substantial drum worth
+    assert ks[0.0] < ks[90.0] < ks[180.0]                     # 0 = inserted (arc at core) = min k
+    assert (1.0 / ks[0.0] - 1.0 / ks[180.0]) * 1e5 > 1000.0   # substantial drum worth

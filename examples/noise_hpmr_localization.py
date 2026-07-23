@@ -45,7 +45,7 @@ DSIGMA = 1.0e-4                # unit fault amplitude (cancels in the matched fi
 w = 2.0 * np.pi * f_hz
 
 # --- geometry: assembly ids (fuel) and detector ids (reflector), cell-aligned -
-p = build_hpmr2d(refine=refine, drum_angle_deg=0.0)
+p = build_hpmr2d(refine=refine, drum_angle_deg=180.0)
 N, D = len(_FUEL_SITES), len(_BE_SITES)
 allsites = {(0, 0)} | set(_FUEL_SITES) | set(_BE_SITES) | set(_DRUM_SITES)
 

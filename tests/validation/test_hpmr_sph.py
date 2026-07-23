@@ -23,8 +23,8 @@ TIGHT = dict(tol_k=1e-9, tol_source=1e-8)
 
 @pytest.mark.slow
 def test_sph_folds_sp3_self_shielding_into_hpmr_diffusion():
-    # Drums inserted (angle=180): the arc faces the core, maximal self-shielding.
-    p = build_hpmr2d(refine=4, drum_angle_deg=180.0, absorber="raster")
+    # Drums inserted (angle=0): the arc faces the core, maximal self-shielding.
+    p = build_hpmr2d(refine=4, drum_angle_deg=0.0, absorber="raster")
     dV = p.grid.cell_volume
     common = dict(active=p.active, mask_bc=p.mask_bc)
 

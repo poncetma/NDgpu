@@ -48,8 +48,9 @@ def test_tri_sp3_resolves_less_drum_worth_than_diffusion():
     # SP3 and diffusion disagree on the HP-MR (transport effect), by a physical
     # margin, and SP3 sees the near-black drum as less absorbing -- so the drum
     # worth it predicts is smaller in magnitude than diffusion's.
-    kd_out, kd_in = _hpmr_k(TriDiffusionEigenSolver, 0.0), _hpmr_k(TriDiffusionEigenSolver, 180.0)
-    ks_out, ks_in = _hpmr_k(TriSP3EigenSolver, 0.0), _hpmr_k(TriSP3EigenSolver, 180.0)
+    # 0 = arc at the core centre (inserted), 180 = outward (withdrawn).
+    kd_out, kd_in = _hpmr_k(TriDiffusionEigenSolver, 180.0), _hpmr_k(TriDiffusionEigenSolver, 0.0)
+    ks_out, ks_in = _hpmr_k(TriSP3EigenSolver, 180.0), _hpmr_k(TriSP3EigenSolver, 0.0)
 
     assert abs(ks_out - kd_out) * 1e5 > 5.0          # SP3 is a distinct solution
     worth_diff = 1.0 / kd_out - 1.0 / kd_in          # both negative (arc inserts)

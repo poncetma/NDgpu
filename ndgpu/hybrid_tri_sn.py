@@ -28,6 +28,7 @@ from scipy.sparse.linalg import factorized
 
 from .materials import Material
 from .sn import SNResult, _anderson
+from .solver import Fields
 from .stencil import face_alpha, harmonic_mean
 from .tri import TriGrid
 from .tri_sn import _EDGES, TriSNTransportSolver
@@ -98,7 +99,8 @@ class HybridTriSNDiffusionSolver:
     """
 
     def __init__(self, grid: TriGrid, materials, material_map=None, sn_mask=None,
-                 active=None, mask_bc="vacuum", n_polar: int = 3, n_azi: int = 12):
+                 active=None, mask_bc="vacuum", n_polar: int = 3, n_azi: int = 12,
+                 mix_material=None, mix_weight=None):
         self.grid = grid
         self.nr, self.nc = grid.shape[0], grid.shape[1]
         self.N = self.nr * self.nc * 2
@@ -113,20 +115,20 @@ class HybridTriSNDiffusionSolver:
                         else np.asarray(sn_mask).reshape(grid.shape)) & self.active
         self.bulk = self.active & ~self.sn_mask
 
-        def per_group(fn):
-            table = np.array([fn(m) for m in mats])
-            return np.stack([table[mmap, gi] for gi in range(self.G)])
-
-        self.D = per_group(lambda m: np.asarray(m.diffusion, float))
-        self.removal = per_group(lambda m: np.asarray(m.removal, float))
-        self.nsf = per_group(lambda m: np.asarray(m.nu_sigma_f, float))
-        self.chi = per_group(lambda m: np.asarray(m.chi, float))
-        sig_s = np.array([m.sigma_s for m in mats])
+        # Per-cell fields via the validated Fields blend so the polar B4C
+        # volume-mixing (mix_material/mix_weight) applies to the bulk diffusion
+        # exactly as in TriDiffusionEigenSolver (and to the drum S_N below).
+        f = Fields(np, grid, mats, mmap, np.float64,
+                   mix_material=mix_material, mix_weight=mix_weight)
+        self.D = np.stack(f.diffusion)
+        self.removal = np.stack(f.removal)
+        self.nsf = np.stack(f.nu_sigma_f)
+        self.chi = np.stack(f.chi)
         self.scatter = [[None] * self.G for _ in range(self.G)]
         for gf in range(self.G):
             for gt in range(self.G):
-                if gf != gt and np.any(sig_s[:, gf, gt]):
-                    self.scatter[gf][gt] = sig_s[mmap, gf, gt].reshape(-1)
+                if gf != gt and f.sigma_s[gf][gt] is not None:
+                    self.scatter[gf][gt] = np.asarray(f.sigma_s[gf][gt]).reshape(-1)
         if not np.any(self.nsf):
             raise ValueError("no fissile material: k-eigenvalue is undefined")
 
@@ -141,7 +143,9 @@ class HybridTriSNDiffusionSolver:
             self.sn = TriSNTransportSolver(grid, mats, material_map=mmap,
                                            active=self.sn_mask, n_polar=n_polar,
                                            n_azi=n_azi, bc="vacuum", scheme="scb",
-                                           require_fissile=False)
+                                           require_fissile=False,
+                                           mix_material=mix_material,
+                                           mix_weight=mix_weight)
             d = self.sn._scb
             bulk_flat = self.bulk.reshape(-1)
             ec = d["ext_cell"]                               # (K,3,2) full-mesh nbr cell

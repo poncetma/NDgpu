@@ -168,9 +168,17 @@ def _placeholder_materials(three_d: bool = False) -> list:
 
 
 def _drum_geometry(drum_angle_deg):
-    """(drum centres, per-drum absorber-arc centre azimuths) at these angles."""
+    """(drum centres, per-drum absorber-arc centre azimuths) at these angles.
+
+    Convention: angle 0 points each drum's B4C arc squarely at the core centre
+    (fully inserted), 180 squarely away (fully withdrawn). atan2(y, x) is the
+    drum's outward radial azimuth, so the arc centre is that direction rotated by
+    180 + angle -- i.e. toward the centre at angle 0, back outward at angle 180.
+    Every drum is measured from its own radial line, so a given angle is the same
+    physical insertion for all 12 drums.
+    """
     drum_xy = [hex_site_xy(R, C, PITCH) for R, C in _DRUM_SITES]
-    arc_az = [math.atan2(y, x) + math.radians(a)          # outward + rotation
+    arc_az = [math.atan2(y, x) + math.radians(180.0 + a)   # 0 = toward centre
               for (x, y), a in zip(drum_xy, drum_angle_deg)]
     return drum_xy, arc_az
 
@@ -178,8 +186,8 @@ def _drum_geometry(drum_angle_deg):
 def hpmr_raster(refine: int, drum_angle_deg, paint_absorber: bool = True) -> TriRaster:
     """Rasterize the radial core (see :mod:`ndgpu.hexraster`).
 
-    drum_angle_deg : per-drum absorber rotation (12,); 0 = arc facing radially
-    outward (withdrawn), 180 = facing the core centre (inserted).
+    drum_angle_deg : per-drum absorber rotation (12,); 0 = arc facing the core
+    centre (inserted), 180 = facing radially outward (withdrawn).
     paint_absorber : if True (default) the B4C arc is stamped by centroid
     (staircase); if False the drum cells stay drum-body Be, for the polar
     volume-mixing path (see :func:`absorber_fraction_map`).
@@ -368,7 +376,8 @@ def build_hpmr2d(refine: int = 4, drum_angle_deg=0.0,
     refine         : triangles per hex = 6 refine^2; also sets the drum-arc
                      rasterization fidelity (>= 4 recommended for "raster").
     drum_angle_deg : absorber-arc rotation, scalar or one value per drum (12).
-                     0 = arc outward (withdrawn), 180 = arc toward the core.
+                     0 = arc toward the core centre (inserted), 180 = outward
+                     (withdrawn).
     materials      : optional replacement list ordered as MATERIAL_NAMES
                      (e.g. SPH-corrected sets read via ndgpu.femffusion).
     absorber       : "raster" (centroid staircase, one material per cell) or

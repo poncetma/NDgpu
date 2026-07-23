@@ -65,9 +65,9 @@ def _run_sph(problem, reference_cls):
 
 @pytest.fixture(scope="module")
 def hpmr_inserted():
-    # Drums inserted (angle=180): the arc faces the core, maximal self-shielding
+    # Drums inserted (angle=0): the arc faces the core, maximal self-shielding
     # -- the state where the transport-vs-diffusion angular gap is largest.
-    return build_hpmr2d(refine=4, drum_angle_deg=180.0, absorber="raster")
+    return build_hpmr2d(refine=4, drum_angle_deg=0.0, absorber="raster")
 
 
 @pytest.mark.slow

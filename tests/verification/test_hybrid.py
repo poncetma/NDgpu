@@ -136,16 +136,17 @@ def _hpmr_k(solver_cls, angle, **extra):
 
 
 def test_hpmr_hybrid_worth_between_diffusion_and_sp3():
-    # Control-drum worth (0 deg withdrawn -> 180 deg inserted). Diffusion
+    # Control-drum worth (180 deg withdrawn -> 0 deg inserted). Diffusion
     # over-predicts the near-black arc's worth; full SP3 self-shields it down.
     # Sourcing transport in the drums alone recovers part of that self-shielding,
     # so the hybrid worth sits strictly between the two and closer to SP3.
-    kd = (_hpmr_k(TriDiffusionEigenSolver, 0.0),
-          _hpmr_k(TriDiffusionEigenSolver, 180.0))
-    ks = (_hpmr_k(TriSP3EigenSolver, 0.0),
-          _hpmr_k(TriSP3EigenSolver, 180.0))
-    kh = (_hpmr_k(TriSP3EigenSolver, 0.0, hybrid_mask="drum"),
-          _hpmr_k(TriSP3EigenSolver, 180.0, hybrid_mask="drum"))
+    # Tuple order is (withdrawn, inserted) so the worth is negative.
+    kd = (_hpmr_k(TriDiffusionEigenSolver, 180.0),
+          _hpmr_k(TriDiffusionEigenSolver, 0.0))
+    ks = (_hpmr_k(TriSP3EigenSolver, 180.0),
+          _hpmr_k(TriSP3EigenSolver, 0.0))
+    kh = (_hpmr_k(TriSP3EigenSolver, 180.0, hybrid_mask="drum"),
+          _hpmr_k(TriSP3EigenSolver, 0.0, hybrid_mask="drum"))
 
     worth = lambda k: 1.0 / k[0] - 1.0 / k[1]        # negative (arc inserts)
     wd, ws, wh = worth(kd), worth(ks), worth(kh)

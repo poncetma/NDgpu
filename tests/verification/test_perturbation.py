@@ -76,11 +76,11 @@ def test_first_order_over_predicts_black_drum_worth():
     # Full drum swing (arc out -> arc into core). First-order PT badly
     # over-predicts because the near-black B4C arc self-shields: the neglected
     # flux depression is an order-one effect, not a small correction.
-    ref = _tri_hpmr(0.0)
+    ref = _tri_hpmr(180.0)                        # 180 = arcs out (withdrawn)
     fwd = ref.solve(**TIGHT)
     adj = ref.solve(adjoint=True, **TIGHT)
 
-    pert = _tri_hpmr(180.0)
+    pert = _tri_hpmr(0.0)                          # 0 = arcs into the core (inserted)
     worth_exact = 1.0 / fwd.k_eff - 1.0 / pert.solve(**TIGHT).k_eff
     worth_pt = first_order_reactivity(ref, fwd, adj, pert)
     assert worth_exact < 0 and worth_pt < 0
