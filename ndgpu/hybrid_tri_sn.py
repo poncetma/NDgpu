@@ -100,7 +100,7 @@ class HybridTriSNDiffusionSolver:
 
     def __init__(self, grid: TriGrid, materials, material_map=None, sn_mask=None,
                  active=None, mask_bc="vacuum", n_polar: int = 3, n_azi: int = 12,
-                 mix_material=None, mix_weight=None):
+                 mix_material=None, mix_weight=None, acceleration: str = "dsa"):
         self.grid = grid
         self.nr, self.nc = grid.shape[0], grid.shape[1]
         self.N = self.nr * self.nc * 2
@@ -145,7 +145,8 @@ class HybridTriSNDiffusionSolver:
                                            n_azi=n_azi, bc="vacuum", scheme="scb",
                                            require_fissile=False,
                                            mix_material=mix_material,
-                                           mix_weight=mix_weight)
+                                           mix_weight=mix_weight,
+                                           acceleration=acceleration)
             d = self.sn._scb
             bulk_flat = self.bulk.reshape(-1)
             ec = d["ext_cell"]                               # (K,3,2) full-mesh nbr cell

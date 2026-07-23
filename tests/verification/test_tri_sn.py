@@ -91,3 +91,29 @@ def test_bad_bc_rejected():
     grid = TriGrid(shape=(4, 4, 2), side=3.0)
     with pytest.raises(ValueError, match="vacuum.*periodic|periodic"):
         TriSNTransportSolver(grid, M1, n_polar=2, n_azi=8, bc="reflective")
+
+
+@pytest.mark.parametrize("scheme", ["step", "scb"])
+def test_dsa_matches_gmres_and_cuts_sweeps(scheme):
+    # Scattering-dominated 2-group tile: every within-group acceleration must
+    # converge to the same k (acceleration changes the iteration count, never
+    # the fixed point), and DSA must beat plain source iteration by >5x sweeps.
+    m = Material(diffusion=[1.4, 0.4], sigma_a=[0.005, 0.015],
+                 nu_sigma_f=[0.004, 0.02], sigma_s=[[0.0, 0.025], [0.0, 0.0]],
+                 chi=[1.0, 0.0], name="soft")
+    n = 10
+    grid = TriGrid(shape=(n, n, 2), side=24.0 / n)
+    tols = dict(tol_k=1e-7, tol_source=1e-6)
+
+    def run(acc):
+        return TriSNTransportSolver(grid, m, n_polar=2, n_azi=8, bc="vacuum",
+                                    scheme=scheme, acceleration=acc).solve(**tols)
+
+    r_dsa = run("dsa")
+    r_gm = run("gmres")
+    r_si = run("si")
+    r_pg = run("dsa-gmres")
+    assert all(r.converged for r in (r_dsa, r_gm, r_si, r_pg))
+    for r in (r_gm, r_si, r_pg):
+        assert r.k_eff == pytest.approx(r_dsa.k_eff, abs=1e-6)
+    assert r_si.n_sweeps > 5 * r_dsa.n_sweeps

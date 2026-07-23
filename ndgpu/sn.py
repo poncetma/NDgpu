@@ -49,7 +49,21 @@ family (``examples/sdpn_benchmark_1d.py``). Same ingredients, one dimension up:
   scattering iteration inside it.
 
 * **Outer** -- power iteration on the fission source with a Gauss-Seidel group
-  sweep, identical in structure to ``ndgpu.solver``.
+  sweep, identical in structure to ``ndgpu.solver``. With
+  ``outer_acceleration="cmfd"`` (the default) each outer is followed by a
+  CMFD/NDA step: one extra current-accumulating sweep per group yields the
+  transport scalar flux and face net currents (exact, since diamond
+  differencing is conservative cell-by-cell), a drift-corrected finite-volume
+  diffusion eigenproblem is assembled from them (face current model
+  J = -beta (phi_R - phi_L) + gamma (phi_R + phi_L), gamma chosen to reproduce
+  the transport current), solved by an Anderson-accelerated power iteration
+  (cheap -- it is a small sparse system), and its flux and k replace the
+  transport iterate. At transport convergence the CMFD problem reproduces the
+  transport balance identically, so the fixed point is unchanged; the outers
+  now converge at the CMFD rate instead of the transport dominance ratio.
+  Negative or non-finite CMFD fluxes (drift terms make the matrix non-M) fall
+  back to the unaccelerated outer. ``outer_acceleration="power"`` is the plain
+  power iteration.
 
 Cross sections come from ndgpu ``Material`` objects, reconstructed into a
 transport-consistent problem whose P1/diffusion limit is exactly the diffusion
@@ -265,6 +279,10 @@ class SNTransportSolver:
                     DSA-accelerated source iteration), "dsa-gmres" (DSA-
                     preconditioned GMRES), "gmres" (plain GMRES), "si" (plain
                     source iteration). See the module docstring.
+    outer_acceleration : "cmfd" (drift-corrected diffusion eigensolve after
+                    each outer; the default with the wavefront sweep) or
+                    "power" (plain power iteration; the default -- and only
+                    option -- with sweep="rows").
     sweep         : "wavefront" (default; vectorized diagonal sweep, CPU/GPU)
                     or "rows" (per-direction scipy banded row solves, CPU only).
     device        : "cpu" (default), "gpu"/"cuda", or "auto" -- array backend
@@ -273,10 +291,12 @@ class SNTransportSolver:
     """
 
     ACCELERATIONS = ("dsa", "dsa-gmres", "gmres", "si")
+    OUTER_ACCELERATIONS = ("cmfd", "power")
 
     def __init__(self, grid: Grid, materials, material_map=None,
                  n_polar: int = 3, n_azi: int = 12, bc: str = BC_VACUUM,
                  require_fissile: bool = True, acceleration: str = "dsa",
+                 outer_acceleration: str | None = None,
                  sweep: str = "wavefront", device: str = "cpu",
                  max_inner: int = 800):
         if grid.shape[2] != 1:
@@ -287,11 +307,20 @@ class SNTransportSolver:
             raise ValueError(f"acceleration must be one of {self.ACCELERATIONS}")
         if sweep not in ("wavefront", "rows"):
             raise ValueError("sweep must be 'wavefront' or 'rows'")
+        if outer_acceleration is None:                       # cmfd needs currents
+            outer_acceleration = "cmfd" if sweep == "wavefront" else "power"
+        if outer_acceleration not in self.OUTER_ACCELERATIONS:
+            raise ValueError(
+                f"outer_acceleration must be one of {self.OUTER_ACCELERATIONS}")
+        if sweep == "rows" and outer_acceleration == "cmfd":
+            raise ValueError("outer_acceleration='cmfd' needs the wavefront "
+                             "sweep (face-current accumulation)")
         self.grid = grid
         self.nx, self.ny = grid.shape[0], grid.shape[1]
         self.hx, self.hy = grid.spacing[0], grid.spacing[1]
         self.bc = bc
         self.acceleration = acceleration
+        self.outer_acceleration = outer_acceleration
         self.sweep_mode = sweep
         self.max_inner = max_inner
         self.xp = get_backend(device)
@@ -355,6 +384,9 @@ class SNTransportSolver:
         self._aq = xp.asarray(np.stack([self._a[s] for s in self._qsel])[:, :, None])
         self._bq = xp.asarray(np.stack([self._b[s] for s in self._qsel])[:, :, None])
         self._wq = xp.asarray(np.stack([self.w[s] for s in self._qsel])[:, :, None])
+        wmu, weta = self.w * self.mu, self.w * self.eta      # signed: net currents
+        self._wmuq = xp.asarray(np.stack([wmu[s] for s in self._qsel])[:, :, None])
+        self._wetaq = xp.asarray(np.stack([weta[s] for s in self._qsel])[:, :, None])
         self._diags = []
         for d in range(nx + ny - 1):
             isw = np.arange(max(0, d - ny + 1), min(d, nx - 1) + 1)
@@ -366,24 +398,31 @@ class SNTransportSolver:
                                 xp.asarray(isw * ny + jsw), xp.asarray(fph)))
 
     # ---- one full transport sweep -----------------------------------------
-    def _sweep(self, q, st_g, inc):
+    def _sweep(self, q, st_g, inc, currents=False):
         """Transport the isotropic source q (nx, ny) through every ordinate.
 
         inc holds per-face incoming edge fluxes {'x0','x1'}: (M, ny), {'y0','y1'}:
         (M, nx) (all zero for vacuum). Returns the scalar flux (nx, ny; a backend
         array) and the outgoing edge fluxes as host (numpy) arrays in the same
-        dict layout (for the reflective update and the hybrid coupling).
+        dict layout (for the reflective update and the hybrid coupling). With
+        ``currents`` a third element holds the face net currents
+        (Jx (nx+1, ny), Jy (nx, ny+1); backend arrays) for CMFD.
         """
         self._sweep_count += 1
         if self.sweep_mode == "rows":
+            if currents:
+                raise ValueError("currents accumulation needs sweep='wavefront'")
             return self._sweep_rows(q, st_g, inc)
-        return self._sweep_wavefront(q, st_g, inc)
+        return self._sweep_wavefront(q, st_g, inc, currents)
 
-    def _sweep_wavefront(self, q, st_g, inc):
+    def _sweep_wavefront(self, q, st_g, inc, currents=False):
         """Vectorized wavefront sweep: one batched diamond-difference update per
         anti-diagonal over (4 quadrants) x (M/4 directions) x (diagonal cells).
         psi = (q + a psi_x_in + b psi_y_in) / (Sigma_t + a + b) with
-        a = 2|mu|/hx, b = 2|eta|/hy; outgoing edges psi_out = 2 psi - psi_in."""
+        a = 2|mu|/hx, b = 2|eta|/hy; outgoing edges psi_out = 2 psi - psi_in.
+        Each cell writes its outgoing edge exactly once (and it is the next
+        cell's incoming), so accumulating w*mu-weighted edge fluxes as they are
+        produced gives every face's net current with no extra passes."""
         xp, nx, ny = self.xp, self.nx, self.ny
         Mq = self.M // 4
         qf = xp.asarray(q).ravel()
@@ -398,25 +437,45 @@ class SNTransportSolver:
             ex[qd] = xp.asarray(np.ascontiguousarray(xin[:, ::1 if fy else -1]))
             ey[qd] = xp.asarray(np.ascontiguousarray(yin[:, ::1 if fx else -1]))
         a, b, w = self._aq, self._bq, self._wq
+        if currents:
+            wmu, weta = self._wmuq, self._wetaq
+            jx_sw = xp.zeros((4, nx + 1, ny))     # per-quadrant faces, swept coords
+            jy_sw = xp.zeros((4, nx, ny + 1))
+            jx_sw[:, 0, :] = (wmu * ex).sum(axis=1)   # incoming boundary faces
+            jy_sw[:, :, 0] = (weta * ey).sum(axis=1)
         for isw, jsw, fsw, fph in self._diags:
             qv = qf[fph][:, None, :]              # (4, 1, nd)
             stv = stf[fph][:, None, :]
             exv = ex[:, :, jsw]                   # (4, Mq, nd)
             eyv = ey[:, :, isw]
             psi = (qv + a * exv + b * eyv) / (stv + a + b)
-            ex[:, :, jsw] = 2.0 * psi - exv
-            ey[:, :, isw] = 2.0 * psi - eyv
+            exn = 2.0 * psi - exv
+            eyn = 2.0 * psi - eyv
+            ex[:, :, jsw] = exn
+            ey[:, :, isw] = eyn
             phi_sw[:, fsw] = (w * psi).sum(axis=1)
+            if currents:
+                jx_sw[:, isw + 1, jsw] = (wmu * exn).sum(axis=1)
+                jy_sw[:, isw, jsw + 1] = (weta * eyn).sum(axis=1)
         phi = xp.zeros((nx, ny))
         pq = phi_sw.reshape(4, nx, ny)
         out = {"x0": np.zeros((self.M, ny)), "x1": np.zeros((self.M, ny)),
                "y0": np.zeros((self.M, nx)), "y1": np.zeros((self.M, nx))}
         exh, eyh = asnumpy(ex), asnumpy(ey)       # final wavefront = far-wall edges
+        if currents:
+            Jx = xp.zeros((nx + 1, ny))
+            Jy = xp.zeros((nx, ny + 1))
         for qd, (fx, fy) in enumerate(_QUADS):
-            phi = phi + pq[qd][::1 if fx else -1, ::1 if fy else -1]
+            sx, sy = (1 if fx else -1), (1 if fy else -1)
+            phi = phi + pq[qd][::sx, ::sy]
             sel = self._qsel[qd]
-            out["x1" if fx else "x0"][sel] = exh[qd][:, ::1 if fy else -1]
-            out["y1" if fy else "y0"][sel] = eyh[qd][:, ::1 if fx else -1]
+            out["x1" if fx else "x0"][sel] = exh[qd][:, ::sy]
+            out["y1" if fy else "y0"][sel] = eyh[qd][:, ::sx]
+            if currents:
+                Jx = Jx + jx_sw[qd][::sx, ::sy]   # swept face s -> physical nx - s
+                Jy = Jy + jy_sw[qd][::sx, ::sy]
+        if currents:
+            return phi, out, (Jx, Jy)
         return phi, out
 
     def _sweep_rows(self, q, st_g, inc):
@@ -480,6 +539,147 @@ class SNTransportSolver:
         scatter-weighted residual r = Sigma_s (phi^(l+1/2) - phi^l)."""
         d = self._dsa_factor(g)(asnumpy(r).ravel())
         return self.xp.asarray(d.reshape(self.nx, self.ny))
+
+    # ---- CMFD outer acceleration ------------------------------------------
+    def _cmfd_factor(self, g, p, Jx, Jy):
+        """LU of the group-g drift-corrected diffusion operator built from the
+        transport flux p and face net currents (Jx, Jy): interior face current
+        model J = -beta (phi_R - phi_L) + gamma (phi_R + phi_L) with beta the
+        harmonic-D coupling and gamma fitted so the model reproduces the
+        transport current at the transport flux; boundary faces carry the pure
+        transport leakage ratio J / phi_cell. At the transport fixed point the
+        operator's balance is the transport balance, so CMFD leaves the
+        converged answer unchanged.
+
+        Optically thick cells (tau = Sigma_t h > 1) destabilize plain CMFD, so
+        the face coupling is enlarged odCMFD-style, beta += theta with
+        theta = 0.25 (1 - 1/tau)_+ (0 for thin cells, -> 1/4 for thick): gamma
+        refits the transport current for any beta, so the damping changes the
+        outer convergence rate only, never the converged answer."""
+        nx, ny, hx, hy = self.nx, self.ny, self.hx, self.hy
+        st = asnumpy(self.st[g])
+        D = 1.0 / (3.0 * np.maximum(st, 1e-12))
+        rem = st - asnumpy(self.ss_self[g])
+
+        def theta(tau_L, tau_R):
+            tau = np.maximum(np.maximum(tau_L, tau_R), 1e-30)
+            return 0.25 * np.maximum(0.0, 1.0 - 1.0 / tau)
+        idx = np.arange(nx * ny).reshape(nx, ny)
+        tiny = 1e-30
+        rows, cols, vals = [], [], []
+
+        def add(r, c, v):
+            rows.append(np.asarray(r).ravel()); cols.append(np.asarray(c).ravel())
+            vals.append(np.asarray(v).ravel())
+
+        for axis, (J, h) in enumerate(((Jx, hx), (Jy, hy))):
+            if axis == 0:
+                beta = (harmonic_mean(D[:-1, :], D[1:, :]) / h
+                        + theta(st[:-1, :] * h, st[1:, :] * h))
+                pL, pR = p[:-1, :], p[1:, :]
+                L, R = idx[:-1, :], idx[1:, :]
+                Jin = J[1:nx, :]
+                b0, b1 = J[0, :], J[nx, :]
+                c0, c1 = idx[0, :], idx[-1, :]
+                p0, p1 = p[0, :], p[-1, :]
+            else:
+                beta = (harmonic_mean(D[:, :-1], D[:, 1:]) / h
+                        + theta(st[:, :-1] * h, st[:, 1:] * h))
+                pL, pR = p[:, :-1], p[:, 1:]
+                L, R = idx[:, :-1], idx[:, 1:]
+                Jin = J[:, 1:ny]
+                b0, b1 = J[:, 0], J[:, ny]
+                c0, c1 = idx[:, 0], idx[:, -1]
+                p0, p1 = p[:, 0], p[:, -1]
+            gh = (Jin + beta * (pR - pL)) / np.maximum(pL + pR, tiny)
+            add(L, L, (beta + gh) / h); add(L, R, (-beta + gh) / h)
+            add(R, R, (beta - gh) / h); add(R, L, (-beta - gh) / h)
+            add(c0, c0, -(b0 / np.maximum(p0, tiny)) / h)      # boundary leakage
+            add(c1, c1, (b1 / np.maximum(p1, tiny)) / h)
+        add(idx, idx, rem)
+        A = sp.csr_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(nx * ny, nx * ny))
+        return factorized(A.tocsc())
+
+    def _cmfd_eigen(self, facs, phi0, k0):
+        """Anderson-accelerated power iteration on the CMFD eigenproblem.
+        Returns (phi, k, ok); ok=False (caller keeps the transport iterate) on
+        breakdown or a negative flux (the drift matrix is not an M-matrix).
+        The returned flux is scaled so the total fission source matches the
+        input's, keeping the outer iterate continuous."""
+        G, nx, ny = self.G, self.nx, self.ny
+        nsf = [asnumpy(self.nsf[g]) for g in range(G)]
+        chi = [asnumpy(self.chi[g]) for g in range(G)]
+        phi = [np.asarray(p, float) for p in phi0]
+        fiss = sum(nsf[g] * phi[g] for g in range(G))
+        total0 = float(fiss.sum())
+        if not np.isfinite(total0) or total0 <= 0.0:
+            return phi0, k0, False
+        k = k0
+        hist = []
+        prev_err = np.inf
+        for _ in range(500):
+            fiss_in = fiss
+            fs = fiss / k
+            phi_new = [None] * G
+            for g in range(G):
+                q = chi[g] * fs
+                for gf in range(G):
+                    s = self.scatter[gf][g]
+                    if gf != g and s is not None:
+                        q = q + s * (phi_new[gf] if gf < g else phi[gf])
+                phi_new[g] = facs[g](q.ravel()).reshape(nx, ny)
+            fiss_new = sum(nsf[g] * phi_new[g] for g in range(G))
+            tn = float(fiss_new.sum())
+            if not np.isfinite(tn) or tn <= 0.0:
+                return phi0, k0, False
+            k_new = k * tn / float(fiss.sum())
+            dk = abs(k_new - k)
+            raw = fiss_new * (total0 / tn)
+            rel = (float(np.max(np.abs(raw - fiss_in)))
+                   / max(float(np.max(np.abs(fiss_in))), 1e-30))
+            phi, k = phi_new, k_new
+            if dk < 1e-11 and rel < 1e-9:
+                break
+            if rel > 1.1 * prev_err:
+                hist = []
+            hist.append((fiss_in.ravel(), raw.ravel()))
+            if len(hist) > 6:
+                hist.pop(0)
+            fiss = _anderson(hist).reshape(nx, ny)
+            fiss = fiss * (total0 / fiss.sum())
+            prev_err = rel
+        scale = total0 / tn
+        phi = [p * scale for p in phi]
+        if not all(np.isfinite(p).all() for p in phi):
+            return phi0, k0, False
+        if min(float(p.min()) for p in phi) < 0.0:
+            return phi0, k0, False
+        return phi, k, True
+
+    def _cmfd_update(self, phi_new, inc, fs, st, ss_self, chi, scatter, k):
+        """One CMFD step after a transport outer: for each group, one
+        current-accumulating sweep of the converged within-group source yields
+        a consistent (flux, face-current) pair; the drift-corrected diffusion
+        eigenproblem built from them is solved and its (flux, k) returned as
+        the new outer iterate (transport iterate on fallback)."""
+        xp, G = self.xp, self.G
+        phi_h, facs = [None] * G, [None] * G
+        for g in range(G):
+            q = chi[g] * fs
+            for gf in range(G):
+                s = scatter[gf][g]
+                if gf != g and s is not None:
+                    q = q + s * phi_new[gf]
+            p, _, (Jx, Jy) = self._sweep(ss_self[g] * phi_new[g] + q, st[g],
+                                         inc[g], currents=True)
+            phi_h[g] = asnumpy(p)
+            facs[g] = self._cmfd_factor(g, phi_h[g], asnumpy(Jx), asnumpy(Jy))
+        phi_c, k_c, ok = self._cmfd_eigen(facs, phi_h, k)
+        if not ok:
+            return phi_new, k, False
+        return [xp.asarray(p) for p in phi_c], k_c, True
 
     # ---- within-group scattering solvers ----------------------------------
     def _si_solve(self, qext, ss_g, st_g, phi, frozen, tol, g, accelerate):
@@ -639,8 +839,13 @@ class SNTransportSolver:
                         qext = qext + s * src
                 phi_new[g], inc[g] = self._solve_group(
                     qext, ss_self[g], st[g], phi[g], inc[g], rtol, g)
+            cmfd_ok = False
+            if self.outer_acceleration == "cmfd":
+                phi_new, k_cmfd, cmfd_ok = self._cmfd_update(
+                    phi_new, inc, fs, st, ss_self, chi, scatter, k)
             fiss_new = sum(nsf[g] * phi_new[g] for g in range(G))
-            k_new = k * float(fiss_new.sum()) / float(fiss.sum())
+            k_new = (k_cmfd if cmfd_ok
+                     else k * float(fiss_new.sum()) / float(fiss.sum()))
             dk = abs(k_new - k)
             denom = max(max(float(xp.max(p)) for p in phi_new), 1e-30)
             rel = max(float(xp.max(xp.abs(phi_new[g] - phi[g])))

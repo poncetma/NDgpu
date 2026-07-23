@@ -88,10 +88,52 @@ def test_dsa_cuts_sweep_count_in_scattering_medium():
     grid = Grid(shape=(n, n, 1), size=(24.0, 24.0, 1.0))
     m = Material(diffusion=[1.0 / 3.0], sigma_a=[0.03], nu_sigma_f=[0.04],
                  sigma_s=[[0.0]])                        # Sigma_t = 1, c = 0.97
-    kw = dict(n_polar=2, n_azi=8, bc="vacuum")
+    # plain power outers, so the sweep count isolates the within-group scheme
+    kw = dict(n_polar=2, n_azi=8, bc="vacuum", outer_acceleration="power")
     tols = dict(tol_k=1e-7, tol_source=1e-6)
     r_dsa = SNTransportSolver(grid, m, acceleration="dsa", **kw).solve(**tols)
     r_si = SNTransportSolver(grid, m, acceleration="si", **kw).solve(**tols)
     assert r_dsa.converged and r_si.converged
     assert r_dsa.k_eff == pytest.approx(r_si.k_eff, abs=1e-6)
     assert r_si.n_sweeps > 5 * r_dsa.n_sweeps
+
+
+def test_cmfd_cuts_outers_at_same_answer():
+    # CMFD replaces the power-iteration update with a drift-corrected diffusion
+    # eigensolve: same fixed point (the drift terms reproduce the transport
+    # balance exactly at convergence), far fewer transport outers. The large
+    # tile keeps the dominance ratio high so the contrast is unambiguous.
+    grid, mats, mmap = _absorber_problem(48)
+    kw = dict(material_map=mmap, n_polar=2, n_azi=8, bc="vacuum")
+    tols = dict(tol_k=1e-7, tol_source=1e-6)
+    r_pow = SNTransportSolver(grid, mats, outer_acceleration="power",
+                              **kw).solve(**tols)
+    r_cmfd = SNTransportSolver(grid, mats, outer_acceleration="cmfd",
+                               **kw).solve(**tols)
+    assert r_pow.converged and r_cmfd.converged
+    assert r_cmfd.k_eff == pytest.approx(r_pow.k_eff, abs=1e-6)
+    assert r_cmfd.outer_iterations * 3 < r_pow.outer_iterations
+    assert r_cmfd.n_sweeps * 3 < r_pow.n_sweeps
+
+
+def test_cmfd_stable_with_optically_thick_cells():
+    # 4 mfp per cell: plain CMFD oscillates; the odCMFD-style face damping
+    # (beta += theta) must keep it convergent, and the reflective-boundary
+    # k_inf composition limit must survive the CMFD outer as well.
+    n = 12
+    grid = Grid(shape=(n, n, 1), size=(48.0, 48.0, 1.0))
+    m = Material(diffusion=[1.0 / 3.0], sigma_a=[0.2], nu_sigma_f=[0.26],
+                 sigma_s=[[0.0]])                            # Sigma_t h = 4
+    r = SNTransportSolver(grid, m, n_polar=3, n_azi=12, bc="vacuum",
+                          outer_acceleration="cmfd").solve(tol_k=1e-7,
+                                                           tol_source=1e-6)
+    assert r.converged
+    mat = Material(diffusion=[1.4, 0.4], sigma_a=[0.01, 0.10],
+                   nu_sigma_f=[0.007, 0.13], sigma_s=[[0.0, 0.018], [0.0, 0.0]],
+                   chi=[1.0, 0.0])
+    grid2 = Grid(shape=(8, 8, 1), size=(16.0, 16.0, 1.0))
+    r2 = SNTransportSolver(grid2, mat, n_polar=2, n_azi=8, bc="reflective",
+                           outer_acceleration="cmfd").solve(tol_k=1e-9,
+                                                            tol_source=1e-9)
+    assert r2.converged
+    assert r2.k_eff == pytest.approx(k_infinite(mat), abs=2e-5)

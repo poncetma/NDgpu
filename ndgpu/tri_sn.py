@@ -12,7 +12,13 @@ here: rather than order the transport sweep by hand (and break cycles), we
 assemble, for each ordinate, the sparse streaming+collision operator
 L_Omega = Omega.grad + Sigma_t with upwind (step) differencing and factorize it
 once. A "sweep" is then a triangular solve; the within-group scattering fixed
-point is GMRES'd exactly as in the Cartesian solver, inside a fission power
+point is collapsed by the same acceleration menu as the Cartesian solver
+(``acceleration=``: "dsa" default, "dsa-gmres", "gmres", "si" -- see
+``ndgpu.sn``), with the DSA error solve a triangular finite-volume diffusion
+operator matching ``TriGroupOperator`` (harmonic face D = 1/(3 Sigma_t),
+4D/h^2 coupling, Marshak-vacuum Robin on faces to excised/off-mesh cells --
+the *error* equation has zero incoming there -- and periodic wrap on the
+torus), one lazy sparse LU per group. All of it sits inside a fission power
 iteration.
 
 Upwind (step) differencing keeps every angular flux non-negative -- robust
@@ -38,6 +44,7 @@ from scipy.sparse.linalg import LinearOperator, factorized, gmres
 from .materials import Material
 from .sn import SNResult, _anderson, quadrature_2d
 from .solver import Fields
+from .stencil import face_alpha, harmonic_mean
 from .tri import TriGrid
 
 _SQRT3_2 = np.sqrt(3.0) / 2.0
@@ -82,16 +89,23 @@ class TriSNTransportSolver:
                     than step. Costs ~3x the unknowns of step.
     """
 
+    ACCELERATIONS = ("dsa", "dsa-gmres", "gmres", "si")
+
     def __init__(self, grid: TriGrid, materials, material_map=None, active=None,
                  n_polar: int = 3, n_azi: int = 12, bc: str = "vacuum",
                  scheme: str = "step", require_fissile: bool = True,
-                 mix_material=None, mix_weight=None):
+                 mix_material=None, mix_weight=None, acceleration: str = "dsa",
+                 max_inner: int = 800):
         if len(grid.shape) != 3 or grid.shape[2] != 2:
             raise ValueError("TriSNTransportSolver is 2D: grid shape (nr, nc, 2)")
         if bc not in ("vacuum", "periodic"):
             raise ValueError("bc must be 'vacuum' or 'periodic'")
         if scheme not in ("step", "scb"):
             raise ValueError("scheme must be 'step' or 'scb'")
+        if acceleration not in self.ACCELERATIONS:
+            raise ValueError(f"acceleration must be one of {self.ACCELERATIONS}")
+        self.acceleration = acceleration
+        self.max_inner = max_inner
         self.scheme = scheme
         self.grid = grid
         self.nr, self.nc = grid.shape[0], grid.shape[1]
@@ -132,6 +146,8 @@ class TriSNTransportSolver:
         self.M = self.mu.size
         self._cell = np.arange(self.N).reshape(self.nr, self.nc, 2)
         self._act_flat = self.active.reshape(-1)
+        self._dsa_fac = [None] * self.G                      # lazy DSA LU per group
+        self._sweep_count = 0
         self._prefactor()
 
     def _prefactor(self):
@@ -196,6 +212,7 @@ class TriSNTransportSolver:
     def _sweep(self, g, src_flat, iface_in=None):
         """phi = Sum_m w_m L_Omega^-1 (src * area) for an isotropic source.
         iface_in (SCB only) injects a hybrid incoming flux on interface edges."""
+        self._sweep_count += 1
         if self.scheme == "scb":
             return self._sweep_scb(g, src_flat, iface_in)
         rhs = src_flat * self.area
@@ -332,6 +349,7 @@ class TriSNTransportSolver:
         """Net current (drum -> bulk, outward-normal positive) on each interface
         half-edge, given the converged within-group source per cell (scatter +
         external) and the incoming from the bulk. Returns (K, 3, 2)."""
+        self._sweep_count += 1                               # same cost as a sweep
         d = self._scb
         ac, K = d["ac"], d["K"]
         base = np.repeat(cell_source[ac] * (self.area / 3.0), 3)
@@ -345,25 +363,115 @@ class TriSNTransportSolver:
             J += self.w[m] * np.where(is_iface, oe * (self.h / 2.0) * face_flux, 0.0)
         return J
 
+    # ---- diffusion synthetic acceleration ---------------------------------
+    def _dsa_factor(self, g):
+        """Sparse LU of the group-g DSA diffusion operator, built on first use.
+
+        Triangular finite-volume diffusion matching TriGroupOperator: harmonic
+        face D = 1/(3 Sigma_t) with 4D/h^2 coupling, removal = Sigma_t -
+        Sigma_s,gg. Faces from an active cell onto an excised/off-mesh cell get
+        the Marshak-vacuum Robin term -- the within-group *error* equation has
+        zero incoming flux there (any prescribed incoming, boundary or hybrid
+        iface_in, is a fixed source) -- and the periodic torus wraps."""
+        if self._dsa_fac[g] is None:
+            nr, nc, N, h = self.nr, self.nc, self.N, self.h
+            st = np.maximum(self.st[g].reshape(-1), 1e-12)
+            ss = self.ss_self[g].reshape(-1)
+            Dv = 1.0 / (3.0 * st)
+            kf = 4.0 / (h * h)
+            alpha = face_alpha("vacuum")
+            cell, act = self._cell, self.active
+            diag = np.maximum(st - ss, 1e-12).astype(float)
+            rows, cols, vals = [], [], []
+            ii, jj = np.meshgrid(np.arange(nr), np.arange(nc), indexing="ij")
+            for (t, di, dj, tn, _) in _EDGES:
+                src = cell[:, :, t]
+                src_act = act[:, :, t]
+                ni, nj = ii + di, jj + dj
+                if self.bc == "periodic":
+                    ni, nj = ni % nr, nj % nc
+                    inb = np.ones_like(ni, bool)
+                else:
+                    inb = (ni >= 0) & (ni < nr) & (nj >= 0) & (nj < nc)
+                nbr = np.where(inb, cell[np.clip(ni, 0, nr - 1),
+                                         np.clip(nj, 0, nc - 1), tn], -1)
+                nbr_act = np.zeros((nr, nc), bool)
+                nbr_act[inb] = act[ni[inb], nj[inb], tn]
+                both = src_act & nbr_act                     # interior coupled face
+                if both.any():
+                    w = harmonic_mean(Dv[src[both]], Dv[nbr[both]]) * kf
+                    rows.append(src[both]); cols.append(nbr[both]); vals.append(-w)
+                    np.add.at(diag, src[both], w)
+                vac = src_act & ~both                        # zero-incoming error face
+                if vac.any():
+                    Dc = Dv[src[vac]]
+                    term = (8.0 * Dc * alpha
+                            / (h * (h * alpha + 2.0 * np.sqrt(3.0) * Dc)))
+                    np.add.at(diag, src[vac], term)
+            diag = np.where(self._act_flat, diag, 1.0)       # excised: unit diagonal
+            rows.append(np.arange(N)); cols.append(np.arange(N)); vals.append(diag)
+            A = sp.csr_matrix((np.concatenate([np.atleast_1d(v) for v in vals]),
+                               (np.concatenate([np.atleast_1d(r) for r in rows]),
+                                np.concatenate([np.atleast_1d(c) for c in cols]))),
+                              shape=(N, N))
+            self._dsa_fac[g] = factorized(A.tocsc())
+        return self._dsa_fac[g]
+
     def _solve_group(self, g, qext_flat, phi0, tol, iface_in=None):
-        """Within-group GMRES on (I - T) phi = b, T = one sweep of the scatter
-        source; the boundary is vacuum/periodic (folded into L_Omega), so no
-        boundary fixed point is needed. iface_in injects a hybrid incoming flux
-        on interface half-edges (a fixed source, so only b carries it)."""
+        """Within-group scattering solve with the configured acceleration; the
+        boundary is vacuum/periodic (folded into L_Omega), so no boundary fixed
+        point is needed. iface_in injects a hybrid incoming flux on interface
+        half-edges (a fixed source, so only b carries it)."""
         ss = self.ss_self[g].reshape(-1)
         b = self._sweep(g, qext_flat, iface_in)              # source-only response
+        tol = min(tol, 1e-4)
 
-        def op(x):                                           # (I - T) x, T = scatter sweep
-            return x - self._sweep(g, ss * x)
+        if self.acceleration in ("gmres", "dsa-gmres"):
+            def op(x):                                       # (I - T) x, T = scatter sweep
+                return x - self._sweep(g, ss * x)
 
-        A = LinearOperator((self.N, self.N), matvec=op, dtype=float)
-        phi, _ = gmres(A, b, x0=phi0, rtol=min(tol, 1e-4), atol=0.0, maxiter=400)
+            A = LinearOperator((self.N, self.N), matvec=op, dtype=float)
+            M = None
+            if self.acceleration == "dsa-gmres":
+                fac = self._dsa_factor(g)
+
+                def prec(x):                                 # M = I + F^-1 Sigma_s
+                    return x + fac(ss * x)
+                M = LinearOperator((self.N, self.N), matvec=prec, dtype=float)
+            phi, _ = gmres(A, b, x0=phi0, M=M, rtol=tol, atol=0.0, maxiter=400)
+            return phi
+
+        # (DSA-accelerated) source iteration, mirroring the Cartesian solver:
+        # each sweep is followed by the diffusion error correction; if the
+        # update norm stops contracting the acceleration is dropped.
+        accelerate = self.acceleration == "dsa"
+        fac = self._dsa_factor(g) if accelerate else None
+        phi = np.asarray(phi0, float).copy()
+        prev = None
+        bad = 0
+        for _ in range(self.max_inner):
+            half = b + self._sweep(g, ss * phi)
+            new = half + fac(ss * (half - phi)) if accelerate else half
+            d = np.max(np.abs(new - phi))
+            scale = max(np.max(np.abs(new)), 1e-300)
+            phi = new
+            if d <= tol * scale:
+                break
+            if accelerate:
+                if prev is not None and d > prev:
+                    bad += 1
+                    if bad >= 3:
+                        accelerate = False
+                else:
+                    bad = 0
+                prev = d
         return phi
 
     def solve(self, tol_k: float = 1e-7, tol_source: float = 1e-6,
               max_outer: int = 500, verbose: bool = False) -> SNResult:
         t0 = time.perf_counter()
         G, N = self.G, self.N
+        sweeps0 = self._sweep_count
         phi = [np.where(self._act_flat, 1.0, 0.0) for _ in range(G)]
         nsf = [self.nsf[g].reshape(-1) for g in range(G)]
         chi = [self.chi[g].reshape(-1) for g in range(G)]
@@ -421,4 +529,5 @@ class TriSNTransportSolver:
         return SNResult(k_eff=k, flux=flux, converged=converged,
                         outer_iterations=outer,
                         solve_seconds=time.perf_counter() - t0,
-                        n_ordinates=self.M, k_history=k_hist)
+                        n_ordinates=self.M, k_history=k_hist,
+                        n_sweeps=self._sweep_count - sweeps0)
