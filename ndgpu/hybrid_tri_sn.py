@@ -100,7 +100,12 @@ class HybridTriSNDiffusionSolver:
 
     def __init__(self, grid: TriGrid, materials, material_map=None, sn_mask=None,
                  active=None, mask_bc="vacuum", n_polar: int = 3, n_azi: int = 12,
-                 mix_material=None, mix_weight=None, acceleration: str = "dsa"):
+                 mix_material=None, mix_weight=None,
+                 acceleration: str = "dsa-gmres"):
+        # Default "dsa-gmres": the Schwarz loop re-solves each warm-started drum
+        # box against a changing interface source, which suits a DSA-
+        # preconditioned Krylov far better than DSA source iteration (HP-MR
+        # refine=4: 15 s vs 50 s; plain gmres 25 s).
         self.grid = grid
         self.nr, self.nc = grid.shape[0], grid.shape[1]
         self.N = self.nr * self.nc * 2

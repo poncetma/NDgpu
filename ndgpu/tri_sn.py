@@ -42,7 +42,7 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import LinearOperator, factorized, gmres
 
 from .materials import Material
-from .sn import SNResult, _anderson, quadrature_2d
+from .sn import SNResult, _anderson, _cmfd_power, quadrature_2d
 from .solver import Fields
 from .stencil import face_alpha, harmonic_mean
 from .tri import TriGrid
@@ -95,7 +95,7 @@ class TriSNTransportSolver:
                  n_polar: int = 3, n_azi: int = 12, bc: str = "vacuum",
                  scheme: str = "step", require_fissile: bool = True,
                  mix_material=None, mix_weight=None, acceleration: str = "dsa",
-                 max_inner: int = 800):
+                 outer_acceleration: str = "cmfd", max_inner: int = 800):
         if len(grid.shape) != 3 or grid.shape[2] != 2:
             raise ValueError("TriSNTransportSolver is 2D: grid shape (nr, nc, 2)")
         if bc not in ("vacuum", "periodic"):
@@ -104,7 +104,10 @@ class TriSNTransportSolver:
             raise ValueError("scheme must be 'step' or 'scb'")
         if acceleration not in self.ACCELERATIONS:
             raise ValueError(f"acceleration must be one of {self.ACCELERATIONS}")
+        if outer_acceleration not in ("cmfd", "power"):
+            raise ValueError("outer_acceleration must be 'cmfd' or 'power'")
         self.acceleration = acceleration
+        self.outer_acceleration = outer_acceleration
         self.max_inner = max_inner
         self.scheme = scheme
         self.grid = grid
@@ -148,7 +151,27 @@ class TriSNTransportSolver:
         self._act_flat = self.active.reshape(-1)
         self._dsa_fac = [None] * self.G                      # lazy DSA LU per group
         self._sweep_count = 0
+        self._build_nbr_maps()
         self._prefactor()
+
+    def _build_nbr_maps(self):
+        """Per _EDGES entry: the neighbour lookup (clipped indices + activity
+        masks) shared by the face-current accumulation and the CMFD assembly."""
+        nr, nc = self.nr, self.nc
+        ii, jj = np.meshgrid(np.arange(nr), np.arange(nc), indexing="ij")
+        self._nbr_maps = []
+        for (t, di, dj, tn, nrm) in _EDGES:
+            ni, nj = ii + di, jj + dj
+            if self.bc == "periodic":
+                ni, nj = ni % nr, nj % nc
+                inb = np.ones((nr, nc), bool)
+            else:
+                inb = (ni >= 0) & (ni < nr) & (nj >= 0) & (nj < nc)
+            nic, njc = np.clip(ni, 0, nr - 1), np.clip(nj, 0, nc - 1)
+            nbr_act = np.zeros((nr, nc), bool)
+            nbr_act[inb] = self.active[ni[inb], nj[inb], tn]
+            self._nbr_maps.append(
+                (t, tn, nic, njc, nbr_act, self.active[:, :, t], nrm))
 
     def _prefactor(self):
         if self.scheme == "scb":
@@ -249,10 +272,13 @@ class TriSNTransportSolver:
                 (1, 2): (1.0, 0.0), (2, 0): (-0.5, -s), (2, 1): (-1.0, 0.0)},
         }
         ext_tab, int_tab = {}, {}
+        edge_of = np.zeros((2, 3, 2), int)       # (type, corner, face) -> cell edge
         for t in (0, 1):
             for lc in (0, 1, 2):
                 ext_tab[(t, lc)] = [(nrm, off, cmap[lc]) for (cs, nrm, off, cmap)
                                     in edge_spec[t] if lc in cs]
+                edge_of[t, lc] = [e for e, (cs, *_ ) in enumerate(edge_spec[t])
+                                  if lc in cs]
                 others = [w for w in (0, 1, 2) if w != lc]
                 int_tab[(t, lc)] = [(w, int_dir[t][(lc, w)]) for w in others]
 
@@ -268,9 +294,11 @@ class TriSNTransportSolver:
         ext_cell = np.full((K, 3, 2), -1)                   # full-mesh neighbour cell id
         int_n = np.zeros((K, 3, 2, 2))
         int_w = np.zeros((K, 3, 2), int)                    # same-cell corner global id
+        ci, cj, ct = np.zeros(K, int), np.zeros(K, int), np.zeros(K, int)
         for r in range(K):
             c = ac[r]
             i, j, t = c // (nc * 2), (c // 2) % nc, c % 2
+            ci[r], cj[r], ct[r] = i, j, t
             for lc in range(3):
                 for f, (nrm, (di, dj, tn), nbr_lc) in enumerate(ext_tab[(t, lc)]):
                     ext_n[r, lc, f] = nrm
@@ -289,7 +317,8 @@ class TriSNTransportSolver:
                     int_n[r, lc, f] = nrm
                     int_w[r, lc, f] = r * 3 + w
         self._scb = {"ac": ac, "K": K, "ext_n": ext_n, "ext_nbr": ext_nbr,
-                     "ext_cell": ext_cell, "int_n": int_n, "int_w": int_w}
+                     "ext_cell": ext_cell, "int_n": int_n, "int_w": int_w,
+                     "edge_of": edge_of, "ci": ci, "cj": cj, "ct": ct}
 
     def _prefactor_scb(self):
         """Assemble and factorize the 3*K corner system per ordinate and group."""
@@ -417,6 +446,107 @@ class TriSNTransportSolver:
             self._dsa_fac[g] = factorized(A.tocsc())
         return self._dsa_fac[g]
 
+    # ---- CMFD outer acceleration ------------------------------------------
+    def _sweep_currents(self, g, src_flat):
+        """One sweep that also accumulates the per-cell-edge net currents.
+
+        Returns (phi, J6): J6[k] (nr, nc) is the net current per unit edge
+        length, outward from the type-t source cell, across edge type k of
+        ``_EDGES`` (zero where the source cell is inactive). Face fluxes are
+        the schemes' own: upwind cell flux for step, upwind corner flux per
+        half-edge for SCB -- both make the transport cell balance exact, so
+        div J + Sigma_t phi = src holds identically and CMFD's fixed point is
+        the transport solution."""
+        self._sweep_count += 1
+        if self.scheme == "scb":
+            return self._sweep_currents_scb(g, src_flat)
+        nr, nc = self.nr, self.nc
+        rhs = np.where(self._act_flat, src_flat * self.area, 0.0)
+        phi = np.zeros(self.N)
+        J6 = np.zeros((6, nr, nc))
+        for m in range(self.M):
+            psi = self._solvers[g][m](rhs)
+            phi += self.w[m] * psi
+            psi3 = psi.reshape(nr, nc, 2)
+            for k, (t, tn, nic, njc, nbr_act, src_act, (nxv, nyv)) in \
+                    enumerate(self._nbr_maps):
+                On = self.mu[m] * nxv + self.eta[m] * nyv
+                if On > 0:                       # outflow: upwind = this cell
+                    face = psi3[:, :, t]
+                else:                            # inflow: upwind = neighbour (0 at bc)
+                    face = np.where(nbr_act, psi3[nic, njc, tn], 0.0)
+                J6[k] += (self.w[m] * On) * np.where(src_act, face, 0.0)
+        return phi, J6
+
+    def _sweep_currents_scb(self, g, src_flat):
+        d = self._scb
+        ac, K = d["ac"], d["K"]
+        base = np.repeat(src_flat[ac] * (self.area / 3.0), 3)
+        phi = np.zeros(self.N)
+        Jh = np.zeros((K, 3, 2))                 # per half-edge (length h/2 folded in)
+        for m in range(self.M):
+            psi = self._solvers[g][m](base).reshape(K, 3)
+            phi[ac] += self.w[m] * psi.mean(1)
+            oe = self.mu[m] * d["ext_n"][..., 0] + self.eta[m] * d["ext_n"][..., 1]
+            nbr = d["ext_nbr"]
+            nbr_psi = np.where(nbr >= 0, psi.ravel()[np.clip(nbr, 0, None)], 0.0)
+            face = np.where(oe > 0, psi[:, :, None], nbr_psi)
+            Jh += self.w[m] * oe * (self.h / 2.0) * face
+        # fold the two half-edges of each cell edge; report per unit length
+        J6 = np.zeros((6, self.nr, self.nc))
+        eo, ci, cj, ct = d["edge_of"], d["ci"], d["cj"], d["ct"]
+        for t in (0, 1):
+            sel = ct == t
+            Je = np.zeros((int(sel.sum()), 3))
+            for lc in range(3):
+                for f in range(2):
+                    Je[:, eo[t, lc, f]] += Jh[sel, lc, f]
+            for e in range(3):
+                J6[t * 3 + e][ci[sel], cj[sel]] = Je[:, e] / self.h
+        return phi, J6
+
+    def _cmfd_factor(self, g, p, J6):
+        """LU of the group-g drift-corrected triangular diffusion operator (the
+        tri counterpart of the Cartesian CMFD matrix): interior face model
+        J = -beta (phi_n - phi_c) + gamma (phi_n + phi_c) per unit length, with
+        beta = sqrt(3) harm(D)/h (the TriGroupOperator coupling) plus the
+        odCMFD-style thick-cell damping, gamma fitted to the transport current;
+        faces onto inactive/off-mesh cells carry the transport leakage ratio.
+        Assembled from both sides of every face (the transport currents are
+        exactly antisymmetric), each side contributing its own row."""
+        h, N = self.h, self.N
+        s3 = np.sqrt(3.0)
+        Lv = 4.0 / (s3 * h)                      # edge length / cell area
+        st = self.st[g].reshape(-1)
+        D = 1.0 / (3.0 * np.maximum(st, 1e-12))
+        rem = st - self.ss_self[g].reshape(-1)
+        cell = self._cell
+        tiny = 1e-30
+        diag = np.where(self._act_flat, rem, 1.0)
+        rows, cols, vals = [np.arange(N)], [np.arange(N)], [diag]
+        for k, (t, tn, nic, njc, nbr_act, src_act, _) in enumerate(self._nbr_maps):
+            src = cell[:, :, t]
+            nbr = cell[nic, njc, tn]
+            both = src_act & nbr_act
+            if both.any():
+                s_, n_ = src[both], nbr[both]
+                beta = s3 * harmonic_mean(D[s_], D[n_]) / h
+                tau = np.maximum(st[s_], st[n_]) * h
+                beta = beta + 0.25 * np.maximum(0.0, 1.0 - 1.0 / np.maximum(tau, tiny))
+                gh = (J6[k][both] + beta * (p[n_] - p[s_])) \
+                    / np.maximum(p[s_] + p[n_], tiny)
+                rows.append(s_); cols.append(s_); vals.append(Lv * (beta + gh))
+                rows.append(s_); cols.append(n_); vals.append(Lv * (-beta + gh))
+            bnd = src_act & ~both                # vacuum / excised face
+            if bnd.any():
+                s_ = src[bnd]
+                gb = J6[k][bnd] / np.maximum(p[s_], tiny)
+                rows.append(s_); cols.append(s_); vals.append(Lv * gb)
+        A = sp.csr_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(N, N))
+        return factorized(A.tocsc())
+
     def _solve_group(self, g, qext_flat, phi0, tol, iface_in=None):
         """Within-group scattering solve with the configured acceleration; the
         boundary is vacuum/periodic (folded into L_Omega), so no boundary fixed
@@ -475,6 +605,7 @@ class TriSNTransportSolver:
         phi = [np.where(self._act_flat, 1.0, 0.0) for _ in range(G)]
         nsf = [self.nsf[g].reshape(-1) for g in range(G)]
         chi = [self.chi[g].reshape(-1) for g in range(G)]
+        ss = [self.ss_self[g].reshape(-1) for g in range(G)]
         scat = [[None if self.scatter[gf][g] is None
                  else self.scatter[gf][g].reshape(-1) for g in range(G)]
                 for gf in range(G)]
@@ -499,9 +630,26 @@ class TriSNTransportSolver:
                         src = phi_new[gf] if gf < g else phi[gf]
                         q = q + scat[gf][g] * src
                 phi_new[g] = self._solve_group(g, q, phi[g], tol)
+            cmfd_ok = False
+            if self.outer_acceleration == "cmfd":
+                # one current-accumulating sweep per group with the converged
+                # within-group source -> consistent (flux, current) pairs; the
+                # drift-corrected diffusion eigensolve replaces the iterate.
+                phi_h, facs = [None] * G, [None] * G
+                for g in range(G):
+                    q = chi[g] * fs
+                    for gf in range(G):
+                        if gf != g and scat[gf][g] is not None:
+                            q = q + scat[gf][g] * phi_new[gf]
+                    ps, J6 = self._sweep_currents(g, ss[g] * phi_new[g] + q)
+                    phi_h[g] = ps
+                    facs[g] = self._cmfd_factor(g, ps, J6)
+                phi_c, k_c, cmfd_ok = _cmfd_power(facs, nsf, chi, scat, phi_h, k)
+                if cmfd_ok:
+                    phi_new = phi_c
             fiss_new = sum(nsf[g] * phi_new[g] for g in range(G))
             total_new = fiss_new.sum()
-            k_new = k * total_new / total
+            k_new = k_c if cmfd_ok else k * total_new / total
             dk = abs(k_new - k)
             rel = max(np.max(np.abs(phi_new[g] - phi[g])) /
                       max(np.max(np.abs(phi_new[g])), 1e-30) for g in range(G))
@@ -512,17 +660,24 @@ class TriSNTransportSolver:
             if dk < tol_k and rel < tol_source and tol < max(1e-8, tol_k):
                 converged = True
                 break
-            # Anderson-accelerate the fission source (the loosely-coupled core has
-            # a dominance ratio near 1, so plain power iteration crawls).
-            raw = fiss_new * (n_act / total_new)             # mean active source = 1
-            if rel > 1.1 * prev_err:
+            if cmfd_ok:
+                # CMFD already accelerated the update; Anderson would mix in
+                # stale pre-CMFD pairs, so take the iterate as-is.
                 hist = []
-            hist.append((fiss_in, raw))
-            if len(hist) > 6:
-                hist.pop(0)
-            fiss = _anderson(hist)
-            fiss *= n_act / fiss.sum()
-            total = fiss.sum()
+                fiss = fiss_new
+                total = total_new
+            else:
+                # Anderson-accelerate the fission source (the loosely-coupled
+                # core has a dominance ratio near 1, so power iteration crawls).
+                raw = fiss_new * (n_act / total_new)         # mean active source = 1
+                if rel > 1.1 * prev_err:
+                    hist = []
+                hist.append((fiss_in, raw))
+                if len(hist) > 6:
+                    hist.pop(0)
+                fiss = _anderson(hist)
+                fiss *= n_act / fiss.sum()
+                total = fiss.sum()
             prev_rel = max(rel, dk)
             prev_err = rel
         flux = np.stack([phi[g].reshape(self.grid.shape) for g in range(G)])

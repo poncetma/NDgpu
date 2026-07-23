@@ -218,6 +218,65 @@ def _anderson(hist):
     return out
 
 
+def _cmfd_power(facs, nsf, chi, scatter, phi0, k0):
+    """Anderson-accelerated power iteration on an assembled CMFD eigenproblem,
+    shared by the Cartesian and triangular solvers (everything flat, (N,)).
+
+    facs[g] solves the group-g drift-corrected diffusion system; scatter[gf][g]
+    is the flat group-transfer field or None. Returns (phi, k, ok): ok=False
+    (caller keeps the transport iterate) on breakdown or a negative flux (the
+    drift matrix is not an M-matrix). The returned flux is scaled so the total
+    fission source matches the input's, keeping the outer iterate continuous."""
+    G = len(facs)
+    phi = [np.asarray(p, float).ravel() for p in phi0]
+    fiss = sum(nsf[g] * phi[g] for g in range(G))
+    total0 = float(fiss.sum())
+    if not np.isfinite(total0) or total0 <= 0.0:
+        return phi0, k0, False
+    k = k0
+    tn = total0
+    hist = []
+    prev_err = np.inf
+    for _ in range(500):
+        fiss_in = fiss
+        fs = fiss / k
+        phi_new = [None] * G
+        for g in range(G):
+            q = chi[g] * fs
+            for gf in range(G):
+                s = scatter[gf][g]
+                if gf != g and s is not None:
+                    q = q + s * (phi_new[gf] if gf < g else phi[gf])
+            phi_new[g] = facs[g](q)
+        fiss_new = sum(nsf[g] * phi_new[g] for g in range(G))
+        tn = float(fiss_new.sum())
+        if not np.isfinite(tn) or tn <= 0.0:
+            return phi0, k0, False
+        k_new = k * tn / float(fiss.sum())
+        dk = abs(k_new - k)
+        raw = fiss_new * (total0 / tn)
+        rel = (float(np.max(np.abs(raw - fiss_in)))
+               / max(float(np.max(np.abs(fiss_in))), 1e-30))
+        phi, k = phi_new, k_new
+        if dk < 1e-11 and rel < 1e-9:
+            break
+        if rel > 1.1 * prev_err:
+            hist = []
+        hist.append((fiss_in, raw))
+        if len(hist) > 6:
+            hist.pop(0)
+        fiss = _anderson(hist)
+        fiss = fiss * (total0 / fiss.sum())
+        prev_err = rel
+    scale = total0 / tn
+    phi = [p * scale for p in phi]
+    if not all(np.isfinite(p).all() for p in phi):
+        return phi0, k0, False
+    if min(float(p.min()) for p in phi) < 0.0:
+        return phi0, k0, False
+    return phi, k, True
+
+
 def _row_solve(q_ang, st_eff, c, binc, forward):
     """One row's 1D diamond-difference sweep along x (the 1D reference recurrence).
 
@@ -603,60 +662,18 @@ class SNTransportSolver:
         return factorized(A.tocsc())
 
     def _cmfd_eigen(self, facs, phi0, k0):
-        """Anderson-accelerated power iteration on the CMFD eigenproblem.
-        Returns (phi, k, ok); ok=False (caller keeps the transport iterate) on
-        breakdown or a negative flux (the drift matrix is not an M-matrix).
-        The returned flux is scaled so the total fission source matches the
-        input's, keeping the outer iterate continuous."""
+        """CMFD eigensolve on the (nx, ny) grid: flattens into the shared
+        ``_cmfd_power`` power iteration and reshapes the result."""
         G, nx, ny = self.G, self.nx, self.ny
-        nsf = [asnumpy(self.nsf[g]) for g in range(G)]
-        chi = [asnumpy(self.chi[g]) for g in range(G)]
-        phi = [np.asarray(p, float) for p in phi0]
-        fiss = sum(nsf[g] * phi[g] for g in range(G))
-        total0 = float(fiss.sum())
-        if not np.isfinite(total0) or total0 <= 0.0:
+        nsf = [asnumpy(self.nsf[g]).ravel() for g in range(G)]
+        chi = [asnumpy(self.chi[g]).ravel() for g in range(G)]
+        scatter = [[None if s is None else np.asarray(s).ravel() for s in row]
+                   for row in self.scatter]
+        phi, k, ok = _cmfd_power(facs, nsf, chi, scatter,
+                                 [np.asarray(p, float).ravel() for p in phi0], k0)
+        if not ok:
             return phi0, k0, False
-        k = k0
-        hist = []
-        prev_err = np.inf
-        for _ in range(500):
-            fiss_in = fiss
-            fs = fiss / k
-            phi_new = [None] * G
-            for g in range(G):
-                q = chi[g] * fs
-                for gf in range(G):
-                    s = self.scatter[gf][g]
-                    if gf != g and s is not None:
-                        q = q + s * (phi_new[gf] if gf < g else phi[gf])
-                phi_new[g] = facs[g](q.ravel()).reshape(nx, ny)
-            fiss_new = sum(nsf[g] * phi_new[g] for g in range(G))
-            tn = float(fiss_new.sum())
-            if not np.isfinite(tn) or tn <= 0.0:
-                return phi0, k0, False
-            k_new = k * tn / float(fiss.sum())
-            dk = abs(k_new - k)
-            raw = fiss_new * (total0 / tn)
-            rel = (float(np.max(np.abs(raw - fiss_in)))
-                   / max(float(np.max(np.abs(fiss_in))), 1e-30))
-            phi, k = phi_new, k_new
-            if dk < 1e-11 and rel < 1e-9:
-                break
-            if rel > 1.1 * prev_err:
-                hist = []
-            hist.append((fiss_in.ravel(), raw.ravel()))
-            if len(hist) > 6:
-                hist.pop(0)
-            fiss = _anderson(hist).reshape(nx, ny)
-            fiss = fiss * (total0 / fiss.sum())
-            prev_err = rel
-        scale = total0 / tn
-        phi = [p * scale for p in phi]
-        if not all(np.isfinite(p).all() for p in phi):
-            return phi0, k0, False
-        if min(float(p.min()) for p in phi) < 0.0:
-            return phi0, k0, False
-        return phi, k, True
+        return [p.reshape(nx, ny) for p in phi], k, True
 
     def _cmfd_update(self, phi_new, inc, fs, st, ss_self, chi, scatter, k):
         """One CMFD step after a transport outer: for each group, one

@@ -106,8 +106,10 @@ def test_dsa_matches_gmres_and_cuts_sweeps(scheme):
     tols = dict(tol_k=1e-7, tol_source=1e-6)
 
     def run(acc):
+        # plain power outers so the sweep count isolates the within-group scheme
         return TriSNTransportSolver(grid, m, n_polar=2, n_azi=8, bc="vacuum",
-                                    scheme=scheme, acceleration=acc).solve(**tols)
+                                    scheme=scheme, acceleration=acc,
+                                    outer_acceleration="power").solve(**tols)
 
     r_dsa = run("dsa")
     r_gm = run("gmres")
@@ -117,3 +119,27 @@ def test_dsa_matches_gmres_and_cuts_sweeps(scheme):
     for r in (r_gm, r_si, r_pg):
         assert r.k_eff == pytest.approx(r_dsa.k_eff, abs=1e-6)
     assert r_si.n_sweeps > 5 * r_dsa.n_sweeps
+
+
+@pytest.mark.parametrize("scheme", ["step", "scb"])
+def test_cmfd_outer_matches_power_with_fewer_outers(scheme):
+    # CMFD replaces the Anderson power update with a drift-corrected diffusion
+    # eigensolve built from the schemes' own (conservative) face currents:
+    # same fixed point, fewer transport outers.
+    m = Material(diffusion=[1.4, 0.4], sigma_a=[0.005, 0.015],
+                 nu_sigma_f=[0.004, 0.02], sigma_s=[[0.0, 0.025], [0.0, 0.0]],
+                 chi=[1.0, 0.0], name="soft")
+    n = 10
+    grid = TriGrid(shape=(n, n, 2), side=24.0 / n)
+    tols = dict(tol_k=1e-7, tol_source=1e-6)
+
+    def run(outer):
+        return TriSNTransportSolver(grid, m, n_polar=2, n_azi=8, bc="vacuum",
+                                    scheme=scheme,
+                                    outer_acceleration=outer).solve(**tols)
+
+    r_pow = run("power")
+    r_cmfd = run("cmfd")
+    assert r_pow.converged and r_cmfd.converged
+    assert r_cmfd.k_eff == pytest.approx(r_pow.k_eff, abs=1e-6)
+    assert r_cmfd.outer_iterations < r_pow.outer_iterations
