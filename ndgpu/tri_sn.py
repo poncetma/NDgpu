@@ -8,10 +8,23 @@ The mesh is the same structured equilateral-triangle lattice the diffusion/SP3
 solvers use (:class:`ndgpu.tri.TriGrid`): cells stored on (nrows, ncols, 2) with
 the last index the down/up triangle of each rhombus, every interior cell coupled
 to three neighbours at fixed offsets. That structure is what makes S_N tractable
-here: rather than order the transport sweep by hand (and break cycles), we
-assemble, for each ordinate, the sparse streaming+collision operator
-L_Omega = Omega.grad + Sigma_t with upwind (step) differencing and factorize it
-once. A "sweep" is then a triangular solve; the within-group scattering fixed
+here. Two sweep engines share identical algebra (``engine=``):
+
+* ``"lu"`` (CPU default): per ordinate, the sparse streaming+collision
+  operator L_Omega = Omega.grad + Sigma_t is assembled once and LU-factorized;
+  a "sweep" is a triangular solve. scipy-bound, CPU only; the only engine that
+  supports the periodic torus and the hybrid iface coupling.
+* ``"levels"`` (default on GPU via ``device=``; also slightly faster on CPU
+  for large meshes): a level-scheduled wavefront. For vacuum bc the upwind
+  dependency graph is a DAG (Omega . centroid strictly increases along every
+  dependency edge), so cells sort into topological levels; a sweep is
+  max-level sequential steps, each one batched gather/scatter update over
+  *all* ordinates at once (plus batched per-cell 3x3 corner-block inverses
+  for SCB) on the numpy/cupy array backend -- the GPU-friendly shape, and
+  machine-precision identical to the LU engine. (cupy path untested: no GPU
+  on the dev machine.)
+
+Either way the within-group scattering fixed
 point is collapsed by the same acceleration menu as the Cartesian solver
 (``acceleration=``: "dsa" default, "dsa-gmres", "gmres", "si" -- see
 ``ndgpu.sn``), with the DSA error solve a triangular finite-volume diffusion
@@ -41,6 +54,7 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import LinearOperator, factorized, gmres
 
+from .backend import asnumpy, get_backend
 from .materials import Material
 from .sn import SNResult, _anderson, _cmfd_power, quadrature_2d
 from .solver import Fields
@@ -95,7 +109,8 @@ class TriSNTransportSolver:
                  n_polar: int = 3, n_azi: int = 12, bc: str = "vacuum",
                  scheme: str = "step", require_fissile: bool = True,
                  mix_material=None, mix_weight=None, acceleration: str = "dsa",
-                 outer_acceleration: str = "cmfd", max_inner: int = 800):
+                 outer_acceleration: str = "cmfd", max_inner: int = 800,
+                 engine: str | None = None, device: str = "cpu"):
         if len(grid.shape) != 3 or grid.shape[2] != 2:
             raise ValueError("TriSNTransportSolver is 2D: grid shape (nr, nc, 2)")
         if bc not in ("vacuum", "periodic"):
@@ -106,6 +121,17 @@ class TriSNTransportSolver:
             raise ValueError(f"acceleration must be one of {self.ACCELERATIONS}")
         if outer_acceleration not in ("cmfd", "power"):
             raise ValueError("outer_acceleration must be 'cmfd' or 'power'")
+        self.xp = get_backend(device)
+        if engine is None:                       # LU is scipy-bound: CPU only
+            engine = "lu" if self.xp is np else "levels"
+        if engine not in ("lu", "levels"):
+            raise ValueError("engine must be 'lu' or 'levels'")
+        if engine == "levels" and bc != "vacuum":
+            raise ValueError("engine='levels' needs bc='vacuum' (the periodic "
+                             "torus wraps the sweep dependency graph into cycles)")
+        if engine == "lu" and self.xp is not np:
+            raise ValueError("engine='lu' is CPU-only; use engine='levels'")
+        self.engine = engine
         self.acceleration = acceleration
         self.outer_acceleration = outer_acceleration
         self.max_inner = max_inner
@@ -174,6 +200,11 @@ class TriSNTransportSolver:
                 (t, tn, nic, njc, nbr_act, self.active[:, :, t], nrm))
 
     def _prefactor(self):
+        if self.engine == "levels":
+            if self.scheme == "scb":
+                self._build_corners()
+            self._setup_levels()
+            return
         if self.scheme == "scb":
             self._build_corners()
             self._prefactor_scb()
@@ -232,10 +263,223 @@ class TriSNTransportSolver:
                 # zero any stray couplings out of inactive rows
                 self._solvers[g][m] = factorized(A.tocsc())
 
+    # ---- level-scheduled sweep (engine="levels", the GPU path) -------------
+    def _setup_levels(self):
+        """Topological level schedule for the batched sweep. Per ordinate the
+        upwind dependency graph on the tri lattice is a DAG for vacuum bc (the
+        potential Omega.x_centroid strictly increases along every dependency
+        edge, faces with Omega.n = 0 carrying none), so cells sort into levels
+        and each level is one batched update -- concatenated across all
+        ordinates, so a sweep is max-level-count sequential steps of large
+        gather/scatter (and, for SCB, batched 3x3 corner-block) kernels on the
+        array backend. The unknowns and update algebra are identical to the LU
+        engine's assembled systems, solved in topological order."""
+        xp, N, M, h = self.xp, self.N, self.M, self.h
+        cell, act = self._cell, self._act_flat
+        scb = self.scheme == "scb"
+        if not scb:
+            outsum = np.zeros((M, N))
+            in_nbr = np.zeros((M, N, 3), np.int64)
+            in_coef = np.zeros((M, N, 3))
+            in_cnt = np.zeros((M, N), np.int64)
+        es = [[] for _ in range(M)]
+        ed = [[] for _ in range(M)]
+        for (t, tn, nic, njc, nbr_act, src_act, (nxv, nyv)) in self._nbr_maps:
+            src = cell[:, :, t]
+            nbr = cell[nic, njc, tn]
+            valid = src_act & nbr_act
+            s_all = src[src_act]
+            sv, nv = src[valid], nbr[valid]
+            for m in range(M):
+                On = (self.mu[m] * nxv + self.eta[m] * nyv) * h
+                if On > 0.0:
+                    if not scb:
+                        outsum[m][s_all] += On
+                elif On < 0.0:
+                    es[m].append(nv)
+                    ed[m].append(sv)
+                    if not scb:
+                        slot = in_cnt[m][sv]
+                        in_nbr[m, sv, slot] = nv
+                        in_coef[m, sv, slot] = -On
+                        in_cnt[m][sv] += 1
+        # Kahn's algorithm per ordinate, vectorized over each level.
+        lvl_of = np.full((M, N), -1, np.int64)
+        n_act = int(act.sum())
+        for m in range(M):
+            se = (np.concatenate(es[m]) if es[m] else np.zeros(0, np.int64))
+            de = (np.concatenate(ed[m]) if ed[m] else np.zeros(0, np.int64))
+            indeg = np.zeros(N, np.int64)
+            np.add.at(indeg, de, 1)
+            perm = np.argsort(se, kind="stable")
+            se_s, de_s = se[perm], de[perm]
+            indptr = np.searchsorted(se_s, np.arange(N + 1))
+            ready = act & (indeg == 0)
+            done = 0
+            l = 0
+            while done < n_act:
+                ids = np.where(ready)[0]
+                if ids.size == 0:
+                    raise RuntimeError("sweep dependency cycle (unexpected "
+                                       "for vacuum bc)")
+                lvl_of[m, ids] = l
+                done += ids.size
+                ready[ids] = False
+                counts = indptr[ids + 1] - indptr[ids]
+                tot = int(counts.sum())
+                if tot:
+                    starts = np.repeat(indptr[ids], counts)
+                    offs = (np.arange(tot)
+                            - np.repeat(np.concatenate(
+                                ([0], np.cumsum(counts)[:-1])), counts))
+                    deps = de_s[starts + offs]
+                    np.subtract.at(indeg, deps, 1)
+                    hit = deps[indeg[deps] == 0]
+                    ready[hit[lvl_of[m, hit] < 0]] = True
+                l += 1
+        # (m, cell) pairs grouped by level, concatenated across ordinates.
+        mm, cc = np.where(lvl_of >= 0)
+        lv = lvl_of[mm, cc]
+        order = np.argsort(lv, kind="stable")
+        mm, cc, lv = mm[order], cc[order], lv[order]
+        bounds = np.searchsorted(lv, np.arange(int(lv.max()) + 2))
+        self._w_xp = xp.asarray(self.w)
+        self._lv_group = {}
+        if scb:
+            d = self._scb
+            ac, K = d["ac"], d["K"]
+            aidx = np.full(N, -1, np.int64)
+            aidx[ac] = np.arange(K)
+            rr = aidx[cc]
+            self._levels = [(xp.asarray(mm[a:b] * K + rr[a:b]),
+                             xp.asarray(rr[a:b]))
+                            for a, b in zip(bounds[:-1], bounds[1:])]
+            # inflow gather tables per (m, corner-cell, corner, face)
+            extn, nbr = d["ext_n"], d["ext_nbr"]
+            oe = (self.mu[:, None, None, None] * extn[None, ..., 0]
+                  + self.eta[:, None, None, None] * extn[None, ..., 1])
+            coef = np.where((oe < 0.0) & (nbr >= 0)[None],
+                            -oe * (h / 2.0), 0.0)              # (M, K, 3, 2)
+            off = (np.arange(M) * (3 * K))[:, None, None, None]
+            nbr_f = np.where(coef > 0.0, off + np.maximum(nbr, 0)[None], 0)
+            self._lv_nbr = xp.asarray(nbr_f.reshape(M * K, 3, 2))
+            self._lv_coef = xp.asarray(coef.reshape(M * K, 3, 2))
+            self._lv_oe = oe                                   # host, for Binv
+        else:
+            self._levels = [(xp.asarray(mm[a:b] * N + cc[a:b]),
+                             xp.asarray(cc[a:b]))
+                            for a, b in zip(bounds[:-1], bounds[1:])]
+            off = (np.arange(M) * N)[:, None, None]
+            nbr_f = np.where(in_coef > 0.0, off + in_nbr, 0)
+            self._lv_nbr = xp.asarray(nbr_f.reshape(M * N, 3))
+            self._lv_coef = xp.asarray(in_coef.reshape(M * N, 3))
+            self._lv_out = outsum                              # host, per-group denom
+
+    def _lv_tables(self, g):
+        """Group-dependent sweep tables: the step denominator, or the SCB
+        per-cell 3x3 corner-block inverses (batched), per ordinate."""
+        if g in self._lv_group:
+            return self._lv_group[g]
+        xp, M = self.xp, self.M
+        if self.scheme == "step":
+            denom = self.st[g].reshape(-1)[None, :] * self.area + self._lv_out
+            out = xp.asarray(denom.reshape(-1))
+        else:
+            d = self._scb
+            K = d["K"]
+            h2 = self.h / 2.0
+            hi = self.h / (2.0 * np.sqrt(3.0))
+            A3 = self.area / 3.0
+            st_c = self.st[g].reshape(-1)[d["ac"]]
+            oi = (self.mu[:, None, None, None] * d["int_n"][None, ..., 0]
+                  + self.eta[:, None, None, None] * d["int_n"][None, ..., 1])
+            wloc = d["int_w"] - np.arange(K)[:, None, None] * 3   # (K, 3, 2)
+            rK = np.arange(K)
+            Binv = np.empty((M, K, 3, 3))
+            for m in range(M):
+                B = np.zeros((K, 3, 3))
+                diag = (st_c[:, None] * A3
+                        + (np.maximum(self._lv_oe[m], 0.0) * h2).sum(2)
+                        + (oi[m] * hi * 0.5).sum(2))            # (K, 3)
+                B[:, np.arange(3), np.arange(3)] = diag
+                for lc in range(3):
+                    for f in range(2):
+                        B[rK, lc, wloc[:, lc, f]] += oi[m, :, lc, f] * hi * 0.5
+                Binv[m] = np.linalg.inv(B)
+            out = xp.asarray(Binv.reshape(M * K, 3, 3))
+        self._lv_group[g] = out
+        return out
+
+    def _sweep_levels(self, g, src_flat):
+        """One batched level-scheduled sweep; returns (phi, psi) with psi the
+        full per-ordinate angular flux (backend array) for current folds."""
+        xp = self.xp
+        if self.scheme == "step":
+            denom = self._lv_tables(g)
+            rhs = xp.asarray(np.where(self._act_flat, src_flat * self.area, 0.0))
+            psi = xp.zeros(self.M * self.N)
+            for pidx, cc in self._levels:
+                inflow = (self._lv_coef[pidx] * psi[self._lv_nbr[pidx]]).sum(1)
+                psi[pidx] = (rhs[cc] + inflow) / denom[pidx]
+            phi = asnumpy((self._w_xp[:, None]
+                           * psi.reshape(self.M, self.N)).sum(0))
+            return phi, psi
+        d = self._scb
+        ac, K = d["ac"], d["K"]
+        Binv = self._lv_tables(g)
+        base = xp.asarray(src_flat[ac] * (self.area / 3.0))
+        psi = xp.zeros(self.M * K * 3)
+        three = xp.arange(3)
+        for pidx, rr in self._levels:
+            b = base[rr][:, None] + (self._lv_coef[pidx]
+                                     * psi[self._lv_nbr[pidx]]).sum(2)
+            p = xp.einsum("nij,nj->ni", Binv[pidx], b)
+            psi[pidx[:, None] * 3 + three] = p
+        phi = np.zeros(self.N)
+        phi[ac] = asnumpy((self._w_xp[:, None]
+                           * psi.reshape(self.M, K, 3).mean(2)).sum(0))
+        return phi, psi
+
+    def _currents_from_psi(self, g, psi):
+        """Fold the level-swept angular fluxes into the per-cell-edge net
+        currents J6 (same convention as _sweep_currents), host-side."""
+        psi = asnumpy(psi)
+        M = self.M
+        if self.scheme == "step":
+            psi3 = psi.reshape(M, self.nr, self.nc, 2)
+            J6 = np.zeros((6, self.nr, self.nc))
+            for k, (t, tn, nic, njc, nbr_act, src_act, (nxv, nyv)) in \
+                    enumerate(self._nbr_maps):
+                for m in range(M):
+                    On = self.mu[m] * nxv + self.eta[m] * nyv
+                    if On > 0:
+                        face = psi3[m, :, :, t]
+                    else:
+                        face = np.where(nbr_act, psi3[m, nic, njc, tn], 0.0)
+                    J6[k] += (self.w[m] * On) * np.where(src_act, face, 0.0)
+            return J6
+        d = self._scb
+        K = d["K"]
+        psi3 = psi.reshape(M, K, 3)
+        nbr = d["ext_nbr"]
+        Jh = np.zeros((K, 3, 2))
+        for m in range(M):
+            oe = self._lv_oe[m]
+            pm = psi3[m]
+            nbr_psi = np.where(nbr >= 0, psi[m * 3 * K:][np.maximum(nbr, 0)], 0.0)
+            face = np.where(oe > 0, pm[:, :, None], nbr_psi)
+            Jh += self.w[m] * oe * (self.h / 2.0) * face
+        return self._fold_half_currents(Jh)
+
     def _sweep(self, g, src_flat, iface_in=None):
         """phi = Sum_m w_m L_Omega^-1 (src * area) for an isotropic source.
         iface_in (SCB only) injects a hybrid incoming flux on interface edges."""
         self._sweep_count += 1
+        if self.engine == "levels":
+            if iface_in is not None:
+                raise ValueError("engine='levels' does not support the hybrid "
+                                 "iface_in coupling; use engine='lu'")
+            return self._sweep_levels(g, src_flat)[0]
         if self.scheme == "scb":
             return self._sweep_scb(g, src_flat, iface_in)
         rhs = src_flat * self.area
@@ -381,6 +625,8 @@ class TriSNTransportSolver:
         coupling). Returns (phi, J) with J shaped like interface_currents'."""
         if self.scheme != "scb":
             raise ValueError("_sweep_iface is SCB-only (hybrid drum boxes)")
+        if self.engine != "lu":
+            raise ValueError("the hybrid iface coupling needs engine='lu'")
         self._sweep_count += 1
         d = self._scb
         ac, K = d["ac"], d["K"]
@@ -480,6 +726,9 @@ class TriSNTransportSolver:
         div J + Sigma_t phi = src holds identically and CMFD's fixed point is
         the transport solution."""
         self._sweep_count += 1
+        if self.engine == "levels":
+            phi, psi = self._sweep_levels(g, src_flat)
+            return phi, self._currents_from_psi(g, psi)
         if self.scheme == "scb":
             return self._sweep_currents_scb(g, src_flat)
         nr, nc = self.nr, self.nc
@@ -514,7 +763,12 @@ class TriSNTransportSolver:
             nbr_psi = np.where(nbr >= 0, psi.ravel()[np.clip(nbr, 0, None)], 0.0)
             face = np.where(oe > 0, psi[:, :, None], nbr_psi)
             Jh += self.w[m] * oe * (self.h / 2.0) * face
-        # fold the two half-edges of each cell edge; report per unit length
+        return phi, self._fold_half_currents(Jh)
+
+    def _fold_half_currents(self, Jh):
+        """Fold per-half-edge currents (K, 3, 2; length h/2 folded in) into the
+        per-cell-edge J6 (6, nr, nc), reported per unit length."""
+        d = self._scb
         J6 = np.zeros((6, self.nr, self.nc))
         eo, ci, cj, ct = d["edge_of"], d["ci"], d["cj"], d["ct"]
         for t in (0, 1):
@@ -525,7 +779,7 @@ class TriSNTransportSolver:
                     Je[:, eo[t, lc, f]] += Jh[sel, lc, f]
             for e in range(3):
                 J6[t * 3 + e][ci[sel], cj[sel]] = Je[:, e] / self.h
-        return phi, J6
+        return J6
 
     def _cmfd_factor(self, g, p, J6):
         """LU of the group-g drift-corrected triangular diffusion operator (the

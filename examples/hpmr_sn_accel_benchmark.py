@@ -38,7 +38,8 @@ TOL = dict(tol_k=5e-7, tol_source=5e-6, max_outer=200)
 CONFIGS = {
     "original": dict(sn=dict(acceleration="gmres", outer_acceleration="power"),
                      hyb=dict(acceleration="gmres", coupling="schwarz")),
-    "accelerated": dict(sn=dict(acceleration="dsa", outer_acceleration="cmfd"),
+    "accelerated": dict(sn=dict(acceleration="dsa", outer_acceleration="cmfd",
+                                engine="levels"),
                         hyb=dict(coupling="krylov")),
 }
 

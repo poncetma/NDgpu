@@ -143,3 +143,42 @@ def test_cmfd_outer_matches_power_with_fewer_outers(scheme):
     assert r_pow.converged and r_cmfd.converged
     assert r_cmfd.k_eff == pytest.approx(r_pow.k_eff, abs=1e-6)
     assert r_cmfd.outer_iterations < r_pow.outer_iterations
+
+
+@pytest.mark.parametrize("scheme", ["step", "scb"])
+def test_levels_engine_matches_lu(scheme):
+    # The level-scheduled (GPU-oriented) sweep solves the same per-ordinate
+    # systems as the LU engine in topological order: machine-precision equal
+    # sweeps, current folds, and k, on a heterogeneous ragged-mask problem.
+    rng = np.random.default_rng(5)
+    fuel = Material(diffusion=[1.1, 0.4], sigma_a=[0.012, 0.1],
+                    nu_sigma_f=[0.026, 0.1], sigma_s=[[0.0, 0.02], [0.0, 0.0]],
+                    chi=[1.0, 0.0])
+    absb = Material(diffusion=[0.9, 0.3], sigma_a=[0.20, 0.3],
+                    nu_sigma_f=[0.0, 0.0], sigma_s=[[0.0, 0.01], [0.0, 0.0]])
+    nr = nc = 8
+    grid = TriGrid(shape=(nr, nc, 2), side=1.5)
+    mmap = rng.integers(0, 2, size=(nr, nc, 2))
+    active = np.ones((nr, nc, 2), bool)
+    active[0, :3, :] = False
+    src = rng.random(nr * nc * 2)
+    kw = dict(material_map=mmap, active=active, n_polar=2, n_azi=8,
+              bc="vacuum", scheme=scheme)
+    s_lu = TriSNTransportSolver(grid, [fuel, absb], engine="lu", **kw)
+    s_lv = TriSNTransportSolver(grid, [fuel, absb], engine="levels", **kw)
+    for g in range(2):
+        assert np.max(np.abs(s_lu._sweep(g, src) - s_lv._sweep(g, src))) < 1e-12
+        _, J1 = s_lu._sweep_currents(g, src)
+        _, J2 = s_lv._sweep_currents(g, src)
+        assert np.max(np.abs(J1 - J2)) < 1e-12
+    r_lu = s_lu.solve(tol_k=1e-8, tol_source=1e-7)
+    r_lv = s_lv.solve(tol_k=1e-8, tol_source=1e-7)
+    assert r_lu.converged and r_lv.converged
+    assert r_lv.k_eff == pytest.approx(r_lu.k_eff, abs=1e-10)
+
+
+def test_levels_engine_rejects_periodic():
+    grid = TriGrid(shape=(4, 4, 2), side=3.0)
+    with pytest.raises(ValueError, match="cycles"):
+        TriSNTransportSolver(grid, M1, n_polar=2, n_azi=8, bc="periodic",
+                             engine="levels")
