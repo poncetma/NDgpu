@@ -11,17 +11,42 @@ family (``examples/sdpn_benchmark_1d.py``). Same ingredients, one dimension up:
   1, so the scalar flux is phi = sum_m w_m psi_m and the isotropic within-group
   source is simply Sigma_s phi + q (no 1/4pi factor).
 
-* **Space** -- diamond differencing on a Cartesian grid, swept one direction at
-  a time. A 2D sweep factorizes into a loop over rows in the direction's y sense
-  (each row's incoming bottom-edge flux comes from the previously swept row) with
-  a 1D diamond-difference bidiagonal solve along x inside it -- the exact 1D
-  recurrence (``_row_solve``), so the whole sweep is O(cells) with only ``ny``
-  Python steps per direction.
+* **Space** -- diamond differencing on a Cartesian grid, swept one quadrant at
+  a time. The default sweep is a vectorized *wavefront* (KBA-style): in swept
+  coordinates every direction of a quadrant marches +x, +y, and all cells on
+  the anti-diagonal i + j = d depend only on diagonal d - 1, so each diagonal
+  is one batched update over (all four quadrants) x (M/4 directions) x (cells
+  on the diagonal). That leaves only nx + ny - 1 sequential steps per sweep --
+  the natural structure for both vectorized CPU execution (numpy) and GPU
+  execution (cupy, one kernel batch per diagonal); the sweep itself is written
+  against the backend-agnostic array API (``device=``). ``sweep="rows"`` keeps
+  the original per-direction scipy banded row solves as a CPU cross-check.
 
 * **Within-group** -- the scattering fixed point (spectral radius = the
-  scattering ratio, near 1 in thermal media) is collapsed by GMRES on the scalar
-  system (I - T) phi = b, T = one sweep of the scattering source, with the
-  reflective boundary frozen and iterated in an outer pass (as in 1D).
+  scattering ratio c, near 1 in thermal media) is collapsed by one of
+  (``acceleration=``):
+
+  - ``"dsa"`` (default): diffusion synthetic acceleration -- after each
+    transport sweep the iteration error is estimated by a cell-centered
+    finite-volume diffusion solve, -div(1/(3 Sigma_t) grad) d + Sigma_r d =
+    Sigma_s (phi^(l+1/2) - phi^l), Marshak-vacuum on all faces (the frozen
+    incoming flux makes the *error* equation zero-incoming even under
+    reflective outer boundaries), and added back. One sparse LU per group,
+    factorized lazily and reused; the spectral radius drops from c to
+    <~ 0.23 c. The FV diffusion operator is not strictly consistent with
+    diamond differencing, so for optically thick cells (Sigma_t h >> 1)
+    effectiveness can degrade; the loop watches the residual and drops the
+    acceleration if it stops contracting.
+  - ``"dsa-gmres"``: GMRES on (I - T) phi = b, left-preconditioned with the
+    DSA operator I + F^-1 Sigma_s -- the robust choice when plain DSA's
+    consistency limits bite.
+  - ``"gmres"``: unpreconditioned GMRES on the scalar system (the original
+    scheme).
+  - ``"si"``: plain source iteration (reference / worst case).
+
+  The reflective boundary condition stays a frozen-incoming outer fixed point,
+  Anderson-accelerated over the face fluxes (as before); DSA accelerates the
+  scattering iteration inside it.
 
 * **Outer** -- power iteration on the fission source with a Gauss-Seidel group
   sweep, identical in structure to ``ndgpu.solver``.
@@ -34,8 +59,9 @@ scatter Sigma_s,gg = Sigma_t - Sigma_a - Sigma_out, group transfer from
 material.sigma_s. So S_N, diffusion and SDPN all approximate the *same* physical
 problem and their k-eigenvalues are directly comparable.
 
-This is a CPU/numpy reference solver (scipy banded solves + GMRES); it is not the
-GPU-native production path. Vacuum and reflective boundaries are supported.
+The wavefront sweep runs on numpy or cupy (``device=``); the DSA correction and
+GMRES stay host-side (scipy LU / Krylov) on the small scalar system. Vacuum and
+reflective boundaries are supported.
 """
 
 from __future__ import annotations
@@ -44,14 +70,22 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
+import scipy.sparse as sp
 from scipy.linalg import solve_banded
-from scipy.sparse.linalg import LinearOperator, gmres
+from scipy.sparse.linalg import LinearOperator, factorized, gmres
 
+from .backend import asnumpy, get_backend
 from .grid import Grid
 from .materials import Material
+from .stencil import harmonic_mean
 
 BC_VACUUM = "vacuum"
 BC_REFLECTIVE = "reflective"
+
+_VACUUM_ALPHA = 0.5
+
+# Sweep quadrants (mu > 0, eta > 0); the wavefront sweep batches all four.
+_QUADS = ((True, True), (False, True), (True, False), (False, False))
 
 
 def quadrature_2d(n_polar: int, n_azi: int):
@@ -90,6 +124,58 @@ def _azimuth_mirrors(n_polar: int, n_azi: int):
     xmir = np.concatenate([p * n_azi + xmir_a for p in range(n_polar)])
     ymir = np.concatenate([p * n_azi + ymir_a for p in range(n_polar)])
     return xmir, ymir
+
+
+def diffusion_matrix(D, removal, hx, hy, bc, active=None):
+    """Assemble the 2D finite-volume diffusion operator -div(D grad) + removal
+    on an (nx, ny) grid: harmonic face D, Marshak vacuum (alpha=1/2) or
+    reflective outer faces, matching ndgpu's stencil. ``bc`` is
+    ((x0, x1), (y0, y1)) face specs ("vacuum", "reflective", or an albedo alpha).
+
+    ``active`` (bool mask) excises cells: faces between an active and an inactive
+    cell carry no diffusion coupling (used by the hybrid solver, which couples
+    the transport subdomain there by an imposed interface current instead), and
+    inactive cells get a unit diagonal (decoupled). Returns a CSC matrix ready
+    to factorize."""
+    nx, ny = D.shape
+    N = nx * ny
+    idx = np.arange(N).reshape(nx, ny)
+    rows, cols, vals = [], [], []
+    diag = removal.copy().astype(float)
+    act = np.ones((nx, ny), bool) if active is None else active
+
+    def add(r, c, v):
+        rows.append(np.atleast_1d(r)); cols.append(np.atleast_1d(c))
+        vals.append(np.atleast_1d(v))
+
+    # x faces (only where both cells are active)
+    wx = harmonic_mean(D[:-1, :], D[1:, :]) / hx**2          # (nx-1, ny)
+    wx = np.where(act[:-1, :] & act[1:, :], wx, 0.0)
+    add(idx[:-1, :].ravel(), idx[1:, :].ravel(), -wx.ravel())
+    add(idx[1:, :].ravel(), idx[:-1, :].ravel(), -wx.ravel())
+    diag[:-1, :] += wx; diag[1:, :] += wx
+    # y faces
+    wy = harmonic_mean(D[:, :-1], D[:, 1:]) / hy**2
+    wy = np.where(act[:, :-1] & act[:, 1:], wy, 0.0)
+    add(idx[:, :-1].ravel(), idx[:, 1:].ravel(), -wy.ravel())
+    add(idx[:, 1:].ravel(), idx[:, :-1].ravel(), -wy.ravel())
+    diag[:, :-1] += wy; diag[:, 1:] += wy
+    # outer boundary Robin terms
+    faces = [(bc[0][0], (0, slice(None)), hx), (bc[0][1], (-1, slice(None)), hx),
+             (bc[1][0], (slice(None), 0), hy), (bc[1][1], (slice(None), -1), hy)]
+    for spec, sl, d in faces:
+        if spec == "reflective":
+            continue
+        alpha = _VACUUM_ALPHA if spec == "vacuum" else float(spec)
+        Db = D[sl]
+        term = 2.0 * Db * alpha / (d * (d * alpha + 2.0 * Db))
+        diag[sl] += np.where(act[sl], term, 0.0)
+    diag = np.where(act, diag, 1.0)                          # excised: unit diagonal
+    add(idx.ravel(), idx.ravel(), diag.ravel())
+    A = sp.csr_matrix((np.concatenate(vals),
+                       (np.concatenate(rows), np.concatenate(cols))),
+                      shape=(N, N))
+    return A.tocsc()
 
 
 def _anderson(hist):
@@ -154,12 +240,13 @@ class SNResult:
     solve_seconds: float
     n_ordinates: int
     k_history: list = field(default_factory=list)
+    n_sweeps: int = 0                            # full transport sweeps performed
 
     def __repr__(self):
         status = "converged" if self.converged else "NOT CONVERGED"
         return (f"SNResult(k_eff={self.k_eff:.6f}, {status}, "
-                f"{self.outer_iterations} outers, S{self.n_ordinates}, "
-                f"{self.solve_seconds:.2f} s)")
+                f"{self.outer_iterations} outers, {self.n_sweeps} sweeps, "
+                f"S{self.n_ordinates}, {self.solve_seconds:.2f} s)")
 
 
 class SNTransportSolver:
@@ -174,19 +261,42 @@ class SNTransportSolver:
     n_polar, n_azi: product-quadrature sizes (n_azi a multiple of 4). Total
                     ordinates M = n_polar * n_azi.
     bc            : "vacuum" or "reflective" (all four in-plane faces).
+    acceleration  : within-group scattering acceleration -- "dsa" (default,
+                    DSA-accelerated source iteration), "dsa-gmres" (DSA-
+                    preconditioned GMRES), "gmres" (plain GMRES), "si" (plain
+                    source iteration). See the module docstring.
+    sweep         : "wavefront" (default; vectorized diagonal sweep, CPU/GPU)
+                    or "rows" (per-direction scipy banded row solves, CPU only).
+    device        : "cpu" (default), "gpu"/"cuda", or "auto" -- array backend
+                    for the wavefront sweep (numpy or cupy).
+    max_inner     : cap on source iterations per within-group solve.
     """
+
+    ACCELERATIONS = ("dsa", "dsa-gmres", "gmres", "si")
 
     def __init__(self, grid: Grid, materials, material_map=None,
                  n_polar: int = 3, n_azi: int = 12, bc: str = BC_VACUUM,
-                 require_fissile: bool = True):
+                 require_fissile: bool = True, acceleration: str = "dsa",
+                 sweep: str = "wavefront", device: str = "cpu",
+                 max_inner: int = 800):
         if grid.shape[2] != 1:
             raise ValueError("SNTransportSolver is 2D: grid must have nz == 1")
         if bc not in (BC_VACUUM, BC_REFLECTIVE):
             raise ValueError(f"bc must be {BC_VACUUM!r} or {BC_REFLECTIVE!r}")
+        if acceleration not in self.ACCELERATIONS:
+            raise ValueError(f"acceleration must be one of {self.ACCELERATIONS}")
+        if sweep not in ("wavefront", "rows"):
+            raise ValueError("sweep must be 'wavefront' or 'rows'")
         self.grid = grid
         self.nx, self.ny = grid.shape[0], grid.shape[1]
         self.hx, self.hy = grid.spacing[0], grid.spacing[1]
         self.bc = bc
+        self.acceleration = acceleration
+        self.sweep_mode = sweep
+        self.max_inner = max_inner
+        self.xp = get_backend(device)
+        if sweep == "rows" and self.xp is not np:
+            raise ValueError("sweep='rows' is CPU-only; use sweep='wavefront'")
 
         mats = [materials] if isinstance(materials, Material) else list(materials)
         G = mats[0].n_groups
@@ -228,16 +338,92 @@ class SNTransportSolver:
         self._b = 2.0 * np.abs(self.eta) / self.hy
         self._fx = self.mu > 0.0
         self._fy = self.eta > 0.0
+        self._setup_wavefront()
+        # Lazily built DSA diffusion factorization per group.
+        self._dsa_fac = [None] * G
+        self._sweep_count = 0
+
+    def _setup_wavefront(self):
+        """Precompute the wavefront sweep's index tables: the ordinate split into
+        the four sweep quadrants and, per anti-diagonal d = i + j (in swept
+        coordinates, where every quadrant marches +x, +y), the swept cell
+        indices plus each quadrant's flattened *physical* cell indices."""
+        xp, nx, ny = self.xp, self.nx, self.ny
+        self._qsel = [np.where((self._fx == fx) & (self._fy == fy))[0]
+                      for fx, fy in _QUADS]
+        # Product quadrature with n_azi % 4 == 0 puts M/4 ordinates per quadrant.
+        self._aq = xp.asarray(np.stack([self._a[s] for s in self._qsel])[:, :, None])
+        self._bq = xp.asarray(np.stack([self._b[s] for s in self._qsel])[:, :, None])
+        self._wq = xp.asarray(np.stack([self.w[s] for s in self._qsel])[:, :, None])
+        self._diags = []
+        for d in range(nx + ny - 1):
+            isw = np.arange(max(0, d - ny + 1), min(d, nx - 1) + 1)
+            jsw = d - isw
+            fph = np.stack([(isw if fx else nx - 1 - isw) * ny
+                            + (jsw if fy else ny - 1 - jsw)
+                            for fx, fy in _QUADS])
+            self._diags.append((xp.asarray(isw), xp.asarray(jsw),
+                                xp.asarray(isw * ny + jsw), xp.asarray(fph)))
 
     # ---- one full transport sweep -----------------------------------------
     def _sweep(self, q, st_g, inc):
         """Transport the isotropic source q (nx, ny) through every ordinate.
 
         inc holds per-face incoming edge fluxes {'x0','x1'}: (M, ny), {'y0','y1'}:
-        (M, nx) (all zero for vacuum). Returns the scalar flux (nx, ny) and the
-        outgoing edge fluxes in the same dict layout (for the reflective update).
+        (M, nx) (all zero for vacuum). Returns the scalar flux (nx, ny; a backend
+        array) and the outgoing edge fluxes as host (numpy) arrays in the same
+        dict layout (for the reflective update and the hybrid coupling).
         """
+        self._sweep_count += 1
+        if self.sweep_mode == "rows":
+            return self._sweep_rows(q, st_g, inc)
+        return self._sweep_wavefront(q, st_g, inc)
+
+    def _sweep_wavefront(self, q, st_g, inc):
+        """Vectorized wavefront sweep: one batched diamond-difference update per
+        anti-diagonal over (4 quadrants) x (M/4 directions) x (diagonal cells).
+        psi = (q + a psi_x_in + b psi_y_in) / (Sigma_t + a + b) with
+        a = 2|mu|/hx, b = 2|eta|/hy; outgoing edges psi_out = 2 psi - psi_in."""
+        xp, nx, ny = self.xp, self.nx, self.ny
+        Mq = self.M // 4
+        qf = xp.asarray(q).ravel()
+        stf = xp.asarray(st_g).ravel()
+        phi_sw = xp.zeros((4, nx * ny))
+        ex = xp.empty((4, Mq, ny))                # x-edge flux at the wavefront, per row
+        ey = xp.empty((4, Mq, nx))                # y-edge flux at the wavefront, per column
+        for qd, (fx, fy) in enumerate(_QUADS):
+            sel = self._qsel[qd]
+            xin = np.asarray(inc["x0" if fx else "x1"])[sel]
+            yin = np.asarray(inc["y0" if fy else "y1"])[sel]
+            ex[qd] = xp.asarray(np.ascontiguousarray(xin[:, ::1 if fy else -1]))
+            ey[qd] = xp.asarray(np.ascontiguousarray(yin[:, ::1 if fx else -1]))
+        a, b, w = self._aq, self._bq, self._wq
+        for isw, jsw, fsw, fph in self._diags:
+            qv = qf[fph][:, None, :]              # (4, 1, nd)
+            stv = stf[fph][:, None, :]
+            exv = ex[:, :, jsw]                   # (4, Mq, nd)
+            eyv = ey[:, :, isw]
+            psi = (qv + a * exv + b * eyv) / (stv + a + b)
+            ex[:, :, jsw] = 2.0 * psi - exv
+            ey[:, :, isw] = 2.0 * psi - eyv
+            phi_sw[:, fsw] = (w * psi).sum(axis=1)
+        phi = xp.zeros((nx, ny))
+        pq = phi_sw.reshape(4, nx, ny)
+        out = {"x0": np.zeros((self.M, ny)), "x1": np.zeros((self.M, ny)),
+               "y0": np.zeros((self.M, nx)), "y1": np.zeros((self.M, nx))}
+        exh, eyh = asnumpy(ex), asnumpy(ey)       # final wavefront = far-wall edges
+        for qd, (fx, fy) in enumerate(_QUADS):
+            phi = phi + pq[qd][::1 if fx else -1, ::1 if fy else -1]
+            sel = self._qsel[qd]
+            out["x1" if fx else "x0"][sel] = exh[qd][:, ::1 if fy else -1]
+            out["y1" if fy else "y0"][sel] = eyh[qd][:, ::1 if fx else -1]
+        return phi, out
+
+    def _sweep_rows(self, q, st_g, inc):
+        """Reference sweep: per-direction row loop with scipy banded solves."""
         nx, ny = self.nx, self.ny
+        q = asnumpy(q)
+        st_g = asnumpy(st_g)
         phi = np.zeros((nx, ny))
         out = {"x0": np.zeros((self.M, ny)), "x1": np.zeros((self.M, ny)),
                "y0": np.zeros((self.M, nx)), "y1": np.zeros((self.M, nx))}
@@ -264,10 +450,8 @@ class SNTransportSolver:
     def _reflect(self, out):
         """Incoming edge fluxes from a sweep's outgoing fluxes under reflection
         (vacuum -> all zero)."""
-        z_ny = np.zeros((self.M, self.ny))
-        z_nx = np.zeros((self.M, self.nx))
         if self.bc == BC_VACUUM:
-            return {"x0": z_ny, "x1": z_ny, "y0": z_nx, "y1": z_nx}
+            return self._zero_inc()
         return {"x0": out["x0"][self.xmir], "x1": out["x1"][self.xmir],
                 "y0": out["y0"][self.ymir], "y1": out["y1"][self.ymir]}
 
@@ -275,38 +459,114 @@ class SNTransportSolver:
         return {"x0": np.zeros((self.M, self.ny)), "x1": np.zeros((self.M, self.ny)),
                 "y0": np.zeros((self.M, self.nx)), "y1": np.zeros((self.M, self.nx))}
 
-    def _scatter_solve(self, qext, ss_g, st_g, phi, frozen, tol):
-        """GMRES the within-group scattering fixed point (I - T) phi = b with the
-        boundary incoming fluxes ``frozen``; T = one sweep of the scatter source."""
-        nx, ny = self.nx, self.ny
+    # ---- diffusion synthetic acceleration ---------------------------------
+    def _dsa_factor(self, g):
+        """Sparse LU of the group-g DSA diffusion operator, built on first use.
+
+        D = 1/(3 Sigma_t), removal = Sigma_t - Sigma_s,gg, Marshak vacuum on
+        every face: with the incoming boundary flux frozen, the within-group
+        *error* equation has zero incoming flux regardless of self.bc."""
+        if self._dsa_fac[g] is None:
+            st = np.maximum(asnumpy(self.st[g]), 1e-12)
+            ss = asnumpy(self.ss_self[g])
+            A = diffusion_matrix(1.0 / (3.0 * st), np.maximum(st - ss, 0.0),
+                                 self.hx, self.hy,
+                                 ((BC_VACUUM, BC_VACUUM), (BC_VACUUM, BC_VACUUM)))
+            self._dsa_fac[g] = factorized(A)
+        return self._dsa_fac[g]
+
+    def _dsa_apply(self, g, r):
+        """Diffusion estimate of the scattering-iteration error from the
+        scatter-weighted residual r = Sigma_s (phi^(l+1/2) - phi^l)."""
+        d = self._dsa_factor(g)(asnumpy(r).ravel())
+        return self.xp.asarray(d.reshape(self.nx, self.ny))
+
+    # ---- within-group scattering solvers ----------------------------------
+    def _si_solve(self, qext, ss_g, st_g, phi, frozen, tol, g, accelerate):
+        """(DSA-accelerated) source iteration on the within-group scattering
+        fixed point with the boundary incoming fluxes ``frozen``. With
+        acceleration, each sweep is followed by the diffusion error correction;
+        if the update norm stops contracting (inconsistent-discretization
+        regime, optically thick cells) the acceleration is dropped for the
+        remainder of the solve."""
+        xp = self.xp
+        phi = xp.asarray(asnumpy(phi).copy())
+        q0 = xp.asarray(qext)
+        prev = None
+        bad = 0
+        for _ in range(self.max_inner):
+            half, _ = self._sweep(ss_g * phi + q0, st_g, frozen)
+            if accelerate:
+                new = half + self._dsa_apply(g, ss_g * (half - phi))
+            else:
+                new = half
+            d = float(xp.max(xp.abs(new - phi)))
+            scale = max(float(xp.max(xp.abs(new))), 1e-300)
+            phi = new
+            if d <= tol * scale:
+                break
+            if accelerate:
+                if prev is not None and d > prev:
+                    bad += 1
+                    if bad >= 3:
+                        accelerate = False
+                else:
+                    bad = 0
+                prev = d
+        return phi
+
+    def _gmres_solve(self, qext, ss_g, st_g, phi, frozen, tol, g, precondition):
+        """GMRES on the scalar within-group system (I - T) phi = b, T = one
+        sweep of the scattering source, boundary incoming fluxes frozen.
+        With ``precondition`` the DSA operator M = I + F^-1 Sigma_s is applied
+        as a left preconditioner."""
+        xp, nx, ny = self.xp, self.nx, self.ny
+        q0 = xp.asarray(qext)
 
         def sweep_src(src):
-            p, _ = self._sweep(src + qext, st_g, frozen)
+            p, _ = self._sweep(src + q0, st_g, frozen)
             return p
 
-        b = sweep_src(np.zeros((nx, ny)))                      # source-only response
+        b = asnumpy(sweep_src(xp.zeros((nx, ny)))).ravel()     # source-only response
 
         def op(x):
-            p = sweep_src(ss_g * x.reshape(nx, ny))
-            return x - (p - b).ravel()
+            p = sweep_src(ss_g * xp.asarray(x.reshape(nx, ny)))
+            return x - (asnumpy(p).ravel() - b)
 
-        A = LinearOperator((nx * ny, nx * ny), matvec=op, dtype=float)
-        phi_v, _ = gmres(A, b.ravel(), x0=phi.ravel(),
+        n = nx * ny
+        A = LinearOperator((n, n), matvec=op, dtype=float)
+        M = None
+        if precondition:
+            def prec(x):
+                r = ss_g * xp.asarray(x.reshape(nx, ny))
+                return x + asnumpy(self._dsa_apply(g, r)).ravel()
+            M = LinearOperator((n, n), matvec=prec, dtype=float)
+        phi_v, _ = gmres(A, b, x0=asnumpy(phi).ravel(), M=M,
                          rtol=min(tol, 1e-4), atol=0.0, maxiter=400)
-        return phi_v.reshape(nx, ny)
+        return xp.asarray(phi_v.reshape(nx, ny))
+
+    def _scatter_solve(self, qext, ss_g, st_g, phi, frozen, tol, g):
+        """Solve the within-group scattering fixed point with the configured
+        acceleration (see class docstring)."""
+        tol = min(tol, 1e-4)
+        if self.acceleration in ("gmres", "dsa-gmres"):
+            return self._gmres_solve(qext, ss_g, st_g, phi, frozen, tol, g,
+                                     precondition=self.acceleration == "dsa-gmres")
+        return self._si_solve(qext, ss_g, st_g, phi, frozen, tol, g,
+                              accelerate=self.acceleration == "dsa")
 
     # ---- within-group solve ------------------------------------------------
-    def _solve_group(self, qext, ss_g, st_g, phi0, inc, tol):
+    def _solve_group(self, qext, ss_g, st_g, phi0, inc, tol, g):
         """Scattering solve nested in the reflective-boundary fixed point.
 
-        For each frozen boundary the scattering system is GMRES-solved to
+        For each frozen boundary the scattering system is solved to
         convergence; the boundary incoming fluxes are then refreshed from the
         solution's outgoing fluxes under reflection. That outer fixed point,
         inc <- reflect(sweep(phi(inc))), converges only at the boundary
         scattering rate (near 1 in thermal media), so it is Anderson-accelerated
         over the flattened face fluxes. Vacuum has no incoming flux -- one solve.
         """
-        phi = self._scatter_solve(qext, ss_g, st_g, phi0, inc, tol)
+        phi = self._scatter_solve(qext, ss_g, st_g, phi0, inc, tol, g)
         if self.bc == BC_VACUUM:
             return phi, inc
 
@@ -321,23 +581,23 @@ class SNTransportSolver:
                 o += s
             return out
 
-        def g(v):                                              # one fixed-point step
+        def gstep(v):                                          # one fixed-point step
             inc_v = unflat(v)
-            ph = self._scatter_solve(qext, ss_g, st_g, phi, inc_v, tol)
-            _, out = self._sweep(ss_g * ph + qext, st_g, inc_v)
+            ph = self._scatter_solve(qext, ss_g, st_g, phi, inc_v, tol, g)
+            _, out = self._sweep(ss_g * ph + self.xp.asarray(qext), st_g, inc_v)
             return flat(self._reflect(out)), ph
 
         v = flat(inc)
         hist = []                                              # (v_in, g(v_in)) pairs
         for _ in range(200):
-            gv, phi = g(v)
+            gv, phi = gstep(v)
             hist.append((v, gv))
             if len(hist) > 6:
                 hist.pop(0)
             v_next = _anderson(hist)
             d = np.max(np.abs(gv - v))
             v = v_next
-            if d < tol * max(1.0, np.max(phi)):
+            if d < tol * max(1.0, float(self.xp.max(phi))):
                 break
         return phi, unflat(v)
 
@@ -346,10 +606,18 @@ class SNTransportSolver:
         """Power iteration on the fission source until |dk| < tol_k and the
         scalar-flux change < tol_source."""
         t0 = time.perf_counter()
+        xp = self.xp
         G, nx, ny = self.G, self.nx, self.ny
-        phi = np.ones((G, nx, ny))
+        sweeps0 = self._sweep_count
+        st = [xp.asarray(self.st[g]) for g in range(G)]
+        ss_self = [xp.asarray(self.ss_self[g]) for g in range(G)]
+        nsf = [xp.asarray(self.nsf[g]) for g in range(G)]
+        chi = [xp.asarray(self.chi[g]) for g in range(G)]
+        scatter = [[None if s is None else xp.asarray(s) for s in row]
+                   for row in self.scatter]
+        phi = [xp.ones((nx, ny)) for _ in range(G)]
         inc = [self._zero_inc() for _ in range(G)]
-        fiss = sum(self.nsf[g] * phi[g] for g in range(G))
+        fiss = sum(nsf[g] * phi[g] for g in range(G))
         k = 1.0
         k_hist = []
         converged = False
@@ -361,21 +629,22 @@ class SNTransportSolver:
             # late (the reflective boundary fixed point in particular must be
             # converged well below the target k accuracy or it leaks).
             rtol = min(1e-3, max(0.05 * prev_rel, 0.01 * tol_k, 1e-11))
-            phi_new = np.zeros_like(phi)
+            phi_new = [None] * G
             for g in range(G):
-                qext = self.chi[g] * fs
+                qext = chi[g] * fs
                 for gf in range(G):
-                    s = self.scatter[gf][g]
+                    s = scatter[gf][g]
                     if gf != g and s is not None:
                         src = phi_new[gf] if gf < g else phi[gf]   # Gauss-Seidel
                         qext = qext + s * src
                 phi_new[g], inc[g] = self._solve_group(
-                    qext, self.ss_self[g], self.st[g], phi[g], inc[g], rtol)
-            fiss_new = sum(self.nsf[g] * phi_new[g] for g in range(G))
-            k_new = k * fiss_new.sum() / fiss.sum()
+                    qext, ss_self[g], st[g], phi[g], inc[g], rtol, g)
+            fiss_new = sum(nsf[g] * phi_new[g] for g in range(G))
+            k_new = k * float(fiss_new.sum()) / float(fiss.sum())
             dk = abs(k_new - k)
-            denom = max(np.max(phi_new), 1e-30)
-            rel = np.max(np.abs(phi_new - phi)) / denom
+            denom = max(max(float(xp.max(p)) for p in phi_new), 1e-30)
+            rel = max(float(xp.max(xp.abs(phi_new[g] - phi[g])))
+                      for g in range(G)) / denom
             phi, fiss, k = phi_new, fiss_new, k_new
             prev_rel = max(rel, dk)
             k_hist.append(k)
@@ -388,7 +657,9 @@ class SNTransportSolver:
             if dk < tol_k and rel < tol_source and rtol < max(1e-8, tol_k):
                 converged = True
                 break
-        return SNResult(k_eff=k, flux=phi, converged=converged,
+        flux = np.stack([asnumpy(p) for p in phi])
+        return SNResult(k_eff=k, flux=flux, converged=converged,
                         outer_iterations=outer,
                         solve_seconds=time.perf_counter() - t0,
-                        n_ordinates=self.M, k_history=k_hist)
+                        n_ordinates=self.M, k_history=k_hist,
+                        n_sweeps=self._sweep_count - sweeps0)

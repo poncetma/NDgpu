@@ -24,7 +24,9 @@ subdomain); a full mask makes every diffusion cell Dirichlet to the transport
 flux, i.e. plain S_N. In between, transport self-shielding is captured in the
 drums while the bulk stays diffusion.
 
-Like ``ndgpu.sn`` this is a CPU/numpy reference, not the GPU production path.
+This coupling layer is a CPU/numpy reference (the S_N subdomain solves use
+``ndgpu.sn``'s wavefront sweep and DSA on their default CPU backend); it is not
+the GPU production path.
 """
 
 from __future__ import annotations
@@ -33,65 +35,11 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
-import scipy.sparse as sp
 from scipy.sparse.linalg import factorized
 
 from .grid import Grid
 from .materials import Material
-from .sn import SNResult, SNTransportSolver
-from .stencil import harmonic_mean
-
-_VACUUM_ALPHA = 0.5
-
-
-def _diffusion_matrix(D, removal, hx, hy, bc, active=None):
-    """Assemble the 2D finite-volume diffusion operator -div(D grad) + removal
-    on an (nx, ny) grid: harmonic face D, Marshak vacuum (alpha=1/2) or
-    reflective outer faces, matching ndgpu's stencil.
-
-    ``active`` (bool mask) excises cells: faces between an active and an inactive
-    cell carry no diffusion coupling (the transport subdomain is coupled there by
-    an imposed interface current instead), and inactive cells get a unit diagonal
-    (decoupled). Returns a CSC matrix ready to factorize."""
-    nx, ny = D.shape
-    N = nx * ny
-    idx = np.arange(N).reshape(nx, ny)
-    rows, cols, vals = [], [], []
-    diag = removal.copy().astype(float)
-    act = np.ones((nx, ny), bool) if active is None else active
-
-    def add(r, c, v):
-        rows.append(np.atleast_1d(r)); cols.append(np.atleast_1d(c))
-        vals.append(np.atleast_1d(v))
-
-    # x faces (only where both cells are active)
-    wx = harmonic_mean(D[:-1, :], D[1:, :]) / hx**2          # (nx-1, ny)
-    wx = np.where(act[:-1, :] & act[1:, :], wx, 0.0)
-    add(idx[:-1, :].ravel(), idx[1:, :].ravel(), -wx.ravel())
-    add(idx[1:, :].ravel(), idx[:-1, :].ravel(), -wx.ravel())
-    diag[:-1, :] += wx; diag[1:, :] += wx
-    # y faces
-    wy = harmonic_mean(D[:, :-1], D[:, 1:]) / hy**2
-    wy = np.where(act[:, :-1] & act[:, 1:], wy, 0.0)
-    add(idx[:, :-1].ravel(), idx[:, 1:].ravel(), -wy.ravel())
-    add(idx[:, 1:].ravel(), idx[:, :-1].ravel(), -wy.ravel())
-    diag[:, :-1] += wy; diag[:, 1:] += wy
-    # outer boundary Robin terms
-    faces = [(bc[0][0], (0, slice(None)), hx), (bc[0][1], (-1, slice(None)), hx),
-             (bc[1][0], (slice(None), 0), hy), (bc[1][1], (slice(None), -1), hy)]
-    for spec, sl, d in faces:
-        if spec == "reflective":
-            continue
-        alpha = _VACUUM_ALPHA if spec == "vacuum" else float(spec)
-        Db = D[sl]
-        term = 2.0 * Db * alpha / (d * (d * alpha + 2.0 * Db))
-        diag[sl] += np.where(act[sl], term, 0.0)
-    diag = np.where(act, diag, 1.0)                          # excised: unit diagonal
-    add(idx.ravel(), idx.ravel(), diag.ravel())
-    A = sp.csr_matrix((np.concatenate(vals),
-                       (np.concatenate(rows), np.concatenate(cols))),
-                      shape=(N, N))
-    return A.tocsc()
+from .sn import SNResult, SNTransportSolver, diffusion_matrix
 
 
 @dataclass
@@ -109,7 +57,8 @@ class HybridSNDiffusionSolver:
     """
 
     def __init__(self, grid: Grid, materials, material_map=None, sn_mask=None,
-                 n_polar: int = 3, n_azi: int = 12, bc: str = "vacuum"):
+                 n_polar: int = 3, n_azi: int = 12, bc: str = "vacuum",
+                 acceleration: str = "dsa"):
         if grid.shape[2] != 1:
             raise ValueError("hybrid solver is 2D: grid must have nz == 1")
         self.grid = grid
@@ -144,6 +93,7 @@ class HybridSNDiffusionSolver:
 
         self.sn_mask = (np.zeros((self.nx, self.ny), bool) if sn_mask is None
                         else np.asarray(sn_mask).reshape(self.nx, self.ny))
+        self.acceleration = acceleration
         self._prefactor_diffusion()
         self._setup_box(mats, n_polar, n_azi)
 
@@ -153,8 +103,8 @@ class HybridSNDiffusionSolver:
         self._active = ~self.sn_mask
         self._dfac = []
         for g in range(self.G):
-            A = _diffusion_matrix(self.D[g], self.removal[g], self.hx, self.hy,
-                                  self.bc_spec, active=self._active)
+            A = diffusion_matrix(self.D[g], self.removal[g], self.hx, self.hy,
+                                 self.bc_spec, active=self._active)
             self._dfac.append(factorized(A))
 
     def _setup_box(self, mats, n_polar, n_azi):
@@ -177,7 +127,8 @@ class HybridSNDiffusionSolver:
                          size=(bnx * self.hx, bny * self.hy, 1.0))
             bmap = self.mmap[i0:i1, j0:j1].reshape(bnx, bny, 1)
             sn = SNTransportSolver(bgrid, mats, material_map=bmap, n_polar=n_polar,
-                                   n_azi=n_azi, bc="vacuum", require_fissile=False)
+                                   n_azi=n_azi, bc="vacuum", require_fissile=False,
+                                   acceleration=self.acceleration)
             self.boxes.append({"span": (i0, i1, j0, j1), "sn": sn,
                                "phi": [None] * self.G,
                                "J": [None] * self.G})       # face net currents
@@ -236,7 +187,7 @@ class HybridSNDiffusionSolver:
                 bp0 = phi_g[i0:i1, j0:j1].copy() if bp0 is None else bp0
                 # (1) transport on the box, incoming from the current bulk flux
                 box_phi, box_inc = sn._solve_group(box_q, sn.ss_self[g],
-                                                   sn.st[g], bp0, inc, tol)
+                                                   sn.st[g], bp0, inc, tol, g)
                 box["phi"][g] = box_phi
                 # (2) net interface current -> source on the ring of bulk cells
                 src = sn.ss_self[g] * box_phi + box_q
@@ -296,7 +247,9 @@ class HybridSNDiffusionSolver:
                 converged = True
                 break
         M = self.boxes[0]["sn"].M if self.boxes else 0
+        n_sweeps = sum(box["sn"]._sweep_count for box in self.boxes)
         return HybridSNResult(k_eff=k, flux=phi, converged=converged,
                               outer_iterations=outer,
                               solve_seconds=time.perf_counter() - t0,
-                              n_ordinates=M, schwarz_iterations=schwarz_total)
+                              n_ordinates=M, schwarz_iterations=schwarz_total,
+                              n_sweeps=n_sweeps)
