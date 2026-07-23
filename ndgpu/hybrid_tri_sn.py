@@ -101,7 +101,8 @@ class HybridTriSNDiffusionSolver:
     def __init__(self, grid: TriGrid, materials, material_map=None, sn_mask=None,
                  active=None, mask_bc="vacuum", n_polar: int = 3, n_azi: int = 12,
                  mix_material=None, mix_weight=None,
-                 acceleration: str = "dsa-gmres", coupling: str = "krylov"):
+                 acceleration: str = "dsa-gmres", coupling: str = "krylov",
+                 engine: str | None = None, device: str = "cpu"):
         # acceleration applies to the coupling="schwarz" path only (the nested
         # drum-box within-group solves); default "dsa-gmres" there because the
         # Schwarz loop re-solves each warm-started box against a changing
@@ -110,6 +111,11 @@ class HybridTriSNDiffusionSolver:
         # 25 s). coupling="krylov" (default) has no nested solves at all.
         if coupling not in ("krylov", "schwarz"):
             raise ValueError("coupling must be 'krylov' or 'schwarz'")
+        if coupling == "schwarz" and engine == "levels":
+            raise ValueError("coupling='schwarz' needs engine='lu' (its nested "
+                             "drum solves use the LU-only iface machinery)")
+        if coupling == "schwarz" and engine is None:
+            engine = "lu"                        # don't auto-pick levels on GPU
         self.coupling = coupling
         self.grid = grid
         self.nr, self.nc = grid.shape[0], grid.shape[1]
@@ -159,7 +165,8 @@ class HybridTriSNDiffusionSolver:
                                            require_fissile=False,
                                            mix_material=mix_material,
                                            mix_weight=mix_weight,
-                                           acceleration=acceleration)
+                                           acceleration=acceleration,
+                                           engine=engine, device=device)
             d = self.sn._scb
             bulk_flat = self.bulk.reshape(-1)
             ec = d["ext_cell"]                               # (K,3,2) full-mesh nbr cell

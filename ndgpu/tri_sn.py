@@ -410,11 +410,17 @@ class TriSNTransportSolver:
         self._lv_group[g] = out
         return out
 
-    def _sweep_levels(self, g, src_flat):
+    def _sweep_levels(self, g, src_flat, iface_in=None):
         """One batched level-scheduled sweep; returns (phi, psi) with psi the
-        full per-ordinate angular flux (backend array) for current folds."""
+        full per-ordinate angular flux (backend array) for current folds.
+        iface_in (SCB only) enters as a fixed source on the inflow interface
+        half-edges, exactly as in the LU engine's ``_iface_rhs`` -- interface
+        faces are boundary faces (no dependency edges), so the level schedule
+        is unchanged."""
         xp = self.xp
         if self.scheme == "step":
+            if iface_in is not None:
+                raise ValueError("iface_in is SCB-only")
             denom = self._lv_tables(g)
             rhs = xp.asarray(np.where(self._act_flat, src_flat * self.area, 0.0))
             psi = xp.zeros(self.M * self.N)
@@ -428,11 +434,19 @@ class TriSNTransportSolver:
         ac, K = d["ac"], d["K"]
         Binv = self._lv_tables(g)
         base = xp.asarray(src_flat[ac] * (self.area / 3.0))
+        IF = None
+        if iface_in is not None:
+            psi_in, is_iface = iface_in
+            cif = np.where(is_iface[None] & (self._lv_oe < 0.0),
+                           -self._lv_oe * (self.h / 2.0), 0.0)  # (M, K, 3, 2)
+            IF = xp.asarray((cif * psi_in[None]).sum(3).reshape(self.M * K, 3))
         psi = xp.zeros(self.M * K * 3)
         three = xp.arange(3)
         for pidx, rr in self._levels:
             b = base[rr][:, None] + (self._lv_coef[pidx]
                                      * psi[self._lv_nbr[pidx]]).sum(2)
+            if IF is not None:
+                b = b + IF[pidx]
             p = xp.einsum("nij,nj->ni", Binv[pidx], b)
             psi[pidx[:, None] * 3 + three] = p
         phi = np.zeros(self.N)
@@ -625,9 +639,18 @@ class TriSNTransportSolver:
         coupling). Returns (phi, J) with J shaped like interface_currents'."""
         if self.scheme != "scb":
             raise ValueError("_sweep_iface is SCB-only (hybrid drum boxes)")
-        if self.engine != "lu":
-            raise ValueError("the hybrid iface coupling needs engine='lu'")
         self._sweep_count += 1
+        if self.engine == "levels":
+            phi, psi = self._sweep_levels(g, src_flat, iface_in)
+            psi3 = asnumpy(psi).reshape(self.M, self._scb["K"], 3)
+            psi_in, is_iface = iface_in
+            J = np.zeros((self._scb["K"], 3, 2))
+            for m in range(self.M):
+                oe = self._lv_oe[m]
+                face = np.where(oe > 0, psi3[m][:, :, None], psi_in)
+                J += self.w[m] * np.where(is_iface,
+                                          oe * (self.h / 2.0) * face, 0.0)
+            return phi, J
         d = self._scb
         ac, K = d["ac"], d["K"]
         base = np.repeat(src_flat[ac] * (self.area / 3.0), 3)

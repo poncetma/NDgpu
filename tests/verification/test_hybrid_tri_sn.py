@@ -104,3 +104,20 @@ def test_krylov_coupling_matches_schwarz():
     assert r_s.converged and r_k.converged
     assert r_k.k_eff == pytest.approx(r_s.k_eff, abs=1e-6)
     assert sweeps_k < sweeps_s
+
+
+def test_levels_engine_matches_lu():
+    # The level-scheduled sweep engine (the GPU path) drives the same krylov
+    # interface coupling through _sweep_iface: identical k to the LU engine.
+    grid, mmap, active, drum = _problem()
+
+    def run(engine):
+        h = HybridTriSNDiffusionSolver(grid, [FUEL, ABSB], mmap, sn_mask=drum,
+                                       active=active, mask_bc="vacuum",
+                                       engine=engine, **QUAD)
+        return h.solve(**TIGHT)
+
+    r_lu = run("lu")
+    r_lv = run("levels")
+    assert r_lu.converged and r_lv.converged
+    assert r_lv.k_eff == pytest.approx(r_lu.k_eff, abs=1e-10)
