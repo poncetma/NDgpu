@@ -244,3 +244,29 @@ def test_3d_rejects_scb_and_levels():
     grid = TriGrid(shape=(4, 4, 2, 2), side=3.0, height=4.0)
     with pytest.raises(NotImplementedError, match="step"):
         TriSNTransportSolver(grid, M1, n_polar=2, n_azi=8, scheme="scb")
+
+
+def test_3d_levels_engine_matches_lu():
+    # The 3D level-scheduled sweep engine (engine="levels", the GPU path) solves
+    # the same per-ordinate systems as the prism LU engine in topological order,
+    # now with axial dependency edges (up to 5 inflow faces/cell). On NumPy both
+    # run the identical arithmetic -> machine-precision equal.
+    grid = TriGrid(shape=(5, 5, 2, 4), side=3.0, height=16.0)
+    rng = np.random.default_rng(0)
+    src = rng.random(5 * 5 * 2 * 4)
+    kw = dict(n_polar=4, n_azi=4, bc="vacuum")
+    lu = TriSNTransportSolver(grid, M1, engine="lu", **kw)
+    lv = TriSNTransportSolver(grid, M1, engine="levels", **kw)
+    assert np.max(np.abs(lu._sweep(0, src) - lv._sweep(0, src))) < 1e-12
+    r_lu = lu.solve(tol_k=1e-8, tol_source=1e-7)
+    r_lv = lv.solve(tol_k=1e-8, tol_source=1e-7)
+    assert r_lu.converged and r_lv.converged
+    assert r_lv.k_eff == pytest.approx(r_lu.k_eff, abs=1e-10)
+
+
+def test_3d_levels_rejects_periodic():
+    # Any periodic wrap (radial or axial) cycles the sweep dependency graph.
+    grid = TriGrid(shape=(4, 4, 2, 3), side=3.0, height=9.0)
+    with pytest.raises(ValueError, match="cycles"):
+        TriSNTransportSolver(grid, M1, n_polar=2, n_azi=8,
+                             bc=("periodic", "vacuum"), engine="levels")

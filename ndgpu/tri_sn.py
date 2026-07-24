@@ -138,8 +138,9 @@ class TriSNTransportSolver:
             engine = "lu" if self.xp is np else "levels"
         if engine not in ("lu", "levels"):
             raise ValueError("engine must be 'lu' or 'levels'")
-        if engine == "levels" and bc != "vacuum":
-            raise ValueError("engine='levels' needs bc='vacuum' (the periodic "
+        if engine == "levels" and (self.bc_radial != "vacuum"
+                                   or self.bc_axial != "vacuum"):
+            raise ValueError("engine='levels' needs vacuum bc (the periodic "
                              "torus wraps the sweep dependency graph into cycles)")
         if engine == "lu" and self.xp is not np:
             raise ValueError("engine='lu' is CPU-only; use engine='levels'")
@@ -163,8 +164,6 @@ class TriSNTransportSolver:
             if scheme != "step":
                 raise NotImplementedError(
                     "3D tri-S_N supports scheme='step' so far (SCB is Phase 5)")
-            engine = "lu"                                    # levels 3D is Phase 2
-            self.engine = "lu"
             if acceleration in ("gmres", "dsa-gmres"):       # Phase 3: dsa / si
                 self.acceleration = "dsa"
             if outer_acceleration == "cmfd":                 # CMFD 3D is Phase 4
@@ -172,6 +171,7 @@ class TriSNTransportSolver:
         else:
             self.nz = 1
         self.N = self.nr * self.nc * 2 * self.nz
+        self._measure = self.vol if self.is3d else self.area  # step cell measure
 
         mats = [materials] if isinstance(materials, Material) else list(materials)
         self.G = mats[0].n_groups
@@ -236,7 +236,10 @@ class TriSNTransportSolver:
 
     def _prefactor(self):
         if self.is3d:
-            self._prefactor_step_3d()
+            if self.engine == "levels":
+                self._setup_levels_3d()
+            else:
+                self._prefactor_step_3d()
             return
         if self.engine == "levels":
             if self.scheme == "scb":
@@ -372,6 +375,129 @@ class TriSNTransportSolver:
                       np.concatenate([np.atleast_1d(c) for c in cols]))),
                     shape=(N, N))
                 self._solvers[g][m] = factorized(A.tocsc())
+
+    def _setup_levels_3d(self):
+        """Level schedule for the prism step sweep (engine='levels', GPU path).
+
+        Same topological scheme as the 2D step engine but the upwind dependency
+        graph adds axial edges, so a cell has up to FIVE inflow faces (3 lateral
+        + 2 axial) instead of 3. The per-level gather tables are width-5; the
+        width-agnostic _run_levels/_sweep_dev/CUDA-graph machinery is otherwise
+        unchanged. Vacuum bc only (a periodic wrap would cycle the graph)."""
+        xp, N, M = self.xp, self.N, self.M
+        nr, nc, nz = self.nr, self.nc, self.nz
+        h, area, dz = self.h, self.area, self.dz
+        cell, act = self._cell, self.active
+        act_flat = self._act_flat
+        ii, jj = np.meshgrid(np.arange(nr), np.arange(nc), indexing="ij")
+        NIN = 5
+        outsum = np.zeros((M, N))
+        in_nbr = np.zeros((M, N, NIN), np.int64)
+        in_coef = np.zeros((M, N, NIN))
+        in_cnt = np.zeros((M, N), np.int64)
+        es = [[] for _ in range(M)]
+        ed = [[] for _ in range(M)]
+        # (s_all outflow ids, sv/nv inflow src/nbr ids, kind, g1, g2) per face
+        faces = []
+        for (t, di, dj, tn, (nx, ny)) in _EDGES:              # lateral
+            src, src_act = cell[:, :, t, :], act[:, :, t, :]
+            ni, nj = ii + di, jj + dj
+            inb = (ni >= 0) & (ni < nr) & (nj >= 0) & (nj < nc)
+            ni2, nj2 = np.clip(ni, 0, nr - 1), np.clip(nj, 0, nc - 1)
+            nbr = np.full((nr, nc, nz), -1)
+            nbr_act = np.zeros((nr, nc, nz), bool)
+            nbr[inb] = cell[ni2[inb], nj2[inb], tn, :]
+            nbr_act[inb] = act[ni2[inb], nj2[inb], tn, :]
+            valid = src_act & nbr_act
+            faces.append((src[src_act], src[valid], nbr[valid], "lat", nx, ny))
+        for dk in (+1, -1):                                    # axial caps
+            nk = np.arange(nz) + dk
+            inbz = (nk >= 0) & (nk < nz)
+            nk2 = np.clip(nk, 0, nz - 1)
+            nbr = np.full((nr, nc, 2, nz), -1)
+            nbr_act = np.zeros((nr, nc, 2, nz), bool)
+            nbr[:, :, :, inbz] = cell[:, :, :, nk2[inbz]]
+            nbr_act[:, :, :, inbz] = act[:, :, :, nk2[inbz]]
+            valid = act & nbr_act
+            faces.append((cell[act], cell[valid], nbr[valid], "ax", dk, None))
+        for (s_all, sv, nv, kind, g1, g2) in faces:
+            for m in range(M):
+                if kind == "lat":
+                    On = (self.mu[m] * g1 + self.eta[m] * g2) * (h * dz)
+                else:
+                    On = (self.xi[m] if g1 > 0 else -self.xi[m]) * area
+                if On > 0.0:
+                    outsum[m][s_all] += On
+                elif On < 0.0:
+                    es[m].append(nv); ed[m].append(sv)
+                    slot = in_cnt[m][sv]
+                    in_nbr[m, sv, slot] = nv
+                    in_coef[m, sv, slot] = -On
+                    in_cnt[m][sv] += 1
+        # Kahn's algorithm per ordinate (identical to the 2D engine).
+        lvl_of = np.full((M, N), -1, np.int64)
+        n_act = int(act_flat.sum())
+        for m in range(M):
+            se = np.concatenate(es[m]) if es[m] else np.zeros(0, np.int64)
+            de = np.concatenate(ed[m]) if ed[m] else np.zeros(0, np.int64)
+            indeg = np.zeros(N, np.int64)
+            np.add.at(indeg, de, 1)
+            perm = np.argsort(se, kind="stable")
+            se_s, de_s = se[perm], de[perm]
+            indptr = np.searchsorted(se_s, np.arange(N + 1))
+            ready = act_flat & (indeg == 0)
+            done = l = 0
+            while done < n_act:
+                ids = np.where(ready)[0]
+                if ids.size == 0:
+                    raise RuntimeError("sweep dependency cycle (unexpected for "
+                                       "vacuum bc)")
+                lvl_of[m, ids] = l
+                done += ids.size
+                ready[ids] = False
+                counts = indptr[ids + 1] - indptr[ids]
+                tot = int(counts.sum())
+                if tot:
+                    starts = np.repeat(indptr[ids], counts)
+                    offs = (np.arange(tot) - np.repeat(
+                        np.concatenate(([0], np.cumsum(counts)[:-1])), counts))
+                    deps = de_s[starts + offs]
+                    np.subtract.at(indeg, deps, 1)
+                    hit = deps[indeg[deps] == 0]
+                    ready[hit[lvl_of[m, hit] < 0]] = True
+                l += 1
+        # per-level width-5 tables (same layout as the 2D step branch)
+        mm, cc = np.where(lvl_of >= 0)
+        lv = lvl_of[mm, cc]
+        order = np.argsort(lv, kind="stable")
+        mm, cc, lv = mm[order], cc[order], lv[order]
+        bounds = np.searchsorted(lv, np.arange(int(lv.max()) + 2))
+        spans = list(zip(bounds[:-1], bounds[1:]))
+        i32 = np.int32
+        self._w_xp = xp.asarray(self.w)
+        self._lv_group = {}
+        self._graphs = {}
+        self.graphs_active = None
+        self._graph_error = None
+        self._act_flat_dev = xp.asarray(act_flat)
+        pidx = mm * N + cc
+        off = (np.arange(M) * N)[:, None, None]
+        nbr_f = np.where(in_coef > 0.0, off + in_nbr, 0).reshape(M * N, NIN)
+        coef = in_coef.reshape(M * N, NIN)
+        self._lv_out = outsum
+        self._levels = []
+        for a, b in spans:
+            p = pidx[a:b]
+            self._levels.append((xp.asarray(cc[a:b].astype(i32)),
+                                 xp.asarray(p.astype(i32)),
+                                 xp.asarray(nbr_f[p].astype(i32)),
+                                 xp.asarray(coef[p])))
+        self._bufs = dict(
+            psi=xp.zeros(M * N), rhs=xp.zeros(N),
+            phiM=xp.zeros(N), psiw=xp.zeros((M, N)),
+            wcol=xp.asarray(self.w[:, None]),
+            work=[(xp.zeros((n, NIN)), xp.zeros(n), xp.zeros(n))
+                  for n in (b - a for a, b in spans)])
 
     def _sweep_3d(self, g, src_flat):
         """One isotropic-source sweep on the prism mesh: phi = sum_m w_m psi_m,
@@ -540,7 +666,7 @@ class TriSNTransportSolver:
             return self._lv_group[g]
         xp, M = self.xp, self.M
         if self.scheme == "step":
-            denom = (self.st[g].reshape(-1)[None, :] * self.area
+            denom = (self.st[g].reshape(-1)[None, :] * self._measure
                      + self._lv_out).reshape(-1)
             out = [xp.asarray(denom[asnumpy(lev[1])]) for lev in self._levels]
         else:
@@ -716,7 +842,7 @@ class TriSNTransportSolver:
         xp, bufs = self.xp, self._bufs
         if self.scheme == "step":
             rhs = bufs["rhs"]
-            xp.multiply(src_dev, self.area, out=rhs)
+            xp.multiply(src_dev, self._measure, out=rhs)
             rhs *= self._act_flat_dev                # zero the excised cells
             self._levels_exec(g, False)
             return bufs["phiM"].ravel(), bufs["psi"]
@@ -775,7 +901,7 @@ class TriSNTransportSolver:
             if iface_in is not None:
                 raise ValueError("iface_in is SCB-only")
             self._buf_set(bufs["rhs"],
-                          np.where(self._act_flat, src_flat * self.area, 0.0))
+                          np.where(self._act_flat, src_flat * self._measure, 0.0))
             self._levels_exec(g, False)
             return asnumpy(bufs["phiM"]).ravel().copy(), bufs["psi"]
         d = self._scb
@@ -827,7 +953,7 @@ class TriSNTransportSolver:
     def _sweep(self, g, src_flat, iface_in=None):
         """phi = Sum_m w_m L_Omega^-1 (src * area) for an isotropic source.
         iface_in (SCB only) injects a hybrid incoming flux on interface edges."""
-        if self.is3d:
+        if self.is3d and self.engine == "lu":
             return self._sweep_3d(g, src_flat)
         self._sweep_count += 1
         if self.engine == "levels":
