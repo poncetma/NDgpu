@@ -240,10 +240,32 @@ def test_3d_dsa_matches_source_iteration():
     assert dsa.outer_iterations <= si.outer_iterations
 
 
-def test_3d_rejects_scb_and_levels():
-    grid = TriGrid(shape=(4, 4, 2, 2), side=3.0, height=4.0)
-    with pytest.raises(NotImplementedError, match="step"):
-        TriSNTransportSolver(grid, M1, n_polar=2, n_azi=8, scheme="scb")
+def test_3d_scb_periodic_is_kinf():
+    # SCB on prisms: each corner sub-prism is closed (lateral corner faces sum to
+    # zero, axial caps cancel), so a flat flux on the torus streams nothing and
+    # k == k_inf exactly -- pinning the corner + axial-cap geometry.
+    grid = TriGrid(shape=(6, 6, 2, 4), side=3.0, height=8.0)
+    r = TriSNTransportSolver(grid, M1, n_polar=4, n_azi=8, bc="periodic",
+                             scheme="scb").solve(tol_k=1e-9, tol_source=1e-9)
+    assert r.converged
+    assert r.k_eff == pytest.approx(k_infinite(M1), abs=2e-6)
+    assert r.flux[0].min() / r.flux[0].max() > 0.9999
+
+
+def test_3d_scb_more_accurate_than_step():
+    # Second-order SCB is closer to the fine-mesh limit than first-order step at
+    # equal (coarse) prism resolution.
+    m = Material(diffusion=[1.0], sigma_a=[0.05], nu_sigma_f=[0.07],
+                 sigma_s=[[0.0]], name="s")
+
+    def k(scheme, nrc, nz):
+        g = TriGrid(shape=(nrc, nrc, 2, nz), side=12.0 / nrc, height=12.0)
+        return TriSNTransportSolver(g, m, n_polar=2, n_azi=8, bc="vacuum",
+                                    scheme=scheme).solve(
+            tol_k=1e-7, tol_source=1e-6, max_outer=800).k_eff
+
+    ref = k("scb", 16, 16)
+    assert abs(k("scb", 6, 6) - ref) < abs(k("step", 6, 6) - ref)
 
 
 def test_3d_levels_engine_matches_lu():

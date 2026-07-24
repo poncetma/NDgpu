@@ -161,9 +161,11 @@ class TriSNTransportSolver:
             self.nz = grid.shape[3]
             self.dz = grid.dz
             self.vol = self.area * self.dz                   # prism cell measure
-            if scheme != "step":
-                raise NotImplementedError(
-                    "3D tri-S_N supports scheme='step' so far (SCB is Phase 5)")
+            if scheme == "scb":
+                engine = "lu"                                # levels-SCB 3D = later
+                self.engine = "lu"
+                if outer_acceleration == "cmfd":             # CMFD-SCB currents = later
+                    self.outer_acceleration = "power"
             if acceleration in ("gmres", "dsa-gmres"):       # Phase 3: dsa / si
                 self.acceleration = "dsa"
         else:
@@ -236,6 +238,9 @@ class TriSNTransportSolver:
         if self.is3d:
             if self.engine == "levels":
                 self._setup_levels_3d()
+            elif self.scheme == "scb":
+                self._build_corners_3d()
+                self._prefactor_scb_3d()
             else:
                 self._prefactor_step_3d()
             return
@@ -952,6 +957,8 @@ class TriSNTransportSolver:
         """phi = Sum_m w_m L_Omega^-1 (src * area) for an isotropic source.
         iface_in (SCB only) injects a hybrid incoming flux on interface edges."""
         if self.is3d and self.engine == "lu":
+            if self.scheme == "scb":
+                return self._sweep_scb_3d(g, src_flat)
             return self._sweep_3d(g, src_flat)
         self._sweep_count += 1
         if self.engine == "levels":
@@ -1095,6 +1102,127 @@ class TriSNTransportSolver:
             rhs = base if iface_in is None else base + self._iface_rhs(m, iface_in)[0].ravel()
             psi = self._solvers[g][m](rhs).reshape(K, 3)
             phi[ac] += self.w[m] * psi.mean(1)                # cell flux = mean of corners
+        return phi
+
+    def _build_corners_3d(self):
+        """Corner connectivity for SCB on the prism mesh: each active prism is
+        split into three corner sub-prisms (the 2D corner quad extruded in z).
+        A corner keeps its two lateral external half-edges + two lateral
+        internal faces (the 2D structure) and gains two axial cap faces coupling
+        the SAME corner in the prism directly above/below. 3 DoF per prism."""
+        s = _SQRT3_2
+        edge_spec = {
+            0: [({1, 2}, (s, 0.5), (0, 0, 1), {1: 0, 2: 1}),
+                ({0, 1}, (0.0, -1.0), (-1, 0, 1), {0: 1, 1: 2}),
+                ({0, 2}, (-s, 0.5), (0, -1, 1), {0: 0, 2: 2})],
+            1: [({0, 1}, (-s, -0.5), (0, 0, 0), {0: 1, 1: 2}),
+                ({1, 2}, (0.0, 1.0), (1, 0, 0), {1: 0, 2: 1}),
+                ({0, 2}, (s, -0.5), (0, 1, 0), {0: 0, 2: 2})],
+        }
+        int_dir = {
+            0: {(0, 1): (1.0, 0.0), (0, 2): (0.5, s), (1, 0): (-1.0, 0.0),
+                (1, 2): (-0.5, s), (2, 0): (-0.5, -s), (2, 1): (0.5, -s)},
+            1: {(0, 1): (-0.5, s), (0, 2): (0.5, s), (1, 0): (0.5, -s),
+                (1, 2): (1.0, 0.0), (2, 0): (-0.5, -s), (2, 1): (-1.0, 0.0)},
+        }
+        ext_tab, int_tab = {}, {}
+        for t in (0, 1):
+            for lc in (0, 1, 2):
+                ext_tab[(t, lc)] = [(nrm, off, cmap[lc]) for (cs, nrm, off, cmap)
+                                    in edge_spec[t] if lc in cs]
+                int_tab[(t, lc)] = [(w, int_dir[t][(lc, w)])
+                                    for w in (0, 1, 2) if w != lc]
+        nr, nc, nz, N = self.nr, self.nc, self.nz, self.N
+        cell, act_flat = self._cell, self._act_flat
+        rad_per, ax_per = self.bc_radial == "periodic", self.bc_axial == "periodic"
+        ac = np.where(act_flat)[0]
+        K = ac.size
+        aidx = np.full(N, -1)
+        aidx[ac] = np.arange(K)
+        ext_n = np.zeros((K, 3, 2, 2))
+        ext_nbr = np.full((K, 3, 2), -1)
+        int_n = np.zeros((K, 3, 2, 2))
+        int_w = np.zeros((K, 3, 2), int)
+        ax_nbr = np.full((K, 3, 2), -1)                      # [corner, lc, up/down]
+        for r in range(K):
+            c = ac[r]
+            k = c % nz; t = (c // nz) % 2
+            j = (c // (nz * 2)) % nc; i = c // (nz * 2 * nc)
+            for lc in range(3):
+                for f, (nrm, (di, dj, tn), nbr_lc) in enumerate(ext_tab[(t, lc)]):
+                    ext_n[r, lc, f] = nrm
+                    ni, nj = i + di, j + dj
+                    ok = (rad_per or (0 <= ni < nr and 0 <= nj < nc))
+                    if ok:
+                        nb = cell[ni % nr, nj % nc, tn, k]
+                        if act_flat[nb]:
+                            ext_nbr[r, lc, f] = aidx[nb] * 3 + nbr_lc
+                for f, (w, nrm) in enumerate(int_tab[(t, lc)]):
+                    int_n[r, lc, f] = nrm
+                    int_w[r, lc, f] = r * 3 + w
+                for uf, dk in enumerate((+1, -1)):
+                    nk = k + dk
+                    if ax_per or (0 <= nk < nz):
+                        nb = cell[i, j, t, nk % nz]
+                        if act_flat[nb]:
+                            ax_nbr[r, lc, uf] = aidx[nb] * 3 + lc
+        self._scb = {"ac": ac, "K": K, "ext_n": ext_n, "ext_nbr": ext_nbr,
+                     "int_n": int_n, "int_w": int_w, "ax_nbr": ax_nbr}
+
+    def _prefactor_scb_3d(self):
+        """Factorize the 3K corner system per ordinate/group on prisms: the 2D
+        corner operator with lateral face areas scaled by dz, plus two axial cap
+        faces (area = corner cap A3 = area/3, cosine +/-xi) upwind-coupled to the
+        same corner above/below."""
+        d = self._scb
+        K = d["K"]
+        dz = self.dz
+        h2 = (self.h / 2.0) * dz                             # lateral ext area
+        hi = (self.h / (2.0 * np.sqrt(3.0))) * dz            # lateral int area
+        A3 = (self.area / 3.0) * dz                          # corner sub-prism volume
+        Acap = self.area / 3.0                               # axial cap area
+        row = np.broadcast_to(
+            np.arange(K)[:, None, None] * 3 + np.arange(3)[None, :, None], (K, 3, 2))
+        rid = (np.arange(K)[:, None] * 3 + np.arange(3)[None, :]).ravel()
+        arow = np.broadcast_to(
+            np.arange(K)[:, None, None] * 3 + np.arange(3)[None, :, None], (K, 3, 2))
+        self._solvers = [[None] * self.M for _ in range(self.G)]
+        for g in range(self.G):
+            st_c = self.st[g].reshape(-1)[d["ac"]]
+            for m in range(self.M):
+                oe = self.mu[m] * d["ext_n"][..., 0] + self.eta[m] * d["ext_n"][..., 1]
+                oi = self.mu[m] * d["int_n"][..., 0] + self.eta[m] * d["int_n"][..., 1]
+                oz = np.array([self.xi[m], -self.xi[m]])      # up, down cap cosines
+                diag = st_c[:, None] * A3                     # (K, 3) collision
+                diag = diag + (np.where(oe > 0, oe, 0.0) * h2).sum(2)
+                diag = diag + (oi * hi * 0.5).sum(2)
+                diag = diag + (np.where(oz > 0, oz, 0.0) * Acap).sum()  # axial outflow
+                rows = [rid]; cols = [rid]; vals = [diag.ravel()]
+                inflow = (oe < 0) & (d["ext_nbr"] >= 0)       # lateral inflow
+                rows.append(row[inflow]); cols.append(d["ext_nbr"][inflow])
+                vals.append((oe * h2)[inflow])
+                rows.append(row.ravel()); cols.append(d["int_w"].ravel())  # internal
+                vals.append((oi * hi * 0.5).ravel())
+                azin = (oz < 0)[None, None, :] & (d["ax_nbr"] >= 0)  # axial inflow
+                coef = np.broadcast_to(oz * Acap, (K, 3, 2))
+                rows.append(arow[azin]); cols.append(d["ax_nbr"][azin])
+                vals.append(coef[azin])
+                Amat = sp.csr_matrix((np.concatenate(vals),
+                                      (np.concatenate(rows), np.concatenate(cols))),
+                                     shape=(3 * K, 3 * K))
+                self._solvers[g][m] = factorized(Amat.tocsc())
+
+    def _sweep_scb_3d(self, g, src_flat):
+        """One SCB prism sweep: phi = sum_m w_m mean_corner(psi_m), the corner
+        source being src * corner-sub-prism-volume (vol/3)."""
+        self._sweep_count += 1
+        d = self._scb
+        ac, K = d["ac"], d["K"]
+        base = np.repeat(src_flat[ac] * (self.vol / 3.0), 3)
+        phi = np.zeros(self.N)
+        for m in range(self.M):
+            psi = self._solvers[g][m](base).reshape(K, 3)
+            phi[ac] += self.w[m] * psi.mean(1)
         return phi
 
     def _sweep_iface(self, g, src_flat, iface_in):
