@@ -129,6 +129,34 @@ def quadrature_2d(n_polar: int, n_azi: int):
     return mu, eta, w
 
 
+def quadrature_3d(n_polar: int, n_azi: int):
+    """Product Gauss-Legendre(polar) x uniform(azimuthal) ordinate set for 3D.
+
+    Returns (mu, eta, xi, w): the x/y in-plane cosines, the z (axial) cosine
+    xi = cos(theta), and weights (sum to 1), each of length M = n_polar * n_azi.
+    Unlike :func:`quadrature_2d` the polar set spans the FULL sphere (both
+    hemispheres, xi in (-1, 1)) -- in 3D the axial direction streams, so xi is a
+    real transport cosine and cannot be folded. n_azi must be a multiple of 4 so
+    the azimuthal set is closed under mu->-mu and eta->-eta; n_polar (the
+    Gauss-Legendre order over [-1, 1]) should be even so no ordinate lands on
+    xi = 0 (a grazing, non-streaming axial direction).
+    """
+    if n_azi % 4 != 0:
+        raise ValueError(f"n_azi must be a multiple of 4, got {n_azi}")
+    if n_polar < 2:
+        raise ValueError("n_polar must be >= 2 for 3D")
+    xi1, wgl = np.polynomial.legendre.leggauss(n_polar)   # xi in (-1, 1)
+    wpol = wgl / 2.0                                       # sum(wpol) = 1
+    sint = np.sqrt(1.0 - xi1 * xi1)
+    a = np.arange(n_azi)
+    phi = 2.0 * np.pi * (a + 0.5) / n_azi
+    mu = np.outer(sint, np.cos(phi)).ravel()
+    eta = np.outer(sint, np.sin(phi)).ravel()
+    xi = np.repeat(xi1, n_azi)
+    w = np.outer(wpol, np.full(n_azi, 1.0 / n_azi)).ravel()
+    return mu, eta, xi, w
+
+
 def _azimuth_mirrors(n_polar: int, n_azi: int):
     """Index maps m -> (x-mirror, y-mirror): the ordinate with mu -> -mu and the
     one with eta -> -eta, for the product set laid out polar-major."""

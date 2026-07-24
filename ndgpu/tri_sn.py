@@ -56,7 +56,7 @@ from scipy.sparse.linalg import LinearOperator, factorized, gmres
 
 from .backend import asnumpy, get_backend
 from .materials import Material
-from .sn import SNResult, _anderson, _cmfd_power, quadrature_2d
+from .sn import SNResult, _anderson, _cmfd_power, quadrature_2d, quadrature_3d
 from .solver import Fields
 from .stencil import face_alpha, harmonic_mean
 from .tri import TriGrid
@@ -112,10 +112,21 @@ class TriSNTransportSolver:
                  outer_acceleration: str = "cmfd", max_inner: int = 800,
                  engine: str | None = None, device: str = "cpu",
                  dsa_rtol: float = 1e-4, dsa_maxiter: int = 100):
-        if len(grid.shape) != 3 or grid.shape[2] != 2:
-            raise ValueError("TriSNTransportSolver is 2D: grid shape (nr, nc, 2)")
-        if bc not in ("vacuum", "periodic"):
-            raise ValueError("bc must be 'vacuum' or 'periodic'")
+        if len(grid.shape) not in (3, 4) or grid.shape[2] != 2:
+            raise ValueError("tri-S_N grid shape must be (nr, nc, 2) or "
+                             "(nr, nc, 2, nz) for extruded prisms")
+        # bc: a single spec for all faces, or (radial, axial) for prisms. Each
+        # spec is "vacuum" or "periodic" (tri-S_N has no reflective law).
+        if isinstance(bc, (tuple, list)):
+            if len(grid.shape) != 4:
+                raise ValueError("per-(radial, axial) bc needs an extruded grid")
+            bc_radial, bc_axial = bc
+        else:
+            bc_radial = bc_axial = bc
+        for b in (bc_radial, bc_axial):
+            if b not in ("vacuum", "periodic"):
+                raise ValueError("bc specs must be 'vacuum' or 'periodic'")
+        self.bc_radial, self.bc_axial = bc_radial, bc_axial
         if scheme not in ("step", "scb"):
             raise ValueError("scheme must be 'step' or 'scb'")
         if acceleration not in self.ACCELERATIONS:
@@ -141,10 +152,25 @@ class TriSNTransportSolver:
         self.scheme = scheme
         self.grid = grid
         self.nr, self.nc = grid.shape[0], grid.shape[1]
-        self.bc = bc
+        self.bc = self.bc_radial                             # in-plane law (2D paths)
         self.h = grid.side
         self.area = (np.sqrt(3.0) / 4.0) * self.h ** 2
-        self.N = self.nr * self.nc * 2
+        self.is3d = len(grid.shape) == 4                     # extruded prisms
+        if self.is3d:
+            self.nz = grid.shape[3]
+            self.dz = grid.dz
+            self.vol = self.area * self.dz                   # prism cell measure
+            if scheme != "step":
+                raise NotImplementedError(
+                    "3D tri-S_N supports scheme='step' so far (SCB is Phase 5)")
+            engine = "lu"                                    # levels 3D is Phase 2
+            self.engine = "lu"
+            self.acceleration = "si"                         # DSA 3D is Phase 3
+            if outer_acceleration == "cmfd":                 # CMFD 3D is Phase 4
+                self.outer_acceleration = "power"
+        else:
+            self.nz = 1
+        self.N = self.nr * self.nc * 2 * self.nz
 
         mats = [materials] if isinstance(materials, Material) else list(materials)
         self.G = mats[0].n_groups
@@ -174,13 +200,18 @@ class TriSNTransportSolver:
         if require_fissile and not np.any(self.nsf):
             raise ValueError("no fissile material: k-eigenvalue is undefined")
 
-        self.mu, self.eta, self.w = quadrature_2d(n_polar, n_azi)
+        if self.is3d:
+            self.mu, self.eta, self.xi, self.w = quadrature_3d(n_polar, n_azi)
+        else:
+            self.mu, self.eta, self.w = quadrature_2d(n_polar, n_azi)
+            self.xi = None
         self.M = self.mu.size
-        self._cell = np.arange(self.N).reshape(self.nr, self.nc, 2)
+        self._cell = np.arange(self.N).reshape(grid.shape)
         self._act_flat = self.active.reshape(-1)
         self._dsa_fac = [None] * self.G                      # lazy DSA LU per group
         self._sweep_count = 0
-        self._build_nbr_maps()
+        if not self.is3d:
+            self._build_nbr_maps()                           # CMFD/currents: 2D only
         self._prefactor()
 
     def _build_nbr_maps(self):
@@ -203,6 +234,9 @@ class TriSNTransportSolver:
                 (t, tn, nic, njc, nbr_act, self.active[:, :, t], nrm))
 
     def _prefactor(self):
+        if self.is3d:
+            self._prefactor_step_3d()
+            return
         if self.engine == "levels":
             if self.scheme == "scb":
                 self._build_corners()
@@ -265,6 +299,88 @@ class TriSNTransportSolver:
                                   shape=(self.N, self.N))
                 # zero any stray couplings out of inactive rows
                 self._solvers[g][m] = factorized(A.tocsc())
+
+    @staticmethod
+    def _add_face(On, src, src_act, nbr, nbr_act, diag, rows, cols, vals):
+        """One face family's step-upwind contribution: outflow (On>0) adds |On|
+        to the source diagonal (leakage out, to a neighbour or the boundary);
+        inflow (On<0) couples On to the upwind neighbour, only where both cells
+        are active (inflow across a vacuum/void boundary contributes 0)."""
+        if On > 0.0:
+            np.add.at(diag, src.reshape(-1),
+                      np.where(src_act, On, 0.0).reshape(-1))
+        elif On < 0.0:
+            valid = src_act & nbr_act
+            s = src[valid]
+            rows.append(s); cols.append(nbr[valid])
+            vals.append(np.full(s.size, On))
+
+    def _prefactor_step_3d(self):
+        """Assemble + LU-factorize L_Omega = Omega.grad + Sigma_t (step upwind)
+        per ordinate and group on the extruded triangular-prism mesh. Each prism
+        has 3 lateral faces (tri edges extruded: area h*dz, in-plane normal, the
+        2D _EDGES normals) coupling within a z layer, plus 2 axial caps (area =
+        tri area, normal +/-z) coupling adjacent layers via the z-cosine xi."""
+        nr, nc, nz, N = self.nr, self.nc, self.nz, self.N
+        h, area, dz, vol = self.h, self.area, self.dz, self.vol
+        cell, act = self._cell, self.active                  # (nr, nc, 2, nz)
+        ii, jj = np.meshgrid(np.arange(nr), np.arange(nc), indexing="ij")
+        rad_per = self.bc_radial == "periodic"               # in-plane wrap
+        ax_per = self.bc_axial == "periodic"                 # axial wrap
+        self._solvers = [[None] * self.M for _ in range(self.G)]
+        for g in range(self.G):
+            st_vol = (self.st[g] * vol).reshape(-1)
+            for m in range(self.M):
+                mu, eta, xi = self.mu[m], self.eta[m], self.xi[m]
+                diag = st_vol.copy()
+                rows, cols, vals = [], [], []
+                for (t, di, dj, tn, (nx, ny)) in _EDGES:      # lateral faces
+                    On = (mu * nx + eta * ny) * (h * dz)
+                    ni, nj = ii + di, jj + dj
+                    if rad_per:
+                        inb = np.ones((nr, nc), bool); ni2, nj2 = ni % nr, nj % nc
+                    else:
+                        inb = (ni >= 0) & (ni < nr) & (nj >= 0) & (nj < nc)
+                        ni2, nj2 = np.clip(ni, 0, nr - 1), np.clip(nj, 0, nc - 1)
+                    nbr = np.full((nr, nc, nz), -1)
+                    nbr_act = np.zeros((nr, nc, nz), bool)
+                    nbr[inb] = cell[ni2[inb], nj2[inb], tn, :]
+                    nbr_act[inb] = act[ni2[inb], nj2[inb], tn, :]
+                    self._add_face(On, cell[:, :, t, :], act[:, :, t, :],
+                                   nbr, nbr_act, diag, rows, cols, vals)
+                kk = np.arange(nz)
+                for dk in (+1, -1):                           # axial caps
+                    On = (xi if dk > 0 else -xi) * area
+                    nk = kk + dk
+                    if ax_per:
+                        inbz = np.ones(nz, bool); nk2 = nk % nz
+                    else:
+                        inbz = (nk >= 0) & (nk < nz); nk2 = np.clip(nk, 0, nz - 1)
+                    nbr = np.full((nr, nc, 2, nz), -1)
+                    nbr_act = np.zeros((nr, nc, 2, nz), bool)
+                    nbr[:, :, :, inbz] = cell[:, :, :, nk2[inbz]]
+                    nbr_act[:, :, :, inbz] = act[:, :, :, nk2[inbz]]
+                    self._add_face(On, cell, act, nbr, nbr_act,
+                                   diag, rows, cols, vals)
+                diag = np.where(~self._act_flat, 1.0, diag)   # excised: identity
+                rows.append(np.arange(N)); cols.append(np.arange(N))
+                vals.append(diag)
+                A = sp.csr_matrix(
+                    (np.concatenate([np.atleast_1d(v) for v in vals]),
+                     (np.concatenate([np.atleast_1d(r) for r in rows]),
+                      np.concatenate([np.atleast_1d(c) for c in cols]))),
+                    shape=(N, N))
+                self._solvers[g][m] = factorized(A.tocsc())
+
+    def _sweep_3d(self, g, src_flat):
+        """One isotropic-source sweep on the prism mesh: phi = sum_m w_m psi_m,
+        psi_m = L_Omega^-1 (src * cell-volume) for active cells."""
+        self._sweep_count += 1
+        rhs = np.where(self._act_flat, src_flat * self.vol, 0.0)
+        phi = np.zeros(self.N)
+        for m in range(self.M):
+            phi += self.w[m] * self._solvers[g][m](rhs)
+        return phi
 
     # ---- level-scheduled sweep (engine="levels", the GPU path) -------------
     def _setup_levels(self):
@@ -710,6 +826,8 @@ class TriSNTransportSolver:
     def _sweep(self, g, src_flat, iface_in=None):
         """phi = Sum_m w_m L_Omega^-1 (src * area) for an isotropic source.
         iface_in (SCB only) injects a hybrid incoming flux on interface edges."""
+        if self.is3d:
+            return self._sweep_3d(g, src_flat)
         self._sweep_count += 1
         if self.engine == "levels":
             if iface_in is not None:

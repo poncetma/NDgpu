@@ -182,3 +182,49 @@ def test_levels_engine_rejects_periodic():
     with pytest.raises(ValueError, match="cycles"):
         TriSNTransportSolver(grid, M1, n_polar=2, n_azi=8, bc="periodic",
                              engine="levels")
+
+
+# ---- 3D: S_N on extruded triangular prisms (Phase 1, step differencing) -----
+
+@pytest.mark.parametrize("mat", [M1, M2])
+def test_3d_periodic_homogeneous_is_kinf(mat):
+    # Full 3D torus (radial + axial periodic): flat flux, every streaming face
+    # cancels (the prism's face normal-areas sum to zero), so k == k_inf exactly.
+    # This pins the whole prism operator -- lateral tri edges AND axial caps.
+    grid = TriGrid(shape=(6, 6, 2, 4), side=3.0, height=8.0)
+    r = TriSNTransportSolver(grid, mat, n_polar=4, n_azi=8,
+                             bc="periodic").solve(tol_k=1e-9, tol_source=1e-9)
+    assert r.converged
+    assert r.k_eff == pytest.approx(k_infinite(mat), abs=2e-6)
+    flux = r.flux[0]
+    assert flux.min() / flux.max() > 0.9999                      # flat in x,y,z
+
+
+def test_3d_axial_slab_matches_diffusion_ordering():
+    # radial-periodic + axial-vacuum reduces to a 1D axial slab (flux flat in
+    # plane), so the ONLY leakage is axial -- this exercises the axial cap scale
+    # in isolation. In this leaky slab S_N (true transport) leaks more than
+    # diffusion, which itself leaks below k_inf, and the gap stays modest: a
+    # wrong axial scale would break the ordering or blow the gap wide open.
+    # (A low-leakage slab converges to diffusion tightly but needs the DSA/CMFD
+    # acceleration of later phases; plain source iteration is too slow there.)
+    from ndgpu.tri import TriDiffusionEigenSolver
+    mat = Material(diffusion=[1.0], sigma_a=[0.004], nu_sigma_f=[0.0055],
+                   sigma_s=[[0.0]], name="d")
+    kinf = k_infinite(mat)
+    grid = TriGrid(shape=(2, 2, 2, 10), side=4.0, height=30.0)   # pure 1D axial
+    kd = TriDiffusionEigenSolver(
+        grid, mat, bc=("reflective", "reflective", "vacuum"),
+        device="cpu").solve(tol_k=1e-8, tol_source=1e-7).k_eff
+    sn = TriSNTransportSolver(grid, mat, n_polar=6, n_azi=4,
+                              bc=("periodic", "vacuum")).solve(
+        tol_k=1e-6, tol_source=1e-5, max_outer=1500)
+    assert sn.converged
+    assert sn.k_eff < kd < kinf                  # transport leaks more; both < k_inf
+    assert abs(sn.k_eff - kd) < 0.15             # gross axial-scale-error guard
+
+
+def test_3d_rejects_scb_and_levels():
+    grid = TriGrid(shape=(4, 4, 2, 2), side=3.0, height=4.0)
+    with pytest.raises(NotImplementedError, match="step"):
+        TriSNTransportSolver(grid, M1, n_polar=2, n_azi=8, scheme="scb")
