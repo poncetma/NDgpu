@@ -49,7 +49,7 @@ def neumann_preconditioner(apply_A, inv_diag, degree):
 
 
 def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
-        precond=None):
+        precond=None, check_every=1, raise_on_fail=True):
     """Solve A x = b with preconditioned CG.
 
     apply_A  : callable, x -> A x (A symmetric positive definite)
@@ -58,6 +58,14 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
     inv_diag : elementwise inverse of diag(A) (the Jacobi preconditioner)
     precond  : optional callable r -> z applying a custom SPD preconditioner
                (e.g. neumann_preconditioner); default is Jacobi via inv_diag
+    check_every : test convergence only every k iterations. Each test is a
+               ``float(...)`` device->host reduction (a sync); on GPU, spacing
+               them out cuts the per-iteration stall when many iterations are
+               expected (e.g. Jacobi-CG on a diffusion operator).
+    raise_on_fail : if False, return the current iterate after ``maxiter``
+               instead of raising -- for use as an *inexact* preconditioner
+               (e.g. a synthetic-acceleration solve) where a partial result is
+               still useful.
 
     Returns (x, n_iterations).
     """
@@ -78,16 +86,18 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
         alpha = rz / dot(p, Ap)
         x += alpha * p
         r -= alpha * Ap
-        if float(dot(r, r)) <= stop2:
+        if it % check_every == 0 and float(dot(r, r)) <= stop2:
             return x, it
         z = M(r)
         rz_new = dot(r, z)
         p = z + (rz_new / rz) * p
         rz = rz_new
-    raise RuntimeError(
-        f"PCG failed to converge in {maxiter} iterations "
-        f"(residual {float(xp.sqrt(dot(r, r))):.3e}, target {stop2**0.5:.3e})"
-    )
+    if raise_on_fail:
+        raise RuntimeError(
+            f"PCG failed to converge in {maxiter} iterations "
+            f"(residual {float(xp.sqrt(dot(r, r))):.3e}, target {stop2**0.5:.3e})"
+        )
+    return x, maxiter
 
 
 def gmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,

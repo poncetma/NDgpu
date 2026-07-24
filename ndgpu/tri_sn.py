@@ -110,7 +110,8 @@ class TriSNTransportSolver:
                  scheme: str = "step", require_fissile: bool = True,
                  mix_material=None, mix_weight=None, acceleration: str = "dsa",
                  outer_acceleration: str = "cmfd", max_inner: int = 800,
-                 engine: str | None = None, device: str = "cpu"):
+                 engine: str | None = None, device: str = "cpu",
+                 dsa_rtol: float = 1e-4, dsa_maxiter: int = 100):
         if len(grid.shape) != 3 or grid.shape[2] != 2:
             raise ValueError("TriSNTransportSolver is 2D: grid shape (nr, nc, 2)")
         if bc not in ("vacuum", "periodic"):
@@ -135,6 +136,8 @@ class TriSNTransportSolver:
         self.acceleration = acceleration
         self.outer_acceleration = outer_acceleration
         self.max_inner = max_inner
+        self.dsa_rtol = dsa_rtol            # device DSA solve: loose tol + capped
+        self.dsa_maxiter = dsa_maxiter      # iters (a preconditioner, not exact)
         self.scheme = scheme
         self.grid = grid
         self.nr, self.nc = grid.shape[0], grid.shape[1]
@@ -352,6 +355,8 @@ class TriSNTransportSolver:
         self._lv_group = {}
         self._graphs = {}
         self.graphs_active = None                # None until a GPU sweep runs
+        self._graph_error = None                 # reason capture fell back, if any
+        self._act_flat_dev = xp.asarray(self._act_flat)   # device-resident masks
         if scb:
             d = self._scb
             ac, K = d["ac"], d["K"]
@@ -383,11 +388,13 @@ class TriSNTransportSolver:
             self._bufs = dict(
                 psi=xp.zeros(M * K * 3), rhs=xp.zeros(K),
                 IF=xp.zeros((M * K, 3)),
-                mk=xp.zeros((M, K)), phk=xp.zeros((1, K)),
-                w3row=xp.asarray(self.w[None, :] / 3.0),
+                mk=xp.zeros((M, K)), mk_w=xp.zeros((M, K)), phk=xp.zeros(K),
+                w3col=xp.asarray(self.w[:, None] / 3.0),
                 work=[(xp.zeros((n, 3, 2)), xp.zeros((n, 3)), xp.zeros(n),
-                       xp.zeros((n, 3)), xp.zeros((n, 3, 1)))
+                       xp.zeros((n, 3)), xp.zeros((n, 3, 3)), xp.zeros((n, 3)))
                       for n in (b - a for a, b in spans)])
+            self._ac_dev = xp.asarray(ac)
+            self._bufs["phiN"] = xp.zeros(N)          # full-N device phi scatter
         else:
             pidx = mm * N + cc
             off = (np.arange(M) * N)[:, None, None]
@@ -403,7 +410,8 @@ class TriSNTransportSolver:
                                      xp.asarray(coef[p])))
             self._bufs = dict(
                 psi=xp.zeros(M * N), rhs=xp.zeros(N),
-                phiM=xp.zeros((1, N)), wrow=xp.asarray(self.w[None, :]),
+                phiM=xp.zeros(N), psiw=xp.zeros((M, N)),
+                wcol=xp.asarray(self.w[:, None]),
                 work=[(xp.zeros((n, 3)), xp.zeros(n), xp.zeros(n))
                       for n in (b - a for a, b in spans)])
 
@@ -466,12 +474,15 @@ class TriSNTransportSolver:
                 xp.add(red, rg, out=red)
                 xp.divide(red, den, out=red)
                 xp.put(psi, pidx, red)
-            xp.matmul(bufs["wrow"], psi.reshape(self.M, self.N),
-                      out=bufs["phiM"])
+            # phi_n = sum_m w_m psi[m, n]: an elementwise weight + a reduction
+            # (NOT matmul -- cuBLAS calls cannot be captured into a CUDA graph).
+            xp.multiply(psi.reshape(self.M, self.N), bufs["wcol"],
+                        out=bufs["psiw"])
+            xp.sum(bufs["psiw"], axis=0, out=bufs["phiM"])
             return
         base = bufs["rhs"]
         IF = bufs["IF"]
-        for (rr, pidx, sidx, nbr, coef), Binv, (gl, b2, bb, ifl, p3) in zip(
+        for (rr, pidx, sidx, nbr, coef), Binv, (gl, b2, bb, ifl, bm, p3) in zip(
                 self._levels, tab, bufs["work"]):
             xp.take(psi, nbr, out=gl)
             xp.multiply(gl, coef, out=gl)
@@ -481,11 +492,16 @@ class TriSNTransportSolver:
             if iface:
                 xp.take(IF, pidx, axis=0, out=ifl)
                 xp.add(b2, ifl, out=b2)
-            xp.matmul(Binv, b2.reshape(-1, 3, 1), out=p3)
+            # p3 = Binv @ b2, batched 3x3 matvec written as broadcast-multiply +
+            # reduction so the captured loop calls no cuBLAS.
+            xp.multiply(Binv, b2[:, None, :], out=bm)
+            xp.sum(bm, axis=2, out=p3)
             xp.put(psi, sidx, p3)
         K = self._scb["K"]
         xp.sum(psi.reshape(self.M, K, 3), axis=2, out=bufs["mk"])
-        xp.matmul(bufs["w3row"], bufs["mk"], out=bufs["phk"])
+        # phi_k = sum_m (w_m/3) mk[m, k]: weight + reduction, no cuBLAS.
+        xp.multiply(bufs["mk"], bufs["w3col"], out=bufs["mk_w"])
+        xp.sum(bufs["mk_w"], axis=0, out=bufs["phk"])
 
     def _levels_exec(self, g, iface):
         """Execute the level loop -- directly on numpy; on cupy, captured once
@@ -507,16 +523,23 @@ class TriSNTransportSolver:
             try:
                 stream = xp.cuda.Stream(non_blocking=True)
                 with stream:
+                    # Warm-up: run once so the memory pool caches every scratch
+                    # block and the kernels are compiled. Allocating from the
+                    # pool (cudaMalloc) is illegal *during* capture, so the pool
+                    # must already hold every block the captured run will reuse.
+                    self._run_levels(g, iface)
+                    stream.synchronize()
                     stream.begin_capture()
                     self._run_levels(g, iface)
                     graph = stream.end_capture()
                 self._graphs[key] = graph
                 self.graphs_active = True
-            except Exception:
+            except Exception as e:               # capture unsupported/failed
                 try:
                     stream.end_capture()
                 except Exception:
                     pass
+                self._graph_error = f"{type(e).__name__}: {e}"
                 self._graphs[key] = "fallback"
                 if self.graphs_active is None:
                     self.graphs_active = False
@@ -531,6 +554,97 @@ class TriSNTransportSolver:
             np.copyto(buf, values)
         else:
             buf.set(np.ascontiguousarray(values))
+
+    def _make_diff_solver(self, A_host, symmetric):
+        """Return a callable ``solve(b) -> x`` for the assembled diffusion
+        operator, on the solver's backend. NumPy: an exact sparse LU (scipy
+        ``factorized``, cheap reused back-solves). CuPy: the operator is moved
+        to the device once and solved iteratively -- Jacobi-preconditioned CG
+        when ``symmetric`` (the DSA operator), else BiCGStab (the non-symmetric
+        CMFD drift operator). On CuPy ``b`` and the returned ``x`` are device
+        arrays, so the caller's iteration never leaves the GPU."""
+        if self.xp is np:
+            return factorized(A_host.tocsc())
+        xp = self.xp
+        import cupyx.scipy.sparse as csp
+        from .linalg import pcg, bicgstab
+        Ad = csp.csr_matrix(A_host.tocsr())
+        inv_diag = 1.0 / Ad.diagonal()
+        # DSA/CMFD is an ACCELERATOR, not part of the fixed point -- an inexact
+        # solve only changes the outer rate, so cap the iterations and check
+        # convergence rarely (each check is a GPU sync). The source-iteration
+        # watchdog drops the acceleration if a too-weak solve stops contracting.
+        rtol, maxit = self.dsa_rtol, self.dsa_maxiter
+        chk = max(1, min(maxit, 25))
+
+        def _solve(b):
+            if symmetric:
+                x, _ = pcg(lambda x: Ad @ x, b, xp.zeros_like(b), inv_diag, xp,
+                           rtol=rtol, maxiter=maxit, check_every=chk,
+                           raise_on_fail=False)
+            else:
+                x, _ = bicgstab(lambda x: Ad @ x, b, xp.zeros_like(b), inv_diag,
+                                xp, rtol=rtol, maxiter=maxit)
+            return x
+        return _solve
+
+    def _sweep_dev(self, g, src_dev):
+        """Device-resident isotropic sweep for the levels engine: ``src_dev``
+        is a backend array and the returned ``(phi_N, psi)`` are backend arrays
+        too (no host round-trip), so a within-group iteration can stay on the
+        GPU. ``phi_N`` is a reused buffer -- copy it if it must outlive the next
+        sweep. Mirrors ``_sweep_levels`` exactly, only the source assembly and
+        flux read-out move onto the device."""
+        self._sweep_count += 1
+        xp, bufs = self.xp, self._bufs
+        if self.scheme == "step":
+            rhs = bufs["rhs"]
+            xp.multiply(src_dev, self.area, out=rhs)
+            rhs *= self._act_flat_dev                # zero the excised cells
+            self._levels_exec(g, False)
+            return bufs["phiM"].ravel(), bufs["psi"]
+        ac = self._ac_dev
+        xp.take(src_dev, ac, out=bufs["rhs"])
+        bufs["rhs"] *= (self.area / 3.0)
+        self._levels_exec(g, False)
+        pf = bufs["phiN"]
+        pf.fill(0.0)
+        pf[ac] = bufs["phk"].ravel()
+        return pf, bufs["psi"]
+
+    def _solve_group_dev(self, g, qext_flat, phi0, tol):
+        """The (DSA-accelerated) within-group source iteration, run entirely on
+        the backend for the levels engine: the sweep, the scattering source and
+        the DSA diffusion correction all operate on device arrays, so the only
+        host<->device traffic is ``qext_flat``/``phi0`` in and the flux out (per
+        group per outer -- not per sweep). Numerically identical to the host
+        loop in ``_solve_group``; on NumPy it simply runs on NumPy."""
+        xp = self.xp
+        ss = xp.asarray(self.ss_self[g].reshape(-1))
+        b = self._sweep_dev(g, xp.asarray(qext_flat))[0].copy()
+        tol = min(tol, 1e-4)
+        accelerate = self.acceleration == "dsa"
+        fac = self._dsa_factor(g) if accelerate else None
+        phi = xp.asarray(np.asarray(phi0, float))
+        prev = None
+        bad = 0
+        for _ in range(self.max_inner):
+            half = b + self._sweep_dev(g, ss * phi)[0]
+            new = half + fac(ss * (half - phi)) if accelerate else half
+            d = float(xp.max(xp.abs(new - phi)))
+            scale = max(float(xp.max(xp.abs(new))), 1e-300)
+            phi = new
+            if d <= tol * scale:
+                break
+            if accelerate:
+                if prev is not None and d > prev:
+                    bad += 1
+                    if bad >= 3:
+                        accelerate = False
+                else:
+                    bad = 0
+                prev = d
+        return asnumpy(phi)
 
     def _sweep_levels(self, g, src_flat, iface_in=None):
         """One batched level-scheduled sweep; returns (phi, psi) with psi the
@@ -792,57 +906,64 @@ class TriSNTransportSolver:
         return J
 
     # ---- diffusion synthetic acceleration ---------------------------------
-    def _dsa_factor(self, g):
-        """Sparse LU of the group-g DSA diffusion operator, built on first use.
+    def _dsa_matrix(self, g):
+        """Assemble the group-g DSA diffusion operator (scipy CSR, host).
 
         Triangular finite-volume diffusion matching TriGroupOperator: harmonic
         face D = 1/(3 Sigma_t) with 4D/h^2 coupling, removal = Sigma_t -
         Sigma_s,gg. Faces from an active cell onto an excised/off-mesh cell get
         the Marshak-vacuum Robin term -- the within-group *error* equation has
         zero incoming flux there (any prescribed incoming, boundary or hybrid
-        iface_in, is a fixed source) -- and the periodic torus wraps."""
+        iface_in, is a fixed source) -- and the periodic torus wraps. Split out
+        of _dsa_factor so the assembled operator can be reused (e.g. the Phase-0
+        device-solver bake-off benchmarks solves on this real matrix)."""
+        nr, nc, N, h = self.nr, self.nc, self.N, self.h
+        st = np.maximum(self.st[g].reshape(-1), 1e-12)
+        ss = self.ss_self[g].reshape(-1)
+        Dv = 1.0 / (3.0 * st)
+        kf = 4.0 / (h * h)
+        alpha = face_alpha("vacuum")
+        cell, act = self._cell, self.active
+        diag = np.maximum(st - ss, 1e-12).astype(float)
+        rows, cols, vals = [], [], []
+        ii, jj = np.meshgrid(np.arange(nr), np.arange(nc), indexing="ij")
+        for (t, di, dj, tn, _) in _EDGES:
+            src = cell[:, :, t]
+            src_act = act[:, :, t]
+            ni, nj = ii + di, jj + dj
+            if self.bc == "periodic":
+                ni, nj = ni % nr, nj % nc
+                inb = np.ones_like(ni, bool)
+            else:
+                inb = (ni >= 0) & (ni < nr) & (nj >= 0) & (nj < nc)
+            nbr = np.where(inb, cell[np.clip(ni, 0, nr - 1),
+                                     np.clip(nj, 0, nc - 1), tn], -1)
+            nbr_act = np.zeros((nr, nc), bool)
+            nbr_act[inb] = act[ni[inb], nj[inb], tn]
+            both = src_act & nbr_act                     # interior coupled face
+            if both.any():
+                w = harmonic_mean(Dv[src[both]], Dv[nbr[both]]) * kf
+                rows.append(src[both]); cols.append(nbr[both]); vals.append(-w)
+                np.add.at(diag, src[both], w)
+            vac = src_act & ~both                        # zero-incoming error face
+            if vac.any():
+                Dc = Dv[src[vac]]
+                term = (8.0 * Dc * alpha
+                        / (h * (h * alpha + 2.0 * np.sqrt(3.0) * Dc)))
+                np.add.at(diag, src[vac], term)
+        diag = np.where(self._act_flat, diag, 1.0)       # excised: unit diagonal
+        rows.append(np.arange(N)); cols.append(np.arange(N)); vals.append(diag)
+        return sp.csr_matrix((np.concatenate([np.atleast_1d(v) for v in vals]),
+                             (np.concatenate([np.atleast_1d(r) for r in rows]),
+                              np.concatenate([np.atleast_1d(c) for c in cols]))),
+                             shape=(N, N))
+
+    def _dsa_factor(self, g):
+        """Backend solver for the group-g DSA diffusion operator, built on
+        first use (host: exact LU; device: capped inexact iterative)."""
         if self._dsa_fac[g] is None:
-            nr, nc, N, h = self.nr, self.nc, self.N, self.h
-            st = np.maximum(self.st[g].reshape(-1), 1e-12)
-            ss = self.ss_self[g].reshape(-1)
-            Dv = 1.0 / (3.0 * st)
-            kf = 4.0 / (h * h)
-            alpha = face_alpha("vacuum")
-            cell, act = self._cell, self.active
-            diag = np.maximum(st - ss, 1e-12).astype(float)
-            rows, cols, vals = [], [], []
-            ii, jj = np.meshgrid(np.arange(nr), np.arange(nc), indexing="ij")
-            for (t, di, dj, tn, _) in _EDGES:
-                src = cell[:, :, t]
-                src_act = act[:, :, t]
-                ni, nj = ii + di, jj + dj
-                if self.bc == "periodic":
-                    ni, nj = ni % nr, nj % nc
-                    inb = np.ones_like(ni, bool)
-                else:
-                    inb = (ni >= 0) & (ni < nr) & (nj >= 0) & (nj < nc)
-                nbr = np.where(inb, cell[np.clip(ni, 0, nr - 1),
-                                         np.clip(nj, 0, nc - 1), tn], -1)
-                nbr_act = np.zeros((nr, nc), bool)
-                nbr_act[inb] = act[ni[inb], nj[inb], tn]
-                both = src_act & nbr_act                     # interior coupled face
-                if both.any():
-                    w = harmonic_mean(Dv[src[both]], Dv[nbr[both]]) * kf
-                    rows.append(src[both]); cols.append(nbr[both]); vals.append(-w)
-                    np.add.at(diag, src[both], w)
-                vac = src_act & ~both                        # zero-incoming error face
-                if vac.any():
-                    Dc = Dv[src[vac]]
-                    term = (8.0 * Dc * alpha
-                            / (h * (h * alpha + 2.0 * np.sqrt(3.0) * Dc)))
-                    np.add.at(diag, src[vac], term)
-            diag = np.where(self._act_flat, diag, 1.0)       # excised: unit diagonal
-            rows.append(np.arange(N)); cols.append(np.arange(N)); vals.append(diag)
-            A = sp.csr_matrix((np.concatenate([np.atleast_1d(v) for v in vals]),
-                               (np.concatenate([np.atleast_1d(r) for r in rows]),
-                                np.concatenate([np.atleast_1d(c) for c in cols]))),
-                              shape=(N, N))
-            self._dsa_fac[g] = factorized(A.tocsc())
+            self._dsa_fac[g] = self._make_diff_solver(self._dsa_matrix(g),
+                                                      symmetric=True)
         return self._dsa_fac[g]
 
     # ---- CMFD outer acceleration ------------------------------------------
@@ -978,6 +1099,10 @@ class TriSNTransportSolver:
             phi, _ = gmres(A, b, x0=phi0, M=M, rtol=tol, atol=0.0, maxiter=400)
             return phi
 
+        # levels engine: run the whole source iteration device-resident.
+        if self.engine == "levels" and iface_in is None:
+            return self._solve_group_dev(g, qext_flat, phi0, tol)
+
         # (DSA-accelerated) source iteration, mirroring the Cartesian solver:
         # each sweep is followed by the diffusion error correction; if the
         # update norm stops contracting the acceleration is dropped.
@@ -1004,11 +1129,18 @@ class TriSNTransportSolver:
                 prev = d
         return phi
 
+    def _sync(self):
+        """Block until queued device work is done -- makes wall-clock timers
+        honest on GPU (a no-op on NumPy)."""
+        if self.xp is not np:
+            self.xp.cuda.Stream.null.synchronize()
+
     def solve(self, tol_k: float = 1e-7, tol_source: float = 1e-6,
               max_outer: int = 500, verbose: bool = False) -> SNResult:
         t0 = time.perf_counter()
         G, N = self.G, self.N
         sweeps0 = self._sweep_count
+        self.t_groups = self.t_cmfd = self.t_power = 0.0   # component wall times
         phi = [np.where(self._act_flat, 1.0, 0.0) for _ in range(G)]
         nsf = [self.nsf[g].reshape(-1) for g in range(G)]
         chi = [self.chi[g].reshape(-1) for g in range(G)]
@@ -1030,6 +1162,7 @@ class TriSNTransportSolver:
             tol = min(1e-3, max(0.05 * prev_rel, 0.01 * tol_k, 1e-10))
             fiss_in = fiss
             phi_new = [None] * G
+            tg = time.perf_counter()
             for g in range(G):
                 q = chi[g] * fs
                 for gf in range(G):
@@ -1037,11 +1170,14 @@ class TriSNTransportSolver:
                         src = phi_new[gf] if gf < g else phi[gf]
                         q = q + scat[gf][g] * src
                 phi_new[g] = self._solve_group(g, q, phi[g], tol)
+            self._sync()
+            self.t_groups += time.perf_counter() - tg
             cmfd_ok = False
             if self.outer_acceleration == "cmfd":
                 # one current-accumulating sweep per group with the converged
                 # within-group source -> consistent (flux, current) pairs; the
                 # drift-corrected diffusion eigensolve replaces the iterate.
+                tc = time.perf_counter()
                 phi_h, facs = [None] * G, [None] * G
                 for g in range(G):
                     q = chi[g] * fs
@@ -1051,7 +1187,11 @@ class TriSNTransportSolver:
                     ps, J6 = self._sweep_currents(g, ss[g] * phi_new[g] + q)
                     phi_h[g] = ps
                     facs[g] = self._cmfd_factor(g, ps, J6)
+                self._sync()
+                tp = time.perf_counter()
                 phi_c, k_c, cmfd_ok = _cmfd_power(facs, nsf, chi, scat, phi_h, k)
+                self.t_power += time.perf_counter() - tp
+                self.t_cmfd += time.perf_counter() - tc
                 if cmfd_ok:
                     phi_new = phi_c
             fiss_new = sum(nsf[g] * phi_new[g] for g in range(G))
