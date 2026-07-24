@@ -307,3 +307,18 @@ def test_3d_cmfd_matches_power_with_fewer_outers():
     assert pw.converged and cm.converged
     assert cm.k_eff == pytest.approx(pw.k_eff, abs=1e-6)
     assert cm.outer_iterations < pw.outer_iterations
+
+
+def test_3d_cmfd_multigrid_solver_matches_lu():
+    # cmfd_solver="mg" (pyamg smoothed-aggregation + BiCGStab, the O(N) CMFD
+    # solve for large 3D meshes where sparse LU is O(N^2)/O(N^4/3) fill) must
+    # reproduce the LU-CMFD eigenvalue on the non-symmetric drift matrix.
+    pytest.importorskip("pyamg")
+    grid = TriGrid(shape=(8, 8, 2, 6), side=3.0, height=18.0)
+    kw = dict(n_polar=4, n_azi=4, bc="vacuum", outer_acceleration="cmfd")
+    lu = TriSNTransportSolver(grid, M1, cmfd_solver="lu", **kw).solve(
+        tol_k=1e-7, tol_source=1e-6)
+    mg = TriSNTransportSolver(grid, M1, cmfd_solver="mg", **kw).solve(
+        tol_k=1e-7, tol_source=1e-6)
+    assert lu.converged and mg.converged
+    assert mg.k_eff == pytest.approx(lu.k_eff, abs=1e-6)

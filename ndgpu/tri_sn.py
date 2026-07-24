@@ -111,7 +111,8 @@ class TriSNTransportSolver:
                  mix_material=None, mix_weight=None, acceleration: str = "dsa",
                  outer_acceleration: str = "cmfd", max_inner: int = 800,
                  engine: str | None = None, device: str = "cpu",
-                 dsa_rtol: float = 1e-4, dsa_maxiter: int = 100):
+                 dsa_rtol: float = 1e-4, dsa_maxiter: int = 100,
+                 cmfd_solver: str = "lu"):
         if len(grid.shape) not in (3, 4) or grid.shape[2] != 2:
             raise ValueError("tri-S_N grid shape must be (nr, nc, 2) or "
                              "(nr, nc, 2, nz) for extruded prisms")
@@ -150,6 +151,7 @@ class TriSNTransportSolver:
         self.max_inner = max_inner
         self.dsa_rtol = dsa_rtol            # device DSA solve: loose tol + capped
         self.dsa_maxiter = dsa_maxiter      # iters (a preconditioner, not exact)
+        self.cmfd_solver = cmfd_solver      # CMFD solve: "lu" or "mg" (O(N), 3D)
         self.scheme = scheme
         self.grid = grid
         self.nr, self.nc = grid.shape[0], grid.shape[1]
@@ -1516,7 +1518,7 @@ class TriSNTransportSolver:
         A = sp.csr_matrix((np.concatenate(vals),
                            (np.concatenate(rows), np.concatenate(cols))),
                           shape=(N, N))
-        return factorized(A.tocsc())
+        return self._make_cmfd_solver(A)
 
     def _faces_3d(self):
         """Directed faces of the prism mesh for CMFD, each yielded once per
@@ -1592,12 +1594,18 @@ class TriSNTransportSolver:
         return phi, currents
 
     def _cmfd_factor_3d(self, g, p, currents):
-        """Drift-corrected FV diffusion LU on the prism mesh (3D CMFD): per
-        directed face J = -beta (phi_n - phi_c) + gamma (phi_n + phi_c), beta
-        the TriGroupOperator lateral/axial coupling with odCMFD thick-cell
-        damping, gamma fitted to the transport current; excised/boundary faces
-        carry the transport leakage ratio. Assembled per volume (Lv = face
-        length / cell volume) from both sides of every face."""
+        """Solver for the group-g drift-corrected prism diffusion operator (LU,
+        or multigrid when cmfd_solver='mg' -- 3D sparse LU is O(N^2)/O(N^4/3)
+        fill and blows up, while AMG stays O(N))."""
+        return self._make_cmfd_solver(self._cmfd_matrix_3d(g, p, currents))
+
+    def _cmfd_matrix_3d(self, g, p, currents):
+        """Assemble the drift-corrected FV diffusion operator on the prism mesh
+        (scipy CSR, host): per directed face J = -beta (phi_n - phi_c) +
+        gamma (phi_n + phi_c), beta the TriGroupOperator lateral/axial coupling
+        with odCMFD thick-cell damping, gamma fitted to the transport current;
+        excised/boundary faces carry the transport leakage ratio. Per volume
+        (Lv = face length / cell volume), from both sides of every face."""
         N = self.N
         st = self.st[g].reshape(-1)
         D = 1.0 / (3.0 * np.maximum(st, 1e-12))
@@ -1623,10 +1631,27 @@ class TriSNTransportSolver:
                 s_ = src[bnd]
                 gb = J[bnd] / np.maximum(p[s_], tiny)
                 rows.append(s_); cols.append(s_); vals.append(Lv * gb)
-        A = sp.csr_matrix((np.concatenate(vals),
-                           (np.concatenate(rows), np.concatenate(cols))),
-                          shape=(N, N))
-        return factorized(A.tocsc())
+        return sp.csr_matrix((np.concatenate(vals),
+                              (np.concatenate(rows), np.concatenate(cols))),
+                             shape=(N, N))
+
+    def _make_cmfd_solver(self, A):
+        """Solver for a CMFD drift matrix. Default: scipy sparse LU. With
+        cmfd_solver='mg': smoothed-aggregation multigrid preconditioning a
+        Krylov solve (BiCGStab -- the drift operator is non-symmetric), which
+        stays O(N) where the 3D LU factorisation blows up."""
+        if getattr(self, "cmfd_solver", "lu") != "mg":
+            return factorized(A.tocsc())
+        try:
+            import pyamg
+        except ImportError as e:                             # optional dependency
+            raise ImportError("cmfd_solver='mg' needs pyamg (pip install pyamg) "
+                              "-- the O(N) CMFD solve for large 3D meshes") from e
+        ml = pyamg.smoothed_aggregation_solver(A.tocsr(), max_coarse=400)
+
+        def solve(b):
+            return ml.solve(b, tol=1e-9, accel="bicgstab", maxiter=200)
+        return solve
 
     def _solve_group(self, g, qext_flat, phi0, tol, iface_in=None):
         """Within-group scattering solve with the configured acceleration; the
