@@ -270,3 +270,18 @@ def test_3d_levels_rejects_periodic():
     with pytest.raises(ValueError, match="cycles"):
         TriSNTransportSolver(grid, M1, n_polar=2, n_azi=8,
                              bc=("periodic", "vacuum"), engine="levels")
+
+
+def test_3d_cmfd_matches_power_with_fewer_outers():
+    # 3D CMFD builds a drift-corrected prism diffusion eigenproblem from the
+    # transport face currents (3 lateral + 2 axial per cell); it must reproduce
+    # the power-iteration eigenvalue exactly and cut the outer count.
+    grid = TriGrid(shape=(8, 8, 2, 6), side=3.0, height=24.0)
+    kw = dict(n_polar=4, n_azi=4, bc="vacuum")
+    pw = TriSNTransportSolver(grid, M1, outer_acceleration="power", **kw).solve(
+        tol_k=1e-7, tol_source=1e-6, max_outer=500)
+    cm = TriSNTransportSolver(grid, M1, outer_acceleration="cmfd", **kw).solve(
+        tol_k=1e-7, tol_source=1e-6, max_outer=500)
+    assert pw.converged and cm.converged
+    assert cm.k_eff == pytest.approx(pw.k_eff, abs=1e-6)
+    assert cm.outer_iterations < pw.outer_iterations

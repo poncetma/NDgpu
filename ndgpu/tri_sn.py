@@ -166,8 +166,6 @@ class TriSNTransportSolver:
                     "3D tri-S_N supports scheme='step' so far (SCB is Phase 5)")
             if acceleration in ("gmres", "dsa-gmres"):       # Phase 3: dsa / si
                 self.acceleration = "dsa"
-            if outer_acceleration == "cmfd":                 # CMFD 3D is Phase 4
-                self.outer_acceleration = "power"
         else:
             self.nz = 1
         self.N = self.nr * self.nc * 2 * self.nz
@@ -1392,6 +1390,116 @@ class TriSNTransportSolver:
                           shape=(N, N))
         return factorized(A.tocsc())
 
+    def _faces_3d(self):
+        """Directed faces of the prism mesh for CMFD, each yielded once per
+        source side (currents are antisymmetric, so both sides give a row).
+        Returns per face: source/neighbour flat-id + activity grids, the
+        ordinate cosine Omega.n_hat(m), the face length/volume ratio Lv, the
+        per-length diffusion coupling beta(Ds,Dn), and the normal-direction cell
+        size (for odCMFD thick-cell damping)."""
+        nr, nc, nz = self.nr, self.nc, self.nz
+        h, dz, area = self.h, self.dz, self.area
+        cell, act = self._cell, self.active
+        ii, jj = np.meshgrid(np.arange(nr), np.arange(nc), indexing="ij")
+        s3 = np.sqrt(3.0)
+        Lv_lat, Lv_ax = 4.0 / (s3 * h), 1.0 / dz
+        rad_per, ax_per = self.bc_radial == "periodic", self.bc_axial == "periodic"
+        for (t, di, dj, tn, (nx, ny)) in _EDGES:              # lateral
+            if rad_per:
+                inb = np.ones((nr, nc), bool)
+                ni, nj = (ii + di) % nr, (jj + dj) % nc
+            else:
+                inb = (ii + di >= 0) & (ii + di < nr) & (jj + dj >= 0) & (jj + dj < nc)
+                ni, nj = np.clip(ii + di, 0, nr - 1), np.clip(jj + dj, 0, nc - 1)
+            nbr = np.full((nr, nc, nz), -1)
+            nbr_act = np.zeros((nr, nc, nz), bool)
+            nbr[inb] = cell[ni[inb], nj[inb], tn, :]
+            nbr_act[inb] = act[ni[inb], nj[inb], tn, :]
+            yield (cell[:, :, t, :], act[:, :, t, :], nbr, nbr_act,
+                   (nx, ny, 0.0), Lv_lat,
+                   lambda Ds, Dn: s3 * harmonic_mean(Ds, Dn) / h, h)
+        kk = np.arange(nz)
+        for dk in (+1, -1):                                   # axial caps
+            nk = kk + dk
+            if ax_per:
+                inbz = np.ones(nz, bool); nk2 = nk % nz
+            else:
+                inbz = (nk >= 0) & (nk < nz); nk2 = np.clip(nk, 0, nz - 1)
+            nbr = np.full((nr, nc, 2, nz), -1)
+            nbr_act = np.zeros((nr, nc, 2, nz), bool)
+            nbr[:, :, :, inbz] = cell[:, :, :, nk2[inbz]]
+            nbr_act[:, :, :, inbz] = act[:, :, :, nk2[inbz]]
+            yield (cell, act, nbr, nbr_act, (0.0, 0.0, float(dk)), Lv_ax,
+                   lambda Ds, Dn: harmonic_mean(Ds, Dn) / dz, dz)
+
+    def _sweep_currents_3d(self, g, src_flat):
+        """Prism sweep that also folds the per-face net current density
+        J = sum_m w_m (Omega.n_hat) psi_upwind (upwind = source cell on outflow,
+        neighbour on inflow), one array per directed face of _faces_3d, so the
+        transport cell balance div J + Sigma_t phi = src holds and CMFD's fixed
+        point is the transport solution."""
+        M, N = self.M, self.N
+        if self.engine == "levels":
+            phi, psi = self._sweep_levels(g, src_flat)
+            psi_mn = asnumpy(psi).reshape(M, N)
+        else:
+            self._sweep_count += 1
+            rhs = np.where(self._act_flat, src_flat * self.vol, 0.0)
+            psi_mn = np.stack([self._solvers[g][m](rhs) for m in range(M)])
+            phi = (self.w[:, None] * psi_mn).sum(0)
+        currents = []
+        for (src, src_act, nbr, nbr_act, (nx, ny, nz_), Lv, beta, hd) \
+                in self._faces_3d():
+            J = np.zeros(src.shape)
+            for m in range(M):
+                c = self.mu[m] * nx + self.eta[m] * ny + self.xi[m] * nz_
+                if c > 0.0:
+                    face = psi_mn[m][src]
+                elif c < 0.0:
+                    face = np.where(nbr_act, psi_mn[m][nbr], 0.0)
+                else:
+                    continue
+                J += (self.w[m] * c) * np.where(src_act, face, 0.0)
+            currents.append(J)
+        return phi, currents
+
+    def _cmfd_factor_3d(self, g, p, currents):
+        """Drift-corrected FV diffusion LU on the prism mesh (3D CMFD): per
+        directed face J = -beta (phi_n - phi_c) + gamma (phi_n + phi_c), beta
+        the TriGroupOperator lateral/axial coupling with odCMFD thick-cell
+        damping, gamma fitted to the transport current; excised/boundary faces
+        carry the transport leakage ratio. Assembled per volume (Lv = face
+        length / cell volume) from both sides of every face."""
+        N = self.N
+        st = self.st[g].reshape(-1)
+        D = 1.0 / (3.0 * np.maximum(st, 1e-12))
+        rem = st - self.ss_self[g].reshape(-1)
+        tiny = 1e-30
+        diag = np.where(self._act_flat, rem, 1.0)
+        rows, cols, vals = [np.arange(N)], [np.arange(N)], [diag]
+        for (src, src_act, nbr, nbr_act, _n, Lv, beta_fn, hd), J in zip(
+                self._faces_3d(), currents):
+            both = src_act & nbr_act
+            if both.any():
+                s_, n_ = src[both], nbr[both]
+                beta = beta_fn(D[s_], D[n_])
+                tau = np.maximum(st[s_], st[n_]) * hd        # optical thickness
+                beta = beta + 0.25 * np.maximum(0.0, 1.0 - 1.0
+                                                / np.maximum(tau, tiny))
+                gh = (J[both] + beta * (p[n_] - p[s_])) \
+                    / np.maximum(p[s_] + p[n_], tiny)
+                rows.append(s_); cols.append(s_); vals.append(Lv * (beta + gh))
+                rows.append(s_); cols.append(n_); vals.append(Lv * (-beta + gh))
+            bnd = src_act & ~both
+            if bnd.any():
+                s_ = src[bnd]
+                gb = J[bnd] / np.maximum(p[s_], tiny)
+                rows.append(s_); cols.append(s_); vals.append(Lv * gb)
+        A = sp.csr_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(N, N))
+        return factorized(A.tocsc())
+
     def _solve_group(self, g, qext_flat, phi0, tol, iface_in=None):
         """Within-group scattering solve with the configured acceleration; the
         boundary is vacuum/periodic (folded into L_Omega), so no boundary fixed
@@ -1501,9 +1609,13 @@ class TriSNTransportSolver:
                     for gf in range(G):
                         if gf != g and scat[gf][g] is not None:
                             q = q + scat[gf][g] * phi_new[gf]
-                    ps, J6 = self._sweep_currents(g, ss[g] * phi_new[g] + q)
+                    if self.is3d:
+                        ps, cur = self._sweep_currents_3d(g, ss[g] * phi_new[g] + q)
+                        facs[g] = self._cmfd_factor_3d(g, ps, cur)
+                    else:
+                        ps, J6 = self._sweep_currents(g, ss[g] * phi_new[g] + q)
+                        facs[g] = self._cmfd_factor(g, ps, J6)
                     phi_h[g] = ps
-                    facs[g] = self._cmfd_factor(g, ps, J6)
                 self._sync()
                 tp = time.perf_counter()
                 phi_c, k_c, cmfd_ok = _cmfd_power(facs, nsf, chi, scat, phi_h, k)
