@@ -220,19 +220,21 @@ def diffusion_matrix(D, removal, hx, hy, bc, active=None):
     return A.tocsc()
 
 
-def _anderson(hist):
+def _anderson(hist, xp=np):
     """Anderson-accelerated next iterate from (input, raw_output) pairs (latest
     last): the residual-minimizing affine combination that collapses the slow
-    fixed-point modes. Falls back to the plain iterate with < 2 pairs."""
+    fixed-point modes. Falls back to the plain iterate with < 2 pairs. Runs on
+    the backend ``xp`` (the small normal-equations solve stays on the host --
+    the m<=6 dot products reduce to host scalars)."""
     raw = hist[-1][1]
     if len(hist) < 2:
         return raw
     res = [gj - sj for sj, gj in hist]
     dres = [res[i] - res[-1] for i in range(len(res) - 1)]
     m = len(dres)
-    A = np.array([[float(np.dot(dres[i], dres[j])) for j in range(m)]
+    A = np.array([[float(xp.sum(dres[i] * dres[j])) for j in range(m)]
                   for i in range(m)])
-    b = np.array([-float(np.dot(dres[i], res[-1])) for i in range(m)])
+    b = np.array([-float(xp.sum(dres[i] * res[-1])) for i in range(m)])
     A[np.diag_indices(m)] += 1e-12 * (np.trace(A) + 1e-300)
     try:
         gamma = np.linalg.solve(A, b)
@@ -242,21 +244,28 @@ def _anderson(hist):
         return raw
     out = raw.copy()
     for j in range(m):
-        out += gamma[j] * (hist[j][1] - hist[-1][1])
+        out += float(gamma[j]) * (hist[j][1] - hist[-1][1])
     return out
 
 
-def _cmfd_power(facs, nsf, chi, scatter, phi0, k0):
+def _cmfd_power(facs, nsf, chi, scatter, phi0, k0, xp=np):
     """Anderson-accelerated power iteration on an assembled CMFD eigenproblem,
     shared by the Cartesian and triangular solvers (everything flat, (N,)).
 
     facs[g] solves the group-g drift-corrected diffusion system; scatter[gf][g]
-    is the flat group-transfer field or None. Returns (phi, k, ok): ok=False
-    (caller keeps the transport iterate) on breakdown or a negative flux (the
-    drift matrix is not an M-matrix). The returned flux is scaled so the total
-    fission source matches the input's, keeping the outer iterate continuous."""
+    is the flat group-transfer field or None. With ``xp=cupy`` the inputs are
+    moved to the device once and the whole power iteration (every facs[g] solve)
+    stays there -- so a device MG CMFD solve runs without a host round-trip per
+    back-solve; only the returned flux comes back to the host. Returns
+    (phi, k, ok): ok=False (caller keeps the transport iterate) on breakdown or
+    a negative flux. The returned flux is scaled so the total fission source
+    matches the input's, keeping the outer iterate continuous."""
     G = len(facs)
-    phi = [np.asarray(p, float).ravel() for p in phi0]
+    phi = [xp.asarray(np.asarray(p, float).ravel()) for p in phi0]
+    nsf = [xp.asarray(x) for x in nsf]
+    chi = [xp.asarray(x) for x in chi]
+    scatter = [[None if s is None else xp.asarray(s) for s in rowg]
+               for rowg in scatter]
     fiss = sum(nsf[g] * phi[g] for g in range(G))
     total0 = float(fiss.sum())
     if not np.isfinite(total0) or total0 <= 0.0:
@@ -283,8 +292,8 @@ def _cmfd_power(facs, nsf, chi, scatter, phi0, k0):
         k_new = k * tn / float(fiss.sum())
         dk = abs(k_new - k)
         raw = fiss_new * (total0 / tn)
-        rel = (float(np.max(np.abs(raw - fiss_in)))
-               / max(float(np.max(np.abs(fiss_in))), 1e-30))
+        rel = (float(xp.max(xp.abs(raw - fiss_in)))
+               / max(float(xp.max(xp.abs(fiss_in))), 1e-30))
         phi, k = phi_new, k_new
         if dk < 1e-11 and rel < 1e-9:
             break
@@ -293,16 +302,16 @@ def _cmfd_power(facs, nsf, chi, scatter, phi0, k0):
         hist.append((fiss_in, raw))
         if len(hist) > 6:
             hist.pop(0)
-        fiss = _anderson(hist)
-        fiss = fiss * (total0 / fiss.sum())
+        fiss = _anderson(hist, xp)
+        fiss = fiss * (total0 / float(fiss.sum()))
         prev_err = rel
     scale = total0 / tn
     phi = [p * scale for p in phi]
-    if not all(np.isfinite(p).all() for p in phi):
+    if not all(bool(xp.isfinite(p).all()) for p in phi):
         return phi0, k0, False
     if min(float(p.min()) for p in phi) < 0.0:
         return phi0, k0, False
-    return phi, k, True
+    return [asnumpy(p) for p in phi], k, True
 
 
 def _row_solve(q_ang, st_eff, c, binc, forward):

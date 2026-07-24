@@ -1638,8 +1638,11 @@ class TriSNTransportSolver:
     def _make_cmfd_solver(self, A):
         """Solver for a CMFD drift matrix. Default: scipy sparse LU. With
         cmfd_solver='mg': smoothed-aggregation multigrid preconditioning a
-        Krylov solve (BiCGStab -- the drift operator is non-symmetric), which
-        stays O(N) where the 3D LU factorisation blows up."""
+        BiCGStab solve (the drift operator is non-symmetric), which stays O(N)
+        where the 3D LU factorisation blows up. On the GPU the multigrid
+        hierarchy (built once on the host by pyamg) is moved to the device and
+        the V-cycle + BiCGStab run there, so -- with the device-resident
+        _cmfd_power -- the CMFD solves never leave the GPU."""
         if getattr(self, "cmfd_solver", "lu") != "mg":
             return factorized(A.tocsc())
         try:
@@ -1647,10 +1650,37 @@ class TriSNTransportSolver:
         except ImportError as e:                             # optional dependency
             raise ImportError("cmfd_solver='mg' needs pyamg (pip install pyamg) "
                               "-- the O(N) CMFD solve for large 3D meshes") from e
+        xp = self.xp
         ml = pyamg.smoothed_aggregation_solver(A.tocsr(), max_coarse=400)
+        if xp is np:
+            return lambda b: ml.solve(b, tol=1e-9, accel="bicgstab", maxiter=200)
+        import cupyx.scipy.sparse as csp
+        from .linalg import bicgstab
+        levels = []
+        for L in ml.levels[:-1]:
+            La = L.A.tocsr()
+            levels.append((csp.csr_matrix(La), xp.asarray(1.0 / La.diagonal()),
+                           csp.csr_matrix(L.P.tocsr()), csp.csr_matrix(L.R.tocsr())))
+        coarse = factorized(ml.levels[-1].A.tocsc())          # tiny, host
+        Ad = csp.csr_matrix(A.tocsr())
+        w = 0.7                                               # damped Jacobi
+
+        def vcycle(b, i=0):
+            if i == len(levels):
+                return xp.asarray(coarse(asnumpy(b)))         # coarse solve on host
+            La, Dinv, P, R = levels[i]
+            x = xp.zeros_like(b)
+            for _ in range(2):
+                x = x + w * Dinv * (b - La @ x)
+            x = x + P @ vcycle(R @ (b - La @ x), i + 1)
+            for _ in range(2):
+                x = x + w * Dinv * (b - La @ x)
+            return x
 
         def solve(b):
-            return ml.solve(b, tol=1e-9, accel="bicgstab", maxiter=200)
+            x, _ = bicgstab(lambda y: Ad @ y, b, xp.zeros_like(b), None, xp,
+                            rtol=1e-9, maxiter=200, precond=vcycle)
+            return x
         return solve
 
     def _solve_group(self, g, qext_flat, phi0, tol, iface_in=None):
@@ -1771,7 +1801,8 @@ class TriSNTransportSolver:
                     phi_h[g] = ps
                 self._sync()
                 tp = time.perf_counter()
-                phi_c, k_c, cmfd_ok = _cmfd_power(facs, nsf, chi, scat, phi_h, k)
+                phi_c, k_c, cmfd_ok = _cmfd_power(facs, nsf, chi, scat, phi_h, k,
+                                                  xp=self.xp)
                 self.t_power += time.perf_counter() - tp
                 self.t_cmfd += time.perf_counter() - tc
                 if cmfd_ok:
