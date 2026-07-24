@@ -200,28 +200,44 @@ def test_3d_periodic_homogeneous_is_kinf(mat):
     assert flux.min() / flux.max() > 0.9999                      # flat in x,y,z
 
 
-def test_3d_axial_slab_matches_diffusion_ordering():
+def test_3d_axial_slab_converges_to_diffusion():
     # radial-periodic + axial-vacuum reduces to a 1D axial slab (flux flat in
-    # plane), so the ONLY leakage is axial -- this exercises the axial cap scale
-    # in isolation. In this leaky slab S_N (true transport) leaks more than
-    # diffusion, which itself leaks below k_inf, and the gap stays modest: a
-    # wrong axial scale would break the ordering or blow the gap wide open.
-    # (A low-leakage slab converges to diffusion tightly but needs the DSA/CMFD
-    # acceleration of later phases; plain source iteration is too slow there.)
+    # plane), so the ONLY leakage is axial -- this pins the axial cap scale.
+    # As the slab thickens the axial leakage drops, so S_N (true transport)
+    # converges to BOTH k_inf and the diffusion answer; the gap closes. A wrong
+    # axial scale could not converge on both. DSA makes the low-leakage slab
+    # tractable (plain source iteration stalls near dominance ratio 1).
     from ndgpu.tri import TriDiffusionEigenSolver
     mat = Material(diffusion=[1.0], sigma_a=[0.004], nu_sigma_f=[0.0055],
                    sigma_s=[[0.0]], name="d")
     kinf = k_infinite(mat)
-    grid = TriGrid(shape=(2, 2, 2, 10), side=4.0, height=30.0)   # pure 1D axial
-    kd = TriDiffusionEigenSolver(
-        grid, mat, bc=("reflective", "reflective", "vacuum"),
-        device="cpu").solve(tol_k=1e-8, tol_source=1e-7).k_eff
-    sn = TriSNTransportSolver(grid, mat, n_polar=6, n_azi=4,
-                              bc=("periodic", "vacuum")).solve(
-        tol_k=1e-6, tol_source=1e-5, max_outer=1500)
-    assert sn.converged
-    assert sn.k_eff < kd < kinf                  # transport leaks more; both < k_inf
-    assert abs(sn.k_eff - kd) < 0.15             # gross axial-scale-error guard
+    gaps = []
+    for H, nz in [(60.0, 10), (240.0, 40)]:
+        grid = TriGrid(shape=(2, 2, 2, nz), side=4.0, height=H)
+        kd = TriDiffusionEigenSolver(
+            grid, mat, bc=("reflective", "reflective", "vacuum"),
+            device="cpu").solve(tol_k=1e-8, tol_source=1e-7).k_eff
+        sn = TriSNTransportSolver(grid, mat, n_polar=6, n_azi=4,
+                                  bc=("periodic", "vacuum")).solve(
+            tol_k=1e-7, tol_source=1e-6, max_outer=800)
+        assert sn.converged                      # DSA converges the low-leak slab
+        assert sn.k_eff < kd < kinf              # transport leaks more; both < k_inf
+        gaps.append(abs(sn.k_eff - kd))
+    assert gaps[1] < 0.4 * gaps[0]               # gap closes as leakage drops
+
+
+def test_3d_dsa_matches_source_iteration():
+    # 3D DSA (Phase 3) must reproduce the plain source-iteration eigenvalue and
+    # cut the outer count. Same operator, different within-group accelerator.
+    grid = TriGrid(shape=(3, 3, 2, 6), side=3.0, height=36.0)
+    kw = dict(n_polar=4, n_azi=4, bc="vacuum")
+    si = TriSNTransportSolver(grid, M1, acceleration="si", **kw).solve(
+        tol_k=1e-8, tol_source=1e-7, max_outer=2000)
+    dsa = TriSNTransportSolver(grid, M1, acceleration="dsa", **kw).solve(
+        tol_k=1e-8, tol_source=1e-7, max_outer=2000)
+    assert si.converged and dsa.converged
+    assert dsa.k_eff == pytest.approx(si.k_eff, abs=5e-6)
+    assert dsa.outer_iterations <= si.outer_iterations
 
 
 def test_3d_rejects_scb_and_levels():

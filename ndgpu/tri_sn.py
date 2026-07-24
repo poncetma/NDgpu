@@ -165,7 +165,8 @@ class TriSNTransportSolver:
                     "3D tri-S_N supports scheme='step' so far (SCB is Phase 5)")
             engine = "lu"                                    # levels 3D is Phase 2
             self.engine = "lu"
-            self.acceleration = "si"                         # DSA 3D is Phase 3
+            if acceleration in ("gmres", "dsa-gmres"):       # Phase 3: dsa / si
+                self.acceleration = "dsa"
             if outer_acceleration == "cmfd":                 # CMFD 3D is Phase 4
                 self.outer_acceleration = "power"
         else:
@@ -1035,6 +1036,8 @@ class TriSNTransportSolver:
         iface_in, is a fixed source) -- and the periodic torus wraps. Split out
         of _dsa_factor so the assembled operator can be reused (e.g. the Phase-0
         device-solver bake-off benchmarks solves on this real matrix)."""
+        if self.is3d:
+            return self._dsa_matrix_3d(g)
         nr, nc, N, h = self.nr, self.nc, self.N, self.h
         st = np.maximum(self.st[g].reshape(-1), 1e-12)
         ss = self.ss_self[g].reshape(-1)
@@ -1070,6 +1073,76 @@ class TriSNTransportSolver:
                         / (h * (h * alpha + 2.0 * np.sqrt(3.0) * Dc)))
                 np.add.at(diag, src[vac], term)
         diag = np.where(self._act_flat, diag, 1.0)       # excised: unit diagonal
+        rows.append(np.arange(N)); cols.append(np.arange(N)); vals.append(diag)
+        return sp.csr_matrix((np.concatenate([np.atleast_1d(v) for v in vals]),
+                             (np.concatenate([np.atleast_1d(r) for r in rows]),
+                              np.concatenate([np.atleast_1d(c) for c in cols]))),
+                             shape=(N, N))
+
+    def _dsa_matrix_3d(self, g):
+        """The DSA diffusion operator on the extruded prism mesh: the 2D
+        in-plane tri-FV coupling per z layer (harmonic 4D/h^2, tri-edge vacuum
+        Robin) plus axial cap coupling harmonic(D)/dz^2 and the perpendicular-
+        face vacuum Robin 2 D alpha/(dz (dz alpha + 2 D)) on z boundaries and
+        axial excised faces -- matching TriGroupOperator's 3D stencil."""
+        nr, nc, nz, N = self.nr, self.nc, self.nz, self.N
+        h, dz = self.h, self.dz
+        st = np.maximum(self.st[g].reshape(-1), 1e-12)
+        ss = self.ss_self[g].reshape(-1)
+        Dv = 1.0 / (3.0 * st)                            # length N, by flat id
+        kf = 4.0 / (h * h)
+        alpha = face_alpha("vacuum")
+        cell, act = self._cell, self.active             # (nr, nc, 2, nz)
+        diag = np.maximum(st - ss, 1e-12).astype(float)
+        rows, cols, vals = [], [], []
+        ii, jj = np.meshgrid(np.arange(nr), np.arange(nc), indexing="ij")
+        rad_per = self.bc_radial == "periodic"
+        ax_per = self.bc_axial == "periodic"
+        for (t, di, dj, tn, _) in _EDGES:               # lateral, per z layer
+            src = cell[:, :, t, :]
+            src_act = act[:, :, t, :]
+            ni, nj = ii + di, jj + dj
+            if rad_per:
+                inb = np.ones((nr, nc), bool); ni2, nj2 = ni % nr, nj % nc
+            else:
+                inb = (ni >= 0) & (ni < nr) & (nj >= 0) & (nj < nc)
+                ni2, nj2 = np.clip(ni, 0, nr - 1), np.clip(nj, 0, nc - 1)
+            nbr = np.full((nr, nc, nz), -1)
+            nbr_act = np.zeros((nr, nc, nz), bool)
+            nbr[inb] = cell[ni2[inb], nj2[inb], tn, :]
+            nbr_act[inb] = act[ni2[inb], nj2[inb], tn, :]
+            both = src_act & nbr_act
+            if both.any():
+                w = harmonic_mean(Dv[src[both]], Dv[nbr[both]]) * kf
+                rows.append(src[both]); cols.append(nbr[both]); vals.append(-w)
+                np.add.at(diag, src[both], w)
+            vac = src_act & ~both
+            if vac.any():
+                Dc = Dv[src[vac]]
+                np.add.at(diag, src[vac], 8.0 * Dc * alpha
+                          / (h * (h * alpha + 2.0 * np.sqrt(3.0) * Dc)))
+        kk = np.arange(nz)
+        for dk in (+1, -1):                             # axial caps
+            nk = kk + dk
+            if ax_per:
+                inbz = np.ones(nz, bool); nk2 = nk % nz
+            else:
+                inbz = (nk >= 0) & (nk < nz); nk2 = np.clip(nk, 0, nz - 1)
+            nbr = np.full((nr, nc, 2, nz), -1)
+            nbr_act = np.zeros((nr, nc, 2, nz), bool)
+            nbr[:, :, :, inbz] = cell[:, :, :, nk2[inbz]]
+            nbr_act[:, :, :, inbz] = act[:, :, :, nk2[inbz]]
+            both = act & nbr_act
+            if both.any():
+                wz = harmonic_mean(Dv[cell[both]], Dv[nbr[both]]) / (dz * dz)
+                rows.append(cell[both]); cols.append(nbr[both]); vals.append(-wz)
+                np.add.at(diag, cell[both], wz)
+            vac = act & ~both
+            if vac.any():
+                Dc = Dv[cell[vac]]
+                np.add.at(diag, cell[vac],
+                          2.0 * Dc * alpha / (dz * (dz * alpha + 2.0 * Dc)))
+        diag = np.where(self._act_flat, diag, 1.0)       # excised: identity
         rows.append(np.arange(N)); cols.append(np.arange(N)); vals.append(diag)
         return sp.csr_matrix((np.concatenate([np.atleast_1d(v) for v in vals]),
                              (np.concatenate([np.atleast_1d(r) for r in rows]),
