@@ -163,9 +163,6 @@ class TriSNTransportSolver:
             self.nz = grid.shape[3]
             self.dz = grid.dz
             self.vol = self.area * self.dz                   # prism cell measure
-            if scheme == "scb":
-                if outer_acceleration == "cmfd":             # CMFD-from-SCB = later
-                    self.outer_acceleration = "power"
             if acceleration in ("gmres", "dsa-gmres"):       # Phase 3: dsa / si
                 self.acceleration = "dsa"
         else:
@@ -1222,8 +1219,18 @@ class TriSNTransportSolver:
                         nb = cell[i, j, t, nk % nz]
                         if act_flat[nb]:
                             ax_nbr[r, lc, uf] = aidx[nb] * 3 + lc
+        # per cell edge (t, e) -> the (corner, ext-face) pairs on it, for folding
+        # the corner half-edge currents into the _faces_3d per-cell-face current.
+        edge_corners = {}
+        for t in (0, 1):
+            lc_edges = {lc: [e for e, (cs, *_) in enumerate(edge_spec[t])
+                             if lc in cs] for lc in range(3)}
+            for e, (cs, *_) in enumerate(edge_spec[t]):
+                edge_corners[(t, e)] = [(lc, lc_edges[lc].index(e))
+                                        for lc in sorted(cs)]
         self._scb = {"ac": ac, "K": K, "ext_n": ext_n, "ext_nbr": ext_nbr,
-                     "int_n": int_n, "int_w": int_w, "ax_nbr": ax_nbr}
+                     "int_n": int_n, "int_w": int_w, "ax_nbr": ax_nbr,
+                     "edge_corners": edge_corners}
 
     def _prefactor_scb_3d(self):
         """Factorize the 3K corner system per ordinate/group on prisms: the 2D
@@ -1647,6 +1654,61 @@ class TriSNTransportSolver:
             currents.append(J)
         return phi, currents
 
+    def _sweep_currents_scb_3d(self, g, src_flat):
+        """CMFD currents for the SCB prism scheme, in the same _faces_3d
+        per-cell-face convention as _sweep_currents_3d. The transport current
+        density across a lateral cell edge is the mean of its two corner
+        half-edge densities (each J = sum_m w_m (Omega.n_hat) psi_upwind, upwind
+        = own corner on outflow, the neighbour prism's shared-vertex corner on
+        inflow); across an axial cap it is the mean over the cell's three
+        corners. Works for the LU and levels engines (corner angular flux)."""
+        M, N = self.M, self.N
+        d = self._scb
+        ac, K = d["ac"], d["K"]
+        if self.engine == "levels":
+            phi, psi = self._sweep_levels(g, src_flat)
+            psi3 = asnumpy(psi).reshape(M, K, 3)
+        else:
+            self._sweep_count += 1
+            base = np.repeat(src_flat[ac] * (self.vol / 3.0), 3)
+            psi3 = np.stack([self._solvers[g][m](base).reshape(K, 3)
+                             for m in range(M)])
+            phi = np.zeros(N)
+            phi[ac] = (self.w[:, None] * psi3.mean(2)).sum(0)
+        psi_flat = psi3.reshape(M, 3 * K)                    # (M, 3K)
+
+        def upwind_density(cos, nbr_id):                     # (M,K,3,F) cosine
+            valid = (nbr_id >= 0)[None]
+            npsi = np.where(valid, psi_flat[:, np.maximum(nbr_id, 0)], 0.0)
+            face = np.where(cos > 0.0, psi3[..., None], npsi)  # own vs neighbour
+            return (self.w[:, None, None, None] * cos * face).sum(0)  # (K,3,F)
+
+        extn = d["ext_n"]
+        oe = (self.mu[:, None, None, None] * extn[None, ..., 0]
+              + self.eta[:, None, None, None] * extn[None, ..., 1])   # (M,K,3,2)
+        Jh = upwind_density(oe, d["ext_nbr"])                # lateral half-edges
+        oz = np.stack([self.xi, -self.xi], -1)[:, None, None, :]      # (M,1,1,2)
+        Ja = upwind_density(oz, d["ax_nbr"])                 # axial caps (K,3,2)
+        aidx = np.full(N, -1)
+        aidx[ac] = np.arange(K)
+        cell = self._cell
+        currents = []
+        for i in range(6):                                   # lateral, _EDGES order
+            t, e = (0, i) if i < 3 else (1, i - 3)
+            r = aidx[cell[:, :, t, :]]                       # (nr,nc,nz), -1 excised
+            mrk = r >= 0
+            J = np.zeros(r.shape)
+            for lc, f in d["edge_corners"][(t, e)]:          # the 2 corners on edge e
+                J[mrk] += 0.5 * Jh[r[mrk], lc, f]
+            currents.append(J)
+        for uf in (0, 1):                                    # axial dk=+1, -1
+            r = aidx[cell]                                   # (nr,nc,2,nz)
+            mrk = r >= 0
+            J = np.zeros(r.shape)
+            J[mrk] = Ja[r[mrk], :, uf].mean(1)               # mean over 3 corners
+            currents.append(J)
+        return phi, currents
+
     def _cmfd_factor_3d(self, g, p, currents):
         """Solver for the group-g drift-corrected prism diffusion operator (LU,
         or multigrid when cmfd_solver='mg' -- 3D sparse LU is O(N^2)/O(N^4/3)
@@ -1847,7 +1909,9 @@ class TriSNTransportSolver:
                         if gf != g and scat[gf][g] is not None:
                             q = q + scat[gf][g] * phi_new[gf]
                     if self.is3d:
-                        ps, cur = self._sweep_currents_3d(g, ss[g] * phi_new[g] + q)
+                        cur_fn = (self._sweep_currents_scb_3d if self.scheme == "scb"
+                                  else self._sweep_currents_3d)
+                        ps, cur = cur_fn(g, ss[g] * phi_new[g] + q)
                         facs[g] = self._cmfd_factor_3d(g, ps, cur)
                     else:
                         ps, J6 = self._sweep_currents(g, ss[g] * phi_new[g] + q)

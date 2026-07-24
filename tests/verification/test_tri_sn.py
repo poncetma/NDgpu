@@ -340,3 +340,20 @@ def test_3d_levels_scb_matches_lu():
     r_lv = lv.solve(tol_k=1e-8, tol_source=1e-7)
     assert r_lu.converged and r_lv.converged
     assert r_lv.k_eff == pytest.approx(r_lu.k_eff, abs=1e-10)
+
+
+@pytest.mark.parametrize("engine", ["lu", "levels"])
+def test_3d_scb_cmfd_matches_power(engine):
+    # CMFD with SCB on prisms: the drift matrix is built from the SCB corner
+    # face currents (lateral half-edge means + axial cap means), so it must
+    # reproduce the power-iteration eigenvalue and cut the outer count -- on the
+    # LU engine and the levels/GPU engine alike.
+    grid = TriGrid(shape=(8, 8, 2, 6), side=3.0, height=18.0)
+    kw = dict(n_polar=4, n_azi=4, bc="vacuum", scheme="scb", engine=engine)
+    pw = TriSNTransportSolver(grid, M1, outer_acceleration="power", **kw).solve(
+        tol_k=1e-7, tol_source=1e-6, max_outer=500)
+    cm = TriSNTransportSolver(grid, M1, outer_acceleration="cmfd", **kw).solve(
+        tol_k=1e-7, tol_source=1e-6, max_outer=500)
+    assert pw.converged and cm.converged
+    assert cm.k_eff == pytest.approx(pw.k_eff, abs=1e-6)
+    assert cm.outer_iterations < pw.outer_iterations
