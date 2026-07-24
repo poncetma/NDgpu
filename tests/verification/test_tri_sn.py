@@ -322,3 +322,21 @@ def test_3d_cmfd_multigrid_solver_matches_lu():
         tol_k=1e-7, tol_source=1e-6)
     assert lu.converged and mg.converged
     assert mg.k_eff == pytest.approx(lu.k_eff, abs=1e-6)
+
+
+def test_3d_levels_scb_matches_lu():
+    # The 3D level-scheduled SCB sweep (engine="levels", GPU path) runs the
+    # batched 3x3 corner-block solve with the corner DAG extended by axial cap
+    # edges (external gather width 4 = 2 lateral + 2 axial). Machine-precision
+    # equal to the prism SCB LU engine.
+    grid = TriGrid(shape=(5, 5, 2, 4), side=3.0, height=16.0)
+    rng = np.random.default_rng(0)
+    src = rng.random(5 * 5 * 2 * 4)
+    kw = dict(n_polar=4, n_azi=4, bc="vacuum", scheme="scb")
+    lu = TriSNTransportSolver(grid, M1, engine="lu", **kw)
+    lv = TriSNTransportSolver(grid, M1, engine="levels", **kw)
+    assert np.max(np.abs(lu._sweep(0, src) - lv._sweep(0, src))) < 1e-12
+    r_lu = lu.solve(tol_k=1e-8, tol_source=1e-7)
+    r_lv = lv.solve(tol_k=1e-8, tol_source=1e-7)
+    assert r_lu.converged and r_lv.converged
+    assert r_lv.k_eff == pytest.approx(r_lu.k_eff, abs=1e-10)

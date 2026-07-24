@@ -164,9 +164,7 @@ class TriSNTransportSolver:
             self.dz = grid.dz
             self.vol = self.area * self.dz                   # prism cell measure
             if scheme == "scb":
-                engine = "lu"                                # levels-SCB 3D = later
-                self.engine = "lu"
-                if outer_acceleration == "cmfd":             # CMFD-SCB currents = later
+                if outer_acceleration == "cmfd":             # CMFD-from-SCB = later
                     self.outer_acceleration = "power"
             if acceleration in ("gmres", "dsa-gmres"):       # Phase 3: dsa / si
                 self.acceleration = "dsa"
@@ -239,6 +237,8 @@ class TriSNTransportSolver:
     def _prefactor(self):
         if self.is3d:
             if self.engine == "levels":
+                if self.scheme == "scb":
+                    self._build_corners_3d()
                 self._setup_levels_3d()
             elif self.scheme == "scb":
                 self._build_corners_3d()
@@ -485,6 +485,9 @@ class TriSNTransportSolver:
         self.graphs_active = None
         self._graph_error = None
         self._act_flat_dev = xp.asarray(act_flat)
+        if self.scheme == "scb":
+            self._setup_levels_scb_tables_3d(mm, cc, spans)
+            return
         pidx = mm * N + cc
         off = (np.arange(M) * N)[:, None, None]
         nbr_f = np.where(in_coef > 0.0, off + in_nbr, 0).reshape(M * N, NIN)
@@ -503,6 +506,54 @@ class TriSNTransportSolver:
             wcol=xp.asarray(self.w[:, None]),
             work=[(xp.zeros((n, NIN)), xp.zeros(n), xp.zeros(n))
                   for n in (b - a for a, b in spans)])
+
+    def _setup_levels_scb_tables_3d(self, mm, cc, spans):
+        """SCB per-level tables for the prism levels engine: the corner external
+        inflow gather (width 4 = 2 lateral half-edges + 2 axial caps) + buffers
+        for the batched 3x3 corner-block sweep. The within-cell block (internal
+        in-plane faces) is _lv_tables' Binv; only the EXTERNAL faces (upwind to
+        a neighbour prism's corner) are gathered here."""
+        xp, N, M = self.xp, self.N, self.M
+        h, dz, area = self.h, self.dz, self.area
+        d = self._scb
+        ac, K = d["ac"], d["K"]
+        aidx = np.full(N, -1, np.int64)
+        aidx[ac] = np.arange(K)
+        rr = aidx[cc]
+        pidx = mm * K + rr
+        h2d, Acap = (h / 2.0) * dz, area / 3.0
+        off = (np.arange(M) * (3 * K))[:, None, None, None]
+        extn, enbr = d["ext_n"], d["ext_nbr"]
+        oe = (self.mu[:, None, None, None] * extn[None, ..., 0]
+              + self.eta[:, None, None, None] * extn[None, ..., 1])      # (M,K,3,2)
+        c_lat = np.where((oe < 0.0) & (enbr >= 0)[None], -oe * h2d, 0.0)
+        n_lat = np.where(c_lat > 0.0, off + np.maximum(enbr, 0)[None], 0)
+        oz = np.stack([self.xi, -self.xi], -1)[:, None, None, :]         # (M,1,1,2) up/down
+        anbr = d["ax_nbr"]
+        c_ax = np.where((oz < 0.0) & (anbr >= 0)[None], -oz * Acap, 0.0)
+        n_ax = np.where(c_ax > 0.0, off + np.maximum(anbr, 0)[None], 0)
+        coef = np.concatenate([c_lat, c_ax], 3).reshape(M * K, 3, 4)     # width 4
+        nbr_f = np.concatenate([n_lat, n_ax], 3).reshape(M * K, 3, 4)
+        self._lv_oe = oe                                                 # host, Binv
+        self._levels = []
+        for a, b in spans:
+            p = pidx[a:b]
+            sidx = ((p[:, None] * 3) + np.arange(3)).ravel()
+            self._levels.append((xp.asarray(rr[a:b].astype(np.int32)),
+                                 xp.asarray(p.astype(np.int32)),
+                                 xp.asarray(sidx.astype(np.int32)),
+                                 xp.asarray(nbr_f[p].astype(np.int32)),
+                                 xp.asarray(coef[p])))
+        self._bufs = dict(
+            psi=xp.zeros(M * K * 3), rhs=xp.zeros(K),
+            IF=xp.zeros((M * K, 3)),
+            mk=xp.zeros((M, K)), mk_w=xp.zeros((M, K)), phk=xp.zeros(K),
+            w3col=xp.asarray(self.w[:, None] / 3.0),
+            work=[(xp.zeros((n, 3, 4)), xp.zeros((n, 3)), xp.zeros(n),
+                   xp.zeros((n, 3)), xp.zeros((n, 3, 3)), xp.zeros((n, 3)))
+                  for n in (b - a for a, b in spans)])
+        self._ac_dev = xp.asarray(ac)
+        self._bufs["phiN"] = xp.zeros(N)
 
     def _sweep_3d(self, g, src_flat):
         """One isotropic-source sweep on the prism mesh: phi = sum_m w_m psi_m,
@@ -677,9 +728,12 @@ class TriSNTransportSolver:
         else:
             d = self._scb
             K = d["K"]
-            h2 = self.h / 2.0
-            hi = self.h / (2.0 * np.sqrt(3.0))
-            A3 = self.area / 3.0
+            dzf = self.dz if self.is3d else 1.0              # lateral face area x dz
+            h2 = (self.h / 2.0) * dzf
+            hi = (self.h / (2.0 * np.sqrt(3.0))) * dzf
+            A3 = (self.area / 3.0) * dzf                     # corner sub-volume
+            ax_out = (np.abs(self.xi) * (self.area / 3.0)    # axial cap outflow
+                      if self.is3d else np.zeros(M))
             st_c = self.st[g].reshape(-1)[d["ac"]]
             oi = (self.mu[:, None, None, None] * d["int_n"][None, ..., 0]
                   + self.eta[:, None, None, None] * d["int_n"][None, ..., 1])
@@ -690,7 +744,7 @@ class TriSNTransportSolver:
                 B = np.zeros((K, 3, 3))
                 diag = (st_c[:, None] * A3
                         + (np.maximum(self._lv_oe[m], 0.0) * h2).sum(2)
-                        + (oi[m] * hi * 0.5).sum(2))            # (K, 3)
+                        + (oi[m] * hi * 0.5).sum(2) + ax_out[m])   # (K, 3)
                 B[:, np.arange(3), np.arange(3)] = diag
                 for lc in range(3):
                     for f in range(2):
@@ -853,7 +907,7 @@ class TriSNTransportSolver:
             return bufs["phiM"].ravel(), bufs["psi"]
         ac = self._ac_dev
         xp.take(src_dev, ac, out=bufs["rhs"])
-        bufs["rhs"] *= (self.area / 3.0)
+        bufs["rhs"] *= (self._measure / 3.0)
         self._levels_exec(g, False)
         pf = bufs["phiN"]
         pf.fill(0.0)
@@ -911,7 +965,7 @@ class TriSNTransportSolver:
             return asnumpy(bufs["phiM"]).ravel().copy(), bufs["psi"]
         d = self._scb
         ac, K = d["ac"], d["K"]
-        self._buf_set(bufs["rhs"], src_flat[ac] * (self.area / 3.0))
+        self._buf_set(bufs["rhs"], src_flat[ac] * (self._measure / 3.0))
         iface = iface_in is not None
         if iface:
             psi_in, is_iface = iface_in
