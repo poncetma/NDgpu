@@ -1053,6 +1053,66 @@ class SNTransportSolver:
             inc, tol, gstep, (phi, out, psi))
         return p, ps, inc_new
 
+    # ---- transient engine adapter -----------------------------------------
+    # TransientSNSolver drives every geometry through these methods only, so it
+    # never interprets the angular flux (here (M, nx, ny) per cell; on the tri
+    # SCB mesh it lives on corner sub-volumes instead) nor the boundary state.
+    # It may only scale psi -- the engine owns its layout.
+
+    T_SHIFT_AT_CONSTRUCTION = False   # Sigma_t + theta is passed per sweep
+    T_CMFD_STEP = True                # supports drift-corrected step acceleration
+
+    def t_setup(self, theta):
+        """Prepare for backward-Euler marching with the per-group collision shift
+        theta[g] = 1/(v_g dt): the shifted total cross section every transient
+        sweep uses, plus the matching DSA factors."""
+        xp = self.xp
+        self._t_theta = [float(t) for t in theta]
+        self._t_st = [xp.asarray(self.st[g]) + self._t_theta[g]
+                      for g in range(self.G)]
+        self._t_ss = [xp.asarray(self.ss_self[g]) for g in range(self.G)]
+        self._t_dsa = [self._dsa_factor_transient(g, self._t_theta[g])
+                       if self.acceleration in ("dsa", "dsa-gmres") else None
+                       for g in range(self.G)]
+
+    def t_state0(self):
+        """Per-group boundary state carried across sweeps and steps."""
+        return [self._zero_inc() for _ in range(self.G)]
+
+    def t_seed_psi(self, g, src, state):
+        """Angular flux of the converged *steady* source (unshifted Sigma_t) --
+        the first step's psi_old. Under reflection the steady incoming fluxes are
+        converged first, so the updated state comes back too."""
+        xp = self.xp
+        st_g = xp.asarray(self.st[g])
+        if self.bc != BC_VACUUM:
+            scale = max(1.0, float(xp.max(xp.abs(xp.asarray(src)))))
+            for _ in range(200):
+                _, out = self._sweep(src, st_g, state)
+                new = self._reflect(out)
+                d = max(float(np.max(np.abs(new[f] - state[f]))) for f in new)
+                state = new
+                if d < 1e-12 * scale:
+                    break
+        _, _, psi = self._sweep_transient(src, st_g, state, None)
+        return psi, state
+
+    def t_solve_group(self, g, qext, psi_old, tol, phi0, state):
+        """One within-group backward-Euler solve: forms the per-ordinate time
+        source theta*psi_old and returns (flux, angular flux, boundary state)."""
+        return self._solve_group_transient(
+            qext, self._t_ss[g], self._t_st[g], state,
+            self._t_theta[g] * psi_old, self._t_dsa[g], tol, g, phi0=phi0)
+
+    def t_cmfd_factor(self, g, src, psi_old, state):
+        """One current-accumulating transient sweep, folded into the group's
+        theta-shifted drift-corrected coarse operator (a callable back-solve)."""
+        p, _, (Jx, Jy) = self._sweep_transient(
+            src, self._t_st[g], state, self._t_theta[g] * psi_old,
+            want_psi=False, currents=True)
+        return self._cmfd_factor(g, asnumpy(p), asnumpy(Jx), asnumpy(Jy),
+                                 shift=self._t_theta[g])
+
     def solve(self, tol_k: float = 1e-7, tol_source: float = 1e-7,
               max_outer: int = 500, verbose: bool = False) -> SNResult:
         """Power iteration on the fission source until |dk| < tol_k and the

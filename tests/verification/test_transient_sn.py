@@ -133,13 +133,136 @@ def test_cmfd_step_acceleration_matches_plain_iteration():
     assert its_c < 0.6 * its_n, (its_c, its_n)
 
 
-def test_cmfd_rejects_row_sweep():
+def test_cmfd_rejects_row_sweep_and_tri_engine():
     """CMFD needs the wavefront sweep's face currents; asking for it with the
     row sweep is an error rather than a silent downgrade."""
     solver = TransientSNSolver(SLAB, lambda t: ([BASE], None), KIN, bc="vacuum",
                                step_acceleration="cmfd", sweep="rows", **QUAD)
-    with pytest.raises(ValueError, match="wavefront"):
+    with pytest.raises(ValueError, match="face"):
         solver.solve(t_end=2e-3, dt=1e-3)
+
+
+# --- Phase 3: the tri / prism engine -------------------------------------------
+# The same driver, a different transport engine: TriSNTransportSolver prefactors
+# its per-ordinate operator, so the backward-Euler shift Sigma_t + theta is folded
+# in at construction (sigma_t_shift) rather than passed per sweep. A *periodic*
+# tri lattice is an infinite medium -- zero leakage, flat isotropic flux -- which
+# makes point kinetics an EXACT reference with no spatial error and no anisotropy
+# floor at all: the only remaining error is backward Euler. That is a sharper test
+# than any Cartesian slab can give.
+
+TRI_MAT = Material(name="1g", diffusion=[D], sigma_a=[SIGMA_A],
+                   nu_sigma_f=[NU_SIGMA_F], sigma_s=[[0.0]])
+TRI_QUAD = dict(n_polar=2, n_azi=8)
+
+
+def tri_nsf_step(eps):
+    pert = [Material(name="pert", diffusion=[D], sigma_a=[SIGMA_A],
+                     nu_sigma_f=[NU_SIGMA_F * (1.0 + eps)], sigma_s=[[0.0]])]
+    return lambda t: (([TRI_MAT] if t <= 0 else pert), None)
+
+
+def tri_grid(is3d=False):
+    from ndgpu.tri import TriGrid
+    # Minimal axial extent: psi is retained between steps, so nz drives memory.
+    return (TriGrid(shape=(2, 2, 2, 3), side=4.0, height=12.0) if is3d
+            else TriGrid(shape=(4, 4, 2), side=3.0))
+
+
+def tri_solver(grid, problem, scheme, **kw):
+    from ndgpu.tri_sn import TriSNTransportSolver
+    return TransientSNSolver(grid, problem, KIN, bc="periodic",
+                             engine_cls=TriSNTransportSolver, scheme=scheme,
+                             **TRI_QUAD, **kw)
+
+
+@pytest.mark.parametrize("is3d", [False, True])
+@pytest.mark.parametrize("scheme", ["step", "scb"])
+def test_tri_transient_periodic_is_kinf_and_stays_steady(scheme, is3d):
+    """On a periodic tri/prism torus the critically adjusted steady state is an
+    exact equilibrium of the discrete transient equations: k0 is k_inf to round-off
+    and the power holds at 1 to machine precision. For SCB this also pins the
+    *corner-resolved* time source -- theta*psi_old enters each corner sub-volume's
+    own balance, and only the correct layout cancels the theta shift exactly."""
+    res = tri_solver(tri_grid(is3d), lambda t: ([TRI_MAT], None),
+                     scheme).solve(t_end=0.06, dt=0.02)
+    k_inf = NU_SIGMA_F / SIGMA_A
+    assert res.k0 == pytest.approx(k_inf, abs=1e-9), res.k0
+    assert np.allclose(res.power, 1.0, atol=1e-12), np.max(np.abs(res.power - 1))
+
+
+@pytest.mark.parametrize("scheme", ["step", "scb"])
+def test_tri_transient_matches_point_kinetics_to_first_order(scheme):
+    """Zero leakage and a flat flux make both schemes spatially exact, so the
+    deviation from exact point kinetics is *purely* backward Euler and must halve
+    with dt (measured 8.81e-4, 4.42e-4, 2.21e-4 for dt = 4e-4 .. 1e-4, i.e.
+    ratios of 2.00). step and scb agree to all printed digits, as they must."""
+    from scipy.integrate import solve_ivp
+
+    eps = 0.5 * BETA / (1.0 - 0.5 * BETA)
+    grid = tri_grid()
+    errs = []
+    for dt in (4e-4, 2e-4, 1e-4):
+        res = tri_solver(grid, tri_nsf_step(eps), scheme).solve(
+            t_end=0.02, dt=dt, tol_step=1e-9)
+        a = NU_SIGMA_F / res.k0
+        ap = a * (1.0 + eps)
+        rhs = lambda t, y: [V * (((1.0 - BETA) * ap - a) * y[0] + LAM * y[1]),
+                            BETA * ap * y[0] - LAM * y[1]]
+        ref = solve_ivp(rhs, (0, res.times[-1]), [1.0, BETA * a / LAM],
+                        method="Radau", t_eval=res.times, rtol=1e-12,
+                        atol=1e-14).y[0]
+        n = res.power / (1.0 + eps)
+        errs.append(float(np.max(np.abs(n[1:] - ref[1:]) / ref[1:])))
+    assert errs[-1] < 5e-4, errs
+    for coarse, fine in zip(errs, errs[1:]):        # first order in dt
+        assert coarse / fine == pytest.approx(2.0, abs=0.15), errs
+
+
+def test_tri_transient_vacuum_leaks_and_stays_steady():
+    """Vacuum (leaky) tri transient: k0 drops well below k_inf and the critically
+    adjusted state is still an exact equilibrium."""
+    from ndgpu.tri import TriGrid
+    from ndgpu.tri_sn import TriSNTransportSolver
+
+    res = TransientSNSolver(TriGrid(shape=(8, 8, 2), side=3.0),
+                            lambda t: ([TRI_MAT], None), KIN, bc="vacuum",
+                            engine_cls=TriSNTransportSolver,
+                            **TRI_QUAD).solve(t_end=0.1, dt=0.02)
+    assert res.k0 < 0.8 * NU_SIGMA_F / SIGMA_A          # real leakage
+    assert np.allclose(res.power, 1.0, atol=1e-8), np.max(np.abs(res.power - 1))
+
+
+def test_tri_transient_rejects_levels_engine():
+    """The level-scheduled sweep carries one shared cell source per ordinate, so a
+    per-ordinate time source needs wider level tables (Phase 3b): refuse clearly
+    rather than silently dropping the time source."""
+    from ndgpu.tri import TriGrid
+    from ndgpu.tri_sn import TriSNTransportSolver
+
+    solver = TransientSNSolver(TriGrid(shape=(8, 8, 2), side=3.0),
+                               lambda t: ([TRI_MAT], None), KIN, bc="vacuum",
+                               engine_cls=TriSNTransportSolver, engine="levels",
+                               **TRI_QUAD)
+    with pytest.raises(NotImplementedError, match="engine='lu'"):
+        solver.solve(t_end=0.02, dt=0.02)
+
+
+def test_tri_sigma_t_shift_shifts_only_total_xs():
+    """The construction-time shift must land on Sigma_t alone -- within-group
+    scattering untouched -- or the transient would silently change the medium."""
+    from ndgpu.tri_sn import TriSNTransportSolver
+
+    grid = tri_grid()
+    base = TriSNTransportSolver(grid, TRI_MAT, bc="periodic", **TRI_QUAD)
+    shifted = TriSNTransportSolver(grid, TRI_MAT, bc="periodic",
+                                   sigma_t_shift=[0.37], **TRI_QUAD)
+    assert np.allclose(shifted.st - base.st, 0.37)
+    assert np.allclose(shifted.ss_self, base.ss_self)
+    assert np.allclose(shifted.nsf, base.nsf)
+    with pytest.raises(ValueError, match="one value per group"):
+        TriSNTransportSolver(grid, TRI_MAT, bc="periodic",
+                             sigma_t_shift=[0.1, 0.2], **TRI_QUAD)
 
 
 # --- Phase 1 transient driver --------------------------------------------------

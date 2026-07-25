@@ -112,7 +112,7 @@ class TriSNTransportSolver:
                  outer_acceleration: str = "cmfd", max_inner: int = 800,
                  engine: str | None = None, device: str = "cpu",
                  dsa_rtol: float = 1e-4, dsa_maxiter: int = 100,
-                 cmfd_solver: str = "lu"):
+                 cmfd_solver: str = "lu", sigma_t_shift=None):
         if len(grid.shape) not in (3, 4) or grid.shape[2] != 2:
             raise ValueError("tri-S_N grid shape must be (nr, nc, 2) or "
                              "(nr, nc, 2, nz) for extruded prisms")
@@ -188,6 +188,21 @@ class TriSNTransportSolver:
         self.st = np.stack(f.sigma_t)                        # (G, nr, nc, 2)
         removal = np.stack(f.removal)
         self.ss_self = np.maximum(self.st - removal, 0.0)
+        # Transient collision shift: backward Euler adds theta_g = 1/(v_g dt) to
+        # the total cross section. Applied *after* ss_self (within-group
+        # scattering is untouched) and *before* _prefactor, so the prefactored
+        # streaming+collision operator, the DSA matrix and the CMFD drift
+        # operator all pick it up with no further plumbing -- the tri engine
+        # factorizes its operator once, so the shift belongs at construction.
+        self.sigma_t_shift = None
+        if sigma_t_shift is not None:
+            shift = np.asarray(sigma_t_shift, float).reshape(-1)
+            if shift.size != self.G:
+                raise ValueError("sigma_t_shift needs one value per group")
+            if np.any(shift < 0.0):
+                raise ValueError("sigma_t_shift must be non-negative")
+            self.sigma_t_shift = shift
+            self.st = self.st + shift.reshape((self.G,) + (1,) * (self.st.ndim - 1))
         self.nsf = np.stack(f.nu_sigma_f)
         self.chi = np.stack(f.chi)
         self.scatter = [[None] * self.G for _ in range(self.G)]
@@ -1027,6 +1042,118 @@ class TriSNTransportSolver:
         for m in range(self.M):
             phi += self.w[m] * self._solvers[g][m](rhs)
         return phi
+
+    # ---- transient engine adapter -----------------------------------------
+    # The transport time term (1/v) dpsi/dt acts on the *angular* flux, so
+    # backward Euler adds theta = 1/(v dt) to Sigma_t (folded in at construction
+    # via sigma_t_shift, see __init__) and a per-ordinate source theta*psi_old.
+    # TransientSNSolver drives this through the t_* methods only and never
+    # interprets psi -- which matters here because the step scheme's psi lives on
+    # cells (M, N) while SCB's lives on corner sub-volumes (M, K, 3), and the
+    # time source must enter each corner balance with its own value.
+
+    T_SHIFT_AT_CONSTRUCTION = True    # the operator is prefactored: shift at build
+    T_CMFD_STEP = False               # transient CMFD on tri is Phase 3b
+
+    def _t_require_lu(self):
+        if self.engine != "lu":
+            raise NotImplementedError(
+                "transient tri-S_N needs engine='lu' (the level-scheduled sweep "
+                "carries one shared cell source per ordinate; a per-ordinate time "
+                "source needs wider level tables -- Phase 3b)")
+
+    def _sweep_ang(self, g, src_flat, q_ang=None):
+        """LU-engine sweep with an optional per-ordinate additive source and the
+        full angular flux returned. ``q_ang`` is in the scheme's own layout --
+        (M, N) cell values for step, (M, K, 3) corner values for SCB -- so the
+        backward-Euler time source enters exactly the unknowns it belongs to.
+        Returns (phi (N,), psi) with psi in that same layout.
+
+        Both schemes solve the *same* prefactored per-ordinate operators as the
+        steady sweeps; only the right-hand side gains the time source. Covers 2D
+        triangles and 3D prisms (``_measure`` is the cell area or prism volume).
+        """
+        self._t_require_lu()
+        self._sweep_count += 1
+        meas = self._measure
+        if self.scheme == "scb":
+            d = self._scb
+            ac, K = d["ac"], d["K"]
+            base = np.repeat(src_flat[ac] * (meas / 3.0), 3).reshape(K, 3)
+            phi = np.zeros(self.N)
+            psi = np.empty((self.M, K, 3))
+            for m in range(self.M):
+                rhs = base if q_ang is None else base + q_ang[m] * (meas / 3.0)
+                p = self._solvers[g][m](rhs.ravel()).reshape(K, 3)
+                psi[m] = p
+                phi[ac] += self.w[m] * p.mean(1)   # cell flux = mean of corners
+            return phi, psi
+        phi = np.zeros(self.N)
+        psi = np.empty((self.M, self.N))
+        for m in range(self.M):
+            s = src_flat if q_ang is None else src_flat + q_ang[m]
+            p = self._solvers[g][m](np.where(self._act_flat, s * meas, 0.0))
+            psi[m] = p
+            phi += self.w[m] * p
+        return phi, psi
+
+    def t_setup(self, theta):
+        """theta is already folded into Sigma_t (sigma_t_shift at construction),
+        so only the DSA factors -- which read the shifted Sigma_t -- are built."""
+        self._t_require_lu()
+        if self.sigma_t_shift is None or not np.allclose(
+                self.sigma_t_shift, np.asarray(theta, float).reshape(-1)):
+            raise ValueError(
+                "tri-S_N transient engine must be constructed with "
+                "sigma_t_shift = theta (T_SHIFT_AT_CONSTRUCTION)")
+        self._t_dsa = [self._dsa_factor(g) if self.acceleration == "dsa" else None
+                       for g in range(self.G)]
+
+    def t_state0(self):
+        return [None] * self.G          # vacuum/periodic fold into L_Omega
+
+    def t_seed_psi(self, g, src, state):
+        """Angular flux of the converged steady source -- the first step's
+        psi_old. Called on the *unshifted* engine (the driver builds the shifted
+        marching instance afterwards), so these sweeps use the true steady
+        Sigma_t; only the psi layout is shared between the two instances."""
+        _, psi = self._sweep_ang(g, np.asarray(src).reshape(-1))
+        return psi, state
+
+    def t_solve_group(self, g, qext, psi_old, tol, phi0, state):
+        """DSA-accelerated within-group solve for one backward-Euler step, with
+        the per-ordinate time source theta*psi_old held fixed. Mirrors the
+        Cartesian engine; the boundary is folded into the operator, so there is
+        no boundary fixed point."""
+        theta = float(self.sigma_t_shift[g])
+        q_ang = theta * psi_old
+        qf = np.asarray(qext).reshape(-1)
+        ss = self.ss_self[g].reshape(-1)
+        fac = self._t_dsa[g]
+        phi = (np.zeros(self.N) if phi0 is None
+               else np.asarray(phi0).reshape(-1).copy())
+        accelerate = fac is not None
+        prev, bad = None, 0
+        for _ in range(self.max_inner):
+            half, _ = self._sweep_ang(g, ss * phi + qf, q_ang)
+            new = half + fac(ss * (half - phi)) if accelerate else half
+            d = float(np.max(np.abs(new - phi)))
+            scale = max(float(np.max(np.abs(new))), 1e-300)
+            phi = new
+            if d <= tol * scale:
+                break
+            if accelerate:                       # same watchdog as the steady solve
+                if prev is not None and d > prev:
+                    bad += 1
+                    if bad >= 3:
+                        accelerate = False
+                else:
+                    bad = 0
+                prev = d
+        # DSA moves phi off the last sweep, so re-sweep at the converged flux to
+        # return an angular flux consistent with it (this psi is psi_old next step).
+        _, psi = self._sweep_ang(g, ss * phi + qf, q_ang)
+        return phi.reshape(self.grid.shape), psi, state
 
     # ---- simple corner balance (SCB), second-order ------------------------
     def _build_corners(self):

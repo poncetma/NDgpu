@@ -882,13 +882,15 @@ class TransientSPNSolver(TransientSDPNSolver):
 class TransientSNSolver:
     """Time-dependent multigroup discrete-ordinates (S_N) transport.
 
-    The transport counterpart of :class:`TransientSolver`. Backward Euler on the
-    angular flux: the transport time term (1/v) dpsi/dt adds theta = 1/(v_g dt)
-    to the total cross section (the sweep's collision diagonal) and contributes a
-    *per-ordinate* source theta * psi_m^old. So -- unlike diffusion, which only
-    shifts the removal term and carries a scalar (1/(v dt)) phi_old -- the full
-    *angular* flux is retained between steps (see the engine hooks on
-    :class:`~ndgpu.sn.SNTransportSolver`). Everything else is shared with
+    The transport counterpart of :class:`TransientSolver`, driving any S_N engine
+    -- Cartesian, triangles, extruded prisms -- through one shared time loop.
+    Backward Euler on the angular flux: the transport time term (1/v) dpsi/dt adds
+    theta = 1/(v_g dt) to the total cross section (the sweep's collision diagonal)
+    and contributes a *per-ordinate* source theta * psi_m^old. So -- unlike
+    diffusion, which only shifts the removal term and carries a scalar
+    (1/(v dt)) phi_old -- the full *angular* flux is retained between steps (see
+    the ``t_*`` engine adapter on :class:`~ndgpu.sn.SNTransportSolver` and
+    :class:`~ndgpu.tri_sn.TriSNTransportSolver`). Everything else is shared with
     :class:`TransientSolver`: the analytic backward-Euler precursor update, the
     critical adjustment by k0, the Anderson fixed point on the fission source and
     the :class:`TransientResult` contract. Only the per-group solve changes -- a
@@ -899,12 +901,17 @@ class TransientSNSolver:
     grid, problem_at, kinetics : as for :class:`TransientSolver`. Only global
         kinetics data is supported (per-material velocities/beta and per-family
         chi_delayed remain diffusion-only).
-    engine_cls : the steady S_N solver class used as the transport engine
-        (:class:`~ndgpu.sn.SNTransportSolver` for Cartesian; the tri/prism
-        engine gains the same hooks in Phase 3). ``engine_kwargs`` are forwarded
-        to it (n_polar, n_azi, acceleration, sweep, ...).
-    bc : "vacuum" or "reflective" (the reflective boundary fixed point is
-        Anderson-accelerated and warm-started across sweeps and time steps).
+    engine_cls : the steady S_N solver class used as the transport engine --
+        :class:`~ndgpu.sn.SNTransportSolver` (2D Cartesian) or
+        :class:`~ndgpu.tri_sn.TriSNTransportSolver` (triangles and extruded
+        prisms, ``engine="lu"``, step or SCB). ``engine_kwargs`` are forwarded to
+        it (n_polar, n_azi, scheme, acceleration, sweep, ...). The driver talks to
+        an engine only through its ``t_*`` adapter methods, so it never interprets
+        the angular flux -- which differs per geometry and scheme (per cell for
+        Cartesian and tri step, per corner sub-volume for tri SCB).
+    bc : the engine's boundary law -- "vacuum"/"reflective" for Cartesian,
+        "vacuum"/"periodic" for tri. The reflective boundary fixed point is
+        Anderson-accelerated and warm-started across sweeps and time steps.
     device : "cpu" (default) or "gpu"/"cuda" -- the transient runs on the
         vectorized wavefront sweep, so the whole per-step transport solve is a
         fixed sequence of batched numpy/cupy kernels.
@@ -941,9 +948,10 @@ class TransientSNSolver:
         self.device = device_name(self.xp)
         self.dtype = np.dtype(dtype)
 
-    def _engine(self, mats, mmap):
+    def _engine(self, mats, mmap, **extra):
         return self.engine_cls(self.grid, mats, mmap, bc=self.bc,
-                               device=self.device_arg, **self.engine_kwargs)
+                               device=self.device_arg, **self.engine_kwargs,
+                               **extra)
 
     def _cmfd_step(self, eng, S, phi, ctx):
         """One CMFD acceleration of the within-step fission fixed point.
@@ -972,13 +980,8 @@ class TransientSNSolver:
                 s = ctx["scatter"][gf][g]
                 if gf != g and s is not None:
                     qext = qext + s * phi[gf]
-            src = ctx["ss"][g] * phi[g] + qext
-            p, _, (Jx, Jy) = eng._sweep_transient(
-                src, ctx["st_shift"][g], ctx["inc"][g],
-                ctx["theta"][g] * ctx["psi_old"][g],
-                want_psi=False, currents=True)
-            facs.append(eng._cmfd_factor(g, asnumpy(p), asnumpy(Jx),
-                                         asnumpy(Jy), shift=ctx["theta"][g]))
+            facs.append(eng.t_cmfd_factor(g, ctx["ss"][g] * phi[g] + qext,
+                                          ctx["psi_old"][g], ctx["state"][g]))
         # Coarse fixed point on the fission source: identical structure to the
         # transport fixed point but with sparse back-solves instead of sweeps.
         nsf = ctx["nsf_h"]
@@ -1028,13 +1031,16 @@ class TransientSNSolver:
             raise ValueError("kinetics.velocities must have one entry per group")
         # CMFD needs face currents, which only the wavefront sweep accumulates.
         # Resolved before the (expensive) steady solve so misuse fails fast.
+        can_cmfd = (getattr(eng, "T_CMFD_STEP", False)
+                    and getattr(eng, "sweep_mode", "wavefront") == "wavefront")
         accel = self.step_acceleration
         if accel == "auto":
-            accel = ("cmfd" if getattr(eng, "sweep_mode", "wavefront")
-                     == "wavefront" else "none")
-        elif accel == "cmfd" and getattr(eng, "sweep_mode", "") == "rows":
-            raise ValueError("step_acceleration='cmfd' needs the wavefront "
-                             "sweep (face-current accumulation)")
+            accel = "cmfd" if can_cmfd else "none"
+        elif accel == "cmfd" and not can_cmfd:
+            raise ValueError(
+                "step_acceleration='cmfd' needs an engine that accumulates face "
+                "currents in its transient sweep (the Cartesian wavefront sweep; "
+                "transient CMFD on the tri/prism mesh is Phase 3b)")
         steady = eng.solve(**(steady_kwargs or dict(tol_k=1e-8, tol_source=1e-7)))
         if not steady.converged:
             raise RuntimeError(f"initial steady state did not converge: {steady}")
@@ -1044,15 +1050,14 @@ class TransientSNSolver:
             return xp.asarray(a)
 
         def load_fields(eng):
-            st = [fld(eng.st[g]) for g in range(G)]
             ss = [fld(eng.ss_self[g]) for g in range(G)]
             nsf = [fld(eng.nsf[g]) for g in range(G)]
             chi = [fld(eng.chi[g]) for g in range(G)]
             scatter = [[None if s is None else fld(s) for s in row]
                        for row in eng.scatter]
-            return st, ss, nsf, chi, scatter
+            return ss, nsf, chi, scatter
 
-        st, ss, nsf, chi, scatter = load_fields(eng)
+        ss, nsf, chi, scatter = load_fields(eng)
 
         def fission_source(phi):
             return sum(nsf[g] * phi[g] for g in range(G))
@@ -1060,19 +1065,17 @@ class TransientSNSolver:
         def total_power(S):
             return float(xp.sum(S))
 
-        # theta_g = 1/(v_g dt) is the backward-Euler collision shift; the shifted
-        # total XS feeds every transient sweep.
+        # theta_g = 1/(v_g dt) is the backward-Euler collision shift.
         theta = [1.0 / (float(kin.velocities[g]) * dt) for g in range(G)]
-        st_shift = [st[g] + theta[g] for g in range(G)]
 
         # Steady scalar flux, and its angular flux from one clean sweep of the
-        # converged steady source (vacuum -> zero incoming). This psi seeds the
-        # very first time source theta*psi_old.
+        # converged steady source. This psi seeds the very first time source
+        # theta*psi_old; the engine owns its layout (per-cell on a Cartesian or
+        # step-differenced mesh, per corner sub-volume for tri SCB) -- the driver
+        # only carries and scales it.
         phi = [fld(steady.flux[g]) for g in range(G)]
         S = fission_source(phi) / k0
-        # Incoming edge fluxes: zero for vacuum, the steady reflective fixed
-        # point's converged faces otherwise (carried and refreshed every step).
-        inc = [eng._zero_inc() for _ in range(G)]
+        state = eng.t_state0()
         psi = []
         for g in range(G):
             qext = chi[g] * S
@@ -1080,19 +1083,16 @@ class TransientSNSolver:
                 s = scatter[gf][g]
                 if gf != g and s is not None:
                     qext = qext + s * phi[gf]
-            src = ss[g] * phi[g] + qext
-            if self.bc != "vacuum":
-                # Reflective: recover the steady boundary fluxes from the
-                # converged steady source before seeding psi with them.
-                for _ in range(200):
-                    _, out = eng._sweep(src, st[g], inc[g])
-                    new = eng._reflect(out)
-                    d = max(np.max(np.abs(new[f] - inc[g][f])) for f in new)
-                    inc[g] = new
-                    if d < 1e-10 * max(1.0, float(xp.max(phi[g]))):
-                        break
-            _, _, psi_g = eng._sweep_transient(src, st[g], inc[g], None)
-            psi.append(fld(psi_g))
+            psi_g, state[g] = eng.t_seed_psi(g, ss[g] * phi[g] + qext, state[g])
+            psi.append(psi_g)
+
+        # Marching engine. Geometries that prefactor their transport operator
+        # (tri/prism) need Sigma_t + theta baked in at construction; the Cartesian
+        # sweep takes the shifted cross section per call and reuses this instance.
+        if getattr(self.engine_cls, "T_SHIFT_AT_CONSTRUCTION", False):
+            eng = self._engine(mats, mmap, sigma_t_shift=theta)
+            ss, nsf, chi, scatter = load_fields(eng)
+        eng.t_setup(theta)
 
         scale = 1.0 / total_power(S)                     # P(0) = 1
         for g in range(G):
@@ -1123,7 +1123,6 @@ class TransientSNSolver:
             return [chi[g] * dsum for g in range(G)]
 
         w_fis = fission_weights()
-        dsa = [eng._dsa_factor_transient(g, theta[g]) for g in range(G)]
         last = (mats, mmap)
 
         times = [0.0]
@@ -1137,11 +1136,13 @@ class TransientSNSolver:
             mats, mmap = self.problem_at(t)
             if mats is not last[0] or mmap is not last[1]:
                 inner_total += eng._sweep_count - sweeps0
-                eng = self._engine(mats, mmap)
-                st, ss, nsf, chi, scatter = load_fields(eng)
-                st_shift = [st[g] + theta[g] for g in range(G)]
+                shift = (dict(sigma_t_shift=theta)
+                         if getattr(self.engine_cls,
+                                    "T_SHIFT_AT_CONSTRUCTION", False) else {})
+                eng = self._engine(mats, mmap, **shift)
+                ss, nsf, chi, scatter = load_fields(eng)
+                eng.t_setup(theta)
                 w_fis = fission_weights()
-                dsa = [eng._dsa_factor_transient(g, theta[g]) for g in range(G)]
                 sweeps0 = eng._sweep_count
                 last = (mats, mmap)
 
@@ -1151,9 +1152,9 @@ class TransientSNSolver:
             phi_old = [p.copy() for p in phi]
             dsrc_g = delayed_source_by_group(C)
             if accel == "cmfd":
-                ctx = dict(G=G, k0=k0, theta=theta, st_shift=st_shift, ss=ss,
-                           scatter=scatter, w_fis=w_fis, dsrc=dsrc_g,
-                           psi_old=psi_old, inc=inc,
+                ctx = dict(G=G, k0=k0, theta=theta, ss=ss, scatter=scatter,
+                           w_fis=w_fis, dsrc=dsrc_g, psi_old=psi_old,
+                           state=state,
                            nsf_h=[asnumpy(nsf[g]).ravel() for g in range(G)],
                            w_fis_h=[asnumpy(w_fis[g]).ravel() for g in range(G)],
                            dsrc_h=[asnumpy(dsrc_g[g]).ravel() for g in range(G)],
@@ -1175,12 +1176,10 @@ class TransientSNSolver:
                         if gf != g and s is not None:
                             src = phi_new[gf] if gf < g else phi[gf]  # Gauss-Seidel
                             qext = qext + s * src
-                    q_ang = theta[g] * psi_old[g]
-                    p, ps, inc[g] = eng._solve_group_transient(
-                        qext, ss[g], st_shift[g], inc[g], q_ang, dsa[g], rtol, g,
-                        phi0=phi[g])
+                    p, ps, state[g] = eng.t_solve_group(
+                        g, qext, psi_old[g], rtol, phi[g], state[g])
                     phi_new[g] = fld(p)
-                    psi_new[g] = fld(ps)
+                    psi_new[g] = ps
                 G_S = fission_source(phi_new) / k0
                 delta = G_S - S
                 change = float(xp.sqrt(xp.sum(delta * delta) / xp.sum(G_S**2)))
