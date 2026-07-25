@@ -855,6 +855,120 @@ class SNTransportSolver:
                 break
         return phi, unflat(v)
 
+    # ---- transient engine hooks (Phase 0) ---------------------------------
+    # The time-dependent driver (TransientSNSolver) treats this class as an
+    # "engine": a steady solve for the initial condition, plus three transient
+    # primitives below. Unlike diffusion -- where backward Euler only shifts the
+    # removal term and the time source (1/(v dt)) phi_old is a *scalar* -- the
+    # transport time term (1/v) dpsi/dt acts on the *angular* flux, so the shift
+    # 1/(v dt) is added to Sigma_t (the sweep's collision diagonal) and the time
+    # source (1/(v dt)) psi_m^old is per-ordinate. That forces the full angular
+    # flux to be carried between steps, which is what _sweep_ang returns.
+
+    def _sweep_ang(self, q, st_g, inc, q_ang=None, want_psi=False):
+        """Per-ordinate reference sweep extended for the transient: it accepts a
+        per-ordinate additive source ``q_ang`` (M, nx, ny) -- the backward-Euler
+        time source theta*psi_old -- and returns the full angular flux ``psi``
+        (M, nx, ny) needed to carry that source to the next step. The isotropic
+        part ``q`` (nx, ny) is added to every ordinate, exactly as in the steady
+        sweeps. CPU/numpy; the transient's within-group workhorse (the vectorized
+        wavefront path is Phase 2)."""
+        self._sweep_count += 1
+        nx, ny = self.nx, self.ny
+        q = asnumpy(q)
+        st_g = asnumpy(st_g)
+        qa = None if q_ang is None else asnumpy(q_ang)
+        phi = np.zeros((nx, ny))
+        psi = np.zeros((self.M, nx, ny)) if want_psi else None
+        out = {"x0": np.zeros((self.M, ny)), "x1": np.zeros((self.M, ny)),
+               "y0": np.zeros((self.M, nx)), "y1": np.zeros((self.M, nx))}
+        for m in range(self.M):
+            a, b, fx, fy, w = self._a[m], self._b[m], self._fx[m], self._fy[m], self.w[m]
+            xin = inc["x0"][m] if fx else inc["x1"][m]
+            yin = (inc["y0"][m] if fy else inc["y1"][m]).copy()
+            rows = range(ny) if fy else range(ny - 1, -1, -1)
+            x_far = np.empty(ny)
+            y_far = None
+            for j in rows:
+                st_eff = st_g[:, j] + b
+                q_row = b * yin + q[:, j]
+                if qa is not None:
+                    q_row = q_row + qa[m, :, j]
+                psi_row, e_far = _row_solve(q_row, st_eff, a, xin[j], fx)
+                phi[:, j] += w * psi_row
+                if psi is not None:
+                    psi[m, :, j] = psi_row
+                yout = 2.0 * psi_row - yin
+                yin = yout
+                x_far[j] = e_far
+                y_far = yout
+            out["x1" if fx else "x0"][m] = x_far
+            out["y1" if fy else "y0"][m] = y_far
+        return (phi, out, psi) if want_psi else (phi, out)
+
+    def _dsa_factor_transient(self, g, theta):
+        """Sparse-LU DSA factor for the *shifted* within-group system: the time
+        shift theta = 1/(v_g dt) raises the total XS (Sigma_t -> Sigma_t + theta)
+        and hence the diffusion removal (Sigma_t - Sigma_s + theta) and lowers
+        D = 1/(3(Sigma_t + theta)). Rebuilt only when the material fields change
+        (dt is fixed), so it is cached by the caller, not here."""
+        st = np.maximum(asnumpy(self.st[g]) + theta, 1e-12)
+        ss = asnumpy(self.ss_self[g])
+        A = diffusion_matrix(1.0 / (3.0 * st), np.maximum(st - ss, 0.0),
+                             self.hx, self.hy,
+                             ((BC_VACUUM, BC_VACUUM), (BC_VACUUM, BC_VACUUM)))
+        return factorized(A)
+
+    def _solve_group_transient(self, qext, ss_g, st_shift, inc, q_ang, dsa_fac,
+                               tol, g):
+        """Within-group solve for one backward-Euler step: the scattering fixed
+        point at the shifted total XS ``st_shift`` (= Sigma_t + theta) with the
+        fixed per-ordinate time source ``q_ang`` (= theta*psi_old). Returns the
+        scalar flux, the outgoing edge fluxes and the full angular flux ``psi``
+        (the next step's psi_old). DSA-accelerated when ``dsa_fac`` is given (the
+        shift makes the within-group problem strictly more diffusive, so DSA is
+        very effective). Reflective boundaries in the transient are Phase 2."""
+        if self.bc != BC_VACUUM:
+            raise NotImplementedError(
+                "transient S_N currently supports bc='vacuum' only "
+                "(reflective boundary fixed point is Phase 2)")
+        xp = self.xp
+        phi = xp.zeros((self.nx, self.ny))
+        q0 = xp.asarray(qext)
+        accelerate = dsa_fac is not None
+        prev = None
+        bad = 0
+        for _ in range(self.max_inner):
+            half, out, psi = self._sweep_ang(ss_g * phi + q0, st_shift, inc,
+                                             q_ang, want_psi=True)
+            half = xp.asarray(half)
+            if accelerate:
+                r = ss_g * (half - phi)
+                corr = xp.asarray(
+                    dsa_fac(asnumpy(r).ravel()).reshape(self.nx, self.ny))
+                new = half + corr
+            else:
+                new = half
+            d = float(xp.max(xp.abs(new - phi)))
+            scale = max(float(xp.max(xp.abs(new))), 1e-300)
+            phi = new
+            if d <= tol * scale:
+                break
+            if accelerate:
+                if prev is not None and d > prev:
+                    bad += 1
+                    if bad >= 3:
+                        accelerate = False
+                else:
+                    bad = 0
+                prev = d
+        # DSA perturbs phi off the last sweep, so psi/out belong to the previous
+        # iterate; one final clean sweep at the converged phi makes the returned
+        # angular flux and edges exactly consistent with it.
+        _, out, psi = self._sweep_ang(ss_g * phi + q0, st_shift, inc, q_ang,
+                                      want_psi=True)
+        return phi, out, psi
+
     def solve(self, tol_k: float = 1e-7, tol_source: float = 1e-7,
               max_outer: int = 500, verbose: bool = False) -> SNResult:
         """Power iteration on the fission source until |dk| < tol_k and the

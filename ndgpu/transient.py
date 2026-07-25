@@ -43,6 +43,7 @@ from .backend import asnumpy, device_name, get_backend, synchronize
 from .grid import Grid
 from .linalg import get_linear_solver, neumann_preconditioner
 from .materials import Kinetics
+from .sn import SNTransportSolver
 from .sp3 import SP3GroupOperator
 from .spn import SDPNGroupOperator, _SPN_C
 from .stencil import BC_VACUUM, BC_ZERO_FLUX, GroupOperator
@@ -873,3 +874,227 @@ class TransientSPNSolver(TransientSDPNSolver):
     equivalent to :class:`TransientSolver` (tested)."""
 
     _coeffs = _SPN_C
+
+
+class TransientSNSolver:
+    """Time-dependent multigroup discrete-ordinates (S_N) transport.
+
+    The transport counterpart of :class:`TransientSolver`. Backward Euler on the
+    angular flux: the transport time term (1/v) dpsi/dt adds theta = 1/(v_g dt)
+    to the total cross section (the sweep's collision diagonal) and contributes a
+    *per-ordinate* source theta * psi_m^old. So -- unlike diffusion, which only
+    shifts the removal term and carries a scalar (1/(v dt)) phi_old -- the full
+    *angular* flux is retained between steps (see the engine hooks on
+    :class:`~ndgpu.sn.SNTransportSolver`). Everything else is shared with
+    :class:`TransientSolver`: the analytic backward-Euler precursor update, the
+    critical adjustment by k0, the Anderson fixed point on the fission source and
+    the :class:`TransientResult` contract. Only the per-group solve changes -- a
+    fixed-source transport sweep instead of a diffusion CG solve.
+
+    Parameters
+    ----------
+    grid, problem_at, kinetics : as for :class:`TransientSolver`. Only global
+        kinetics data is supported (per-material velocities/beta and per-family
+        chi_delayed remain diffusion-only).
+    engine_cls : the steady S_N solver class used as the transport engine
+        (:class:`~ndgpu.sn.SNTransportSolver` for Cartesian; the tri/prism
+        engine gains the same hooks in Phase 3). ``engine_kwargs`` are forwarded
+        to it (n_polar, n_azi, acceleration, ...).
+    bc : "vacuum" only for now (the reflective boundary fixed point in the
+        transient sweep is Phase 2).
+    """
+
+    def __init__(self, grid: Grid, problem_at, kinetics: Kinetics,
+                 engine_cls=SNTransportSolver, bc: str = "vacuum",
+                 device: str = "cpu", dtype=np.float64, **engine_kwargs):
+        _require_global_kinetics(kinetics, "TransientSNSolver")
+        self.grid = grid
+        self.problem_at = problem_at
+        self.kinetics = kinetics
+        self.engine_cls = engine_cls
+        self.bc = bc
+        self.device_arg = device
+        self.engine_kwargs = engine_kwargs
+        self.xp = get_backend(device)
+        self.device = device_name(self.xp)
+        self.dtype = np.dtype(dtype)
+
+    def _engine(self, mats, mmap):
+        return self.engine_cls(self.grid, mats, mmap, bc=self.bc,
+                               device=self.device_arg, **self.engine_kwargs)
+
+    def solve(self, t_end: float, dt: float, tol_step: float = 1e-6,
+              max_sweeps: int = 200, anderson_depth: int = 5,
+              steady_kwargs: dict | None = None,
+              verbose: bool = False) -> TransientResult:
+        """March from the steady S_N state at t=0 to t_end with fixed step dt
+        (see :meth:`TransientSolver.solve` for the shared parameters)."""
+        xp, kin = self.xp, self.kinetics
+        beta = [float(b) for b in kin.beta]
+        lam = kin.decay
+        n_steps = int(round(t_end / dt))
+        synchronize(xp)
+        t0 = time.perf_counter()
+
+        # --- initial condition: steady S_N state, critically adjusted --------
+        mats, mmap = self.problem_at(0.0)
+        eng = self._engine(mats, mmap)
+        G = eng.G
+        if kin.velocities.shape[-1] != G:
+            raise ValueError("kinetics.velocities must have one entry per group")
+        steady = eng.solve(**(steady_kwargs or dict(tol_k=1e-8, tol_source=1e-7)))
+        if not steady.converged:
+            raise RuntimeError(f"initial steady state did not converge: {steady}")
+        k0 = steady.k_eff
+
+        def fld(a):
+            return xp.asarray(a)
+
+        def load_fields(eng):
+            st = [fld(eng.st[g]) for g in range(G)]
+            ss = [fld(eng.ss_self[g]) for g in range(G)]
+            nsf = [fld(eng.nsf[g]) for g in range(G)]
+            chi = [fld(eng.chi[g]) for g in range(G)]
+            scatter = [[None if s is None else fld(s) for s in row]
+                       for row in eng.scatter]
+            return st, ss, nsf, chi, scatter
+
+        st, ss, nsf, chi, scatter = load_fields(eng)
+
+        def fission_source(phi):
+            return sum(nsf[g] * phi[g] for g in range(G))
+
+        def total_power(S):
+            return float(xp.sum(S))
+
+        # theta_g = 1/(v_g dt) is the backward-Euler collision shift; the shifted
+        # total XS feeds every transient sweep.
+        theta = [1.0 / (float(kin.velocities[g]) * dt) for g in range(G)]
+        st_shift = [st[g] + theta[g] for g in range(G)]
+
+        # Steady scalar flux, and its angular flux from one clean sweep of the
+        # converged steady source (vacuum -> zero incoming). This psi seeds the
+        # very first time source theta*psi_old.
+        phi = [fld(steady.flux[g]) for g in range(G)]
+        S = fission_source(phi) / k0
+        zero_inc = eng._zero_inc()
+        psi = []
+        for g in range(G):
+            qext = chi[g] * S
+            for gf in range(G):
+                s = scatter[gf][g]
+                if gf != g and s is not None:
+                    qext = qext + s * phi[gf]
+            _, _, psi_g = eng._sweep_ang(ss[g] * phi[g] + qext, st[g], zero_inc,
+                                         want_psi=True)
+            psi.append(fld(psi_g))
+
+        scale = 1.0 / total_power(S)                     # P(0) = 1
+        for g in range(G):
+            phi[g] = phi[g] * scale
+            psi[g] = psi[g] * scale
+        S = S * scale
+        C = [(beta[i] / lam[i]) * S for i in range(kin.n_families)]  # equilibrium
+
+        # End-of-step fission weight and delayed emission -- the same analytic
+        # backward-Euler precursor substitution as TransientSolver, global data.
+        bcoef = [beta[i] / (1.0 + lam[i] * dt) for i in range(kin.n_families)]
+        bcoef_sum = sum(bcoef)
+
+        def fission_weights():
+            if kin.chi_delayed is not None:
+                return [chi[g] - float(kin.chi_delayed[g]) * bcoef_sum
+                        for g in range(G)]
+            return [chi[g] * (1.0 - bcoef_sum) for g in range(G)]
+
+        def delayed_source_by_group(C):
+            decayed = [(lam[i] / (1.0 + lam[i] * dt)) * C[i]
+                       for i in range(kin.n_families)]
+            dsum = decayed[0]
+            for d in decayed[1:]:
+                dsum = dsum + d
+            if kin.chi_delayed is not None:
+                return [float(kin.chi_delayed[g]) * dsum for g in range(G)]
+            return [chi[g] * dsum for g in range(G)]
+
+        w_fis = fission_weights()
+        dsa = [eng._dsa_factor_transient(g, theta[g]) for g in range(G)]
+        last = (mats, mmap)
+
+        times = [0.0]
+        power = [1.0]
+        inner_total = 0
+        sweeps0 = eng._sweep_count
+
+        for n in range(1, n_steps + 1):
+            t = n * dt
+            mats, mmap = self.problem_at(t)
+            if mats is not last[0] or mmap is not last[1]:
+                inner_total += eng._sweep_count - sweeps0
+                eng = self._engine(mats, mmap)
+                st, ss, nsf, chi, scatter = load_fields(eng)
+                st_shift = [st[g] + theta[g] for g in range(G)]
+                w_fis = fission_weights()
+                dsa = [eng._dsa_factor_transient(g, theta[g]) for g in range(G)]
+                sweeps0 = eng._sweep_count
+                last = (mats, mmap)
+
+            # psi_old is fixed within the step; the time source is theta*psi_old.
+            psi_old = list(psi)
+            dsrc_g = delayed_source_by_group(C)
+
+            change = 1.0
+            change_prev = np.inf
+            hist: list = []
+            for sweep in range(1, max_sweeps + 1):
+                rtol = min(1e-6, max(1e-3 * change, 1e-3 * tol_step, 1e-12))
+                phi_new = [None] * G
+                psi_new = [None] * G
+                for g in range(G):
+                    qext = w_fis[g] * S + dsrc_g[g]
+                    for gf in range(G):
+                        s = scatter[gf][g]
+                        if gf != g and s is not None:
+                            src = phi_new[gf] if gf < g else phi[gf]  # Gauss-Seidel
+                            qext = qext + s * src
+                    q_ang = theta[g] * psi_old[g]
+                    p, _, ps = eng._solve_group_transient(
+                        qext, ss[g], st_shift[g], zero_inc, q_ang, dsa[g], rtol, g)
+                    phi_new[g] = fld(p)
+                    psi_new[g] = fld(ps)
+                G_S = fission_source(phi_new) / k0
+                delta = G_S - S
+                change = float(xp.sqrt(xp.sum(delta * delta) / xp.sum(G_S**2)))
+                phi, psi = phi_new, psi_new
+                if change < tol_step:
+                    S = G_S
+                    break
+                if change > _ANDERSON_RESTART_GROWTH * change_prev:
+                    hist = []
+                change_prev = change
+                hist.append((S, G_S))
+                hist = hist[-anderson_depth:]
+                S = G_S
+                if len(hist) >= 2:
+                    S = _anderson_mix(hist, S, xp)
+            else:
+                raise RuntimeError(
+                    f"time step at t={t:g} s did not converge "
+                    f"({max_sweeps} sweeps, source change {change:.2e})")
+
+            for i in range(kin.n_families):
+                C[i] = (C[i] + (dt * beta[i]) * S) / (1.0 + lam[i] * dt)
+
+            times.append(t)
+            power.append(total_power(S))
+            if verbose and (n % max(1, n_steps // 20) == 0 or n == n_steps):
+                print(f"  t = {t:8.4f} s   P/P0 = {power[-1]:.5f}   ({sweep} sweeps)")
+
+        inner_total += eng._sweep_count - sweeps0
+        synchronize(xp)
+        return TransientResult(
+            times=np.array(times), power=np.array(power), k0=k0, steady=steady,
+            flux=xp.stack(phi), precursors=xp.stack(C),
+            total_inner_iterations=inner_total,
+            solve_seconds=time.perf_counter() - t0, device=self.device,
+        )

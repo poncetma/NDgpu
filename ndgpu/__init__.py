@@ -35,7 +35,7 @@ from .tri import (TriDiffusionEigenSolver, TriGrid, TriSDP1EigenSolver,
                   TriSP3EigenSolver, TriSP5EigenSolver, TriSP7EigenSolver)
 from .transient import (TransientResult, TransientSDP1Solver,
                         TransientSDP3Solver, TransientSDPNSolver,
-                        TransientSPNSolver, TransientSolver)
+                        TransientSNSolver, TransientSPNSolver, TransientSolver)
 
 __version__ = "0.1.0"
 
@@ -69,6 +69,7 @@ __all__ = [
     "TransientSDPNSolver",
     "TransientSDP3Solver",
     "TransientSPNSolver",
+    "TransientSNSolver",
     "TransientResult",
     "NoiseSolver",
     "NoiseSource",
