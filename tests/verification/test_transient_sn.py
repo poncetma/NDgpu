@@ -13,17 +13,24 @@ independent of the solver:
 
 * **Point kinetics.** For a *uniform* perturbation the flux shape never changes,
   so the space-angle transport equations collapse exactly onto the point-kinetics
-  ODEs. Unlike diffusion -- whose fundamental mode is geometry-locked -- a
-  transport mode's shape depends on the *scattering ratio* c = Sigma_s/Sigma_t, so
-  a Sigma_a step subtly reshapes it. A **nu*Sigma_f step** leaves the streaming +
-  scattering operator (hence the mode) untouched, giving a transport-exact point
-  kinetics reference. The only bookkeeping: res.power tracks nu*Sigma_f * phi, so
-  after the (1+eps) production step it reads (1+eps) n(t); dividing it out
-  recovers the population n(t). A low-leakage slab keeps the mode nearly
-  isotropic so the naive generation time Lambda = 1/(v a) is accurate; in a leaky
-  slab the transport Lambda departs from 1/(v a) (the isotropic fission source
-  cannot balance the anisotropic time term pointwise) and the match loosens to a
-  physical ~1e-3 -- a transport-kinetics effect, not a discretization error.
+  ODEs. A **nu*Sigma_f step** is used because it leaves the streaming +
+  scattering operator -- hence the transport mode -- exactly untouched, while a
+  Sigma_a step at fixed Sigma_t = 1/3D perturbs the scattering ratio
+  c = Sigma_s/Sigma_t and so could reshape it (diffusion is immune: its
+  fundamental mode is geometry-locked). The only bookkeeping: res.power tracks
+  nu*Sigma_f * phi, so after the (1+eps) production step it reads (1+eps) n(t);
+  dividing it out recovers the population n(t).
+
+  What actually limits the match is the **generation time**, not the mode shape.
+  A low-leakage slab keeps the flux nearly isotropic, so the naive
+  Lambda = 1/(v a) assumed by the reference ODE is accurate and the deviation is
+  pure backward-Euler O(dt) (measured 9.4e-4, 4.5e-4, 2.0e-4, 8.0e-5 for
+  dt = 4e-4 .. 5e-5). In a leaky slab the true transport Lambda is
+  adjoint-weighted and departs from 1/(v a), so the deviation *saturates* at a
+  dt-independent ~1.3e-3 -- physics, not a discretization error. Measured with
+  both perturbation types, the two agree to < 0.5% in each regime, confirming
+  the floor tracks leakage (anisotropy) and that mode reshaping is negligible
+  here. See examples/transient_sn_pk_benchmark.py.
 """
 
 import numpy as np
@@ -67,14 +74,72 @@ def test_sweep_ang_matches_steady_sweep_and_psi_sums_to_phi():
     assert np.allclose(phi_from_psi, phi, atol=1e-11)
 
 
-def test_reflective_transient_not_supported():
-    """Reflective boundaries in the transient sweep are Phase 2; the engine hook
-    rejects them clearly rather than silently leaking."""
-    eng = SNTransportSolver(SLAB, BASE, bc="reflective", **QUAD)
-    with pytest.raises(NotImplementedError):
-        eng._solve_group_transient(np.ones((eng.nx, eng.ny)), eng.ss_self[0],
-                                   eng.st[0], eng._zero_inc(),
-                                   np.zeros((eng.M, eng.nx, eng.ny)), None, 1e-6, 0)
+@pytest.mark.parametrize("bc", ["vacuum", "reflective"])
+def test_wavefront_transient_sweep_matches_row_reference(bc):
+    """Phase 2: the vectorized wavefront sweep carries the per-ordinate time
+    source and returns the angular flux, and must reproduce the per-ordinate row
+    reference exactly -- scalar flux, angular flux and outgoing edges -- with
+    non-trivial incoming fluxes on every face."""
+    grid = Grid(shape=(9, 7, 1), size=(20.0, 15.0, 1.0))
+    ew = SNTransportSolver(grid, BASE, bc=bc, n_polar=2, n_azi=8,
+                           sweep="wavefront")
+    er = SNTransportSolver(grid, BASE, bc=bc, n_polar=2, n_azi=8, sweep="rows")
+    rng = np.random.default_rng(3)
+    q = rng.random((9, 7))
+    q_ang = rng.random((ew.M, 9, 7))
+    inc = ew._zero_inc()
+    if bc == "reflective":
+        for f in inc:
+            inc[f] = rng.random(inc[f].shape)
+    pw, ow, psw = ew._sweep_wavefront(q, ew.st[0], inc, q_ang=q_ang,
+                                      want_psi=True)
+    pr, orr, psr = er._sweep_ang(q, er.st[0], inc, q_ang, want_psi=True)
+    assert np.allclose(pw, pr, atol=1e-12), np.max(np.abs(pw - pr))
+    assert np.allclose(psw, psr, atol=1e-12), np.max(np.abs(psw - psr))
+    for f in ow:
+        assert np.allclose(ow[f], orr[f], atol=1e-12), f
+    assert np.allclose(np.einsum("m,mxy->xy", ew.w, psw), pw, atol=1e-12)
+
+
+def test_reflective_transient_stays_steady_and_is_kinf():
+    """Phase 2: with reflective boundaries the transient's boundary fixed point
+    must hold the steady state exactly -- and for a homogeneous medium that state
+    is the non-leaking k_inf solution, so this also pins the reflective transient
+    against an analytic eigenvalue."""
+    grid = Grid(shape=(6, 6, 1), size=(30.0, 30.0, 1.0))
+    res = TransientSNSolver(grid, lambda t: ([BASE], None), KIN,
+                            bc="reflective", **QUAD).solve(t_end=0.1, dt=0.02)
+    k_inf = NU_SIGMA_F / SIGMA_A
+    assert res.k0 == pytest.approx(k_inf, rel=1e-8), res.k0
+    assert np.allclose(res.power, 1.0, atol=1e-5), res.power
+
+
+def test_cmfd_step_acceleration_matches_plain_iteration():
+    """Phase 2: the drift-corrected coarse solve accelerates the within-step
+    fission fixed point without moving it -- the CMFD and plain power traces must
+    agree, at far fewer fixed-point iterations per step. CMFD pays most at large
+    dt, where the 1/(v dt) shift no longer damps the fixed point."""
+    eps = 0.5 * BETA / (1.0 - 0.5 * BETA)
+    grid = Grid(shape=(12, 12, 1), size=(60.0, 60.0, 1.0))
+    kw = dict(t_end=0.2, dt=5e-2, tol_step=1e-9)
+    runs = {}
+    for acc in ("none", "cmfd"):
+        runs[acc] = TransientSNSolver(grid, nsf_step(eps), KIN, bc="vacuum",
+                                      step_acceleration=acc, **QUAD).solve(**kw)
+    assert np.allclose(runs["cmfd"].power, runs["none"].power, rtol=0, atol=1e-5), \
+        np.max(np.abs(runs["cmfd"].power - runs["none"].power))
+    its_c = np.mean(runs["cmfd"].step_iterations)
+    its_n = np.mean(runs["none"].step_iterations)
+    assert its_c < 0.6 * its_n, (its_c, its_n)
+
+
+def test_cmfd_rejects_row_sweep():
+    """CMFD needs the wavefront sweep's face currents; asking for it with the
+    row sweep is an error rather than a silent downgrade."""
+    solver = TransientSNSolver(SLAB, lambda t: ([BASE], None), KIN, bc="vacuum",
+                               step_acceleration="cmfd", sweep="rows", **QUAD)
+    with pytest.raises(ValueError, match="wavefront"):
+        solver.solve(t_end=2e-3, dt=1e-3)
 
 
 # --- Phase 1 transient driver --------------------------------------------------

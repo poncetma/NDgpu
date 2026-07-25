@@ -100,6 +100,7 @@ _VACUUM_ALPHA = 0.5
 
 # Sweep quadrants (mu > 0, eta > 0); the wavefront sweep batches all four.
 _QUADS = ((True, True), (False, True), (True, False), (False, False))
+_FACES = ("x0", "x1", "y0", "y1")
 
 
 def quadrature_2d(n_polar: int, n_azi: int):
@@ -511,14 +512,25 @@ class SNTransportSolver:
             return self._sweep_rows(q, st_g, inc)
         return self._sweep_wavefront(q, st_g, inc, currents)
 
-    def _sweep_wavefront(self, q, st_g, inc, currents=False):
+    def _sweep_wavefront(self, q, st_g, inc, currents=False, q_ang=None,
+                         want_psi=False):
         """Vectorized wavefront sweep: one batched diamond-difference update per
         anti-diagonal over (4 quadrants) x (M/4 directions) x (diagonal cells).
         psi = (q + a psi_x_in + b psi_y_in) / (Sigma_t + a + b) with
         a = 2|mu|/hx, b = 2|eta|/hy; outgoing edges psi_out = 2 psi - psi_in.
         Each cell writes its outgoing edge exactly once (and it is the next
         cell's incoming), so accumulating w*mu-weighted edge fluxes as they are
-        produced gives every face's net current with no extra passes."""
+        produced gives every face's net current with no extra passes.
+
+        ``q_ang`` (M, nx, ny) adds a *per-ordinate* source on top of the
+        isotropic ``q`` -- the transient's backward-Euler time source
+        theta*psi_old -- and ``want_psi`` returns the full angular flux that
+        becomes the next step's psi_old. Both ride the same batched update: the
+        per-ordinate arrays are pre-flipped into each quadrant's swept
+        coordinates once, so the diagonal loop indexes them with the same swept
+        index as everything else and stays a fixed sequence of batched kernels
+        (numpy or cupy). Extra return values are appended in the order
+        (currents, psi)."""
         xp, nx, ny = self.xp, self.nx, self.ny
         Mq = self.M // 4
         qf = xp.asarray(q).ravel()
@@ -532,6 +544,19 @@ class SNTransportSolver:
             yin = np.asarray(inc["y0" if fy else "y1"])[sel]
             ex[qd] = xp.asarray(np.ascontiguousarray(xin[:, ::1 if fy else -1]))
             ey[qd] = xp.asarray(np.ascontiguousarray(yin[:, ::1 if fx else -1]))
+        qa_sw = None
+        if q_ang is not None:
+            # Per-quadrant flip into swept coords: physical (i, j) = (isw or
+            # nx-1-isw, jsw or ny-1-jsw), so the flip is its own inverse and the
+            # flat swept index isw*ny + jsw addresses it.
+            qa = xp.asarray(q_ang)
+            qa_sw = xp.stack([
+                xp.ascontiguousarray(
+                    qa[xp.asarray(self._qsel[qd])][:, ::(1 if fx else -1),
+                                                   ::(1 if fy else -1)]
+                ).reshape(Mq, nx * ny)
+                for qd, (fx, fy) in enumerate(_QUADS)])
+        psi_sw = xp.zeros((4, Mq, nx * ny)) if want_psi else None
         a, b, w = self._aq, self._bq, self._wq
         if currents:
             wmu, weta = self._wmuq, self._wetaq
@@ -541,6 +566,8 @@ class SNTransportSolver:
             jy_sw[:, :, 0] = (weta * ey).sum(axis=1)
         for isw, jsw, fsw, fph in self._diags:
             qv = qf[fph][:, None, :]              # (4, 1, nd)
+            if qa_sw is not None:
+                qv = qv + qa_sw[:, :, fsw]        # (4, Mq, nd)
             stv = stf[fph][:, None, :]
             exv = ex[:, :, jsw]                   # (4, Mq, nd)
             eyv = ey[:, :, isw]
@@ -550,6 +577,8 @@ class SNTransportSolver:
             ex[:, :, jsw] = exn
             ey[:, :, isw] = eyn
             phi_sw[:, fsw] = (w * psi).sum(axis=1)
+            if want_psi:
+                psi_sw[:, :, fsw] = psi
             if currents:
                 jx_sw[:, isw + 1, jsw] = (wmu * exn).sum(axis=1)
                 jy_sw[:, isw, jsw + 1] = (weta * eyn).sum(axis=1)
@@ -561,18 +590,26 @@ class SNTransportSolver:
         if currents:
             Jx = xp.zeros((nx + 1, ny))
             Jy = xp.zeros((nx, ny + 1))
+        if want_psi:
+            psi_out = xp.zeros((self.M, nx, ny))
         for qd, (fx, fy) in enumerate(_QUADS):
             sx, sy = (1 if fx else -1), (1 if fy else -1)
             phi = phi + pq[qd][::sx, ::sy]
             sel = self._qsel[qd]
             out["x1" if fx else "x0"][sel] = exh[qd][:, ::sy]
             out["y1" if fy else "y0"][sel] = eyh[qd][:, ::sx]
+            if want_psi:
+                psi_out[xp.asarray(sel)] = \
+                    psi_sw[qd].reshape(Mq, nx, ny)[:, ::sx, ::sy]
             if currents:
                 Jx = Jx + jx_sw[qd][::sx, ::sy]   # swept face s -> physical nx - s
                 Jy = Jy + jy_sw[qd][::sx, ::sy]
+        extras = []
         if currents:
-            return phi, out, (Jx, Jy)
-        return phi, out
+            extras.append((Jx, Jy))
+        if want_psi:
+            extras.append(psi_out)
+        return (phi, out, *extras)
 
     def _sweep_rows(self, q, st_g, inc):
         """Reference sweep: per-direction row loop with scipy banded solves."""
@@ -637,7 +674,7 @@ class SNTransportSolver:
         return self.xp.asarray(d.reshape(self.nx, self.ny))
 
     # ---- CMFD outer acceleration ------------------------------------------
-    def _cmfd_factor(self, g, p, Jx, Jy):
+    def _cmfd_factor(self, g, p, Jx, Jy, shift=0.0):
         """LU of the group-g drift-corrected diffusion operator built from the
         transport flux p and face net currents (Jx, Jy): interior face current
         model J = -beta (phi_R - phi_L) + gamma (phi_R + phi_L) with beta the
@@ -651,9 +688,14 @@ class SNTransportSolver:
         the face coupling is enlarged odCMFD-style, beta += theta with
         theta = 0.25 (1 - 1/tau)_+ (0 for thin cells, -> 1/4 for thick): gamma
         refits the transport current for any beta, so the damping changes the
-        outer convergence rate only, never the converged answer."""
+        outer convergence rate only, never the converged answer.
+
+        ``shift`` adds a positive constant to the total cross section (the
+        transient's backward-Euler 1/(v dt)), so D = 1/(3(Sigma_t + shift)) and
+        the removal picks up the shift -- the coarse operator then matches the
+        *time-shifted* transport balance."""
         nx, ny, hx, hy = self.nx, self.ny, self.hx, self.hy
-        st = asnumpy(self.st[g])
+        st = asnumpy(self.st[g]) + shift
         D = 1.0 / (3.0 * np.maximum(st, 1e-12))
         rem = st - asnumpy(self.ss_self[g])
 
@@ -824,36 +866,47 @@ class SNTransportSolver:
         if self.bc == BC_VACUUM:
             return phi, inc
 
-        faces = ("x0", "x1", "y0", "y1")
-        flat = lambda d: np.concatenate([d[f].ravel() for f in faces])
-        sizes = [inc[f].size for f in faces]
-
-        def unflat(v):
-            out, o = {}, 0
-            for f, s in zip(faces, sizes):
-                out[f] = v[o:o + s].reshape(inc[f].shape)
-                o += s
-            return out
-
-        def gstep(v):                                          # one fixed-point step
-            inc_v = unflat(v)
-            ph = self._scatter_solve(qext, ss_g, st_g, phi, inc_v, tol, g)
+        def gstep(inc_v, state):                               # one fixed-point step
+            ph = self._scatter_solve(qext, ss_g, st_g, state, inc_v, tol, g)
             _, out = self._sweep(ss_g * ph + self.xp.asarray(qext), st_g, inc_v)
-            return flat(self._reflect(out)), ph
+            return self._flat_inc(self._reflect(out)), ph, float(self.xp.max(ph))
 
-        v = flat(inc)
+        return self._boundary_fixed_point(inc, tol, gstep, phi)
+
+    # ---- reflective boundary fixed point (shared steady/transient) ---------
+    def _flat_inc(self, d):
+        return np.concatenate([np.asarray(d[f]).ravel() for f in _FACES])
+
+    def _unflat_inc(self, v):
+        out, o = {}, 0
+        for f in _FACES:
+            n = self.ny if f[0] == "x" else self.nx
+            out[f] = v[o:o + self.M * n].reshape(self.M, n)
+            o += self.M * n
+        return out
+
+    def _boundary_fixed_point(self, inc, tol, gstep, state0):
+        """Anderson-accelerated fixed point inc <- reflect(sweep(solve(inc))).
+
+        ``gstep(inc_dict, state) -> (flat_reflected_inc, state, scale)`` performs
+        one step; ``state`` carries the within-group solution between steps (the
+        scalar flux for the steady solver, the (flux, edges, angular flux) triple
+        for the transient) and ``scale`` its magnitude for the stopping test.
+        Returns the final state and the converged incoming fluxes."""
+        v = self._flat_inc(inc)
+        state = state0
         hist = []                                              # (v_in, g(v_in)) pairs
         for _ in range(200):
-            gv, phi = gstep(v)
+            gv, state, scale = gstep(self._unflat_inc(v), state)
             hist.append((v, gv))
             if len(hist) > 6:
                 hist.pop(0)
             v_next = _anderson(hist)
             d = np.max(np.abs(gv - v))
             v = v_next
-            if d < tol * max(1.0, float(self.xp.max(phi))):
+            if d < tol * max(1.0, scale):
                 break
-        return phi, unflat(v)
+        return state, self._unflat_inc(v)
 
     # ---- transient engine hooks (Phase 0) ---------------------------------
     # The time-dependent driver (TransientSNSolver) treats this class as an
@@ -865,15 +918,27 @@ class SNTransportSolver:
     # source (1/(v dt)) psi_m^old is per-ordinate. That forces the full angular
     # flux to be carried between steps, which is what _sweep_ang returns.
 
+    def _sweep_transient(self, q, st_g, inc, q_ang, want_psi=True,
+                         currents=False):
+        """One transient sweep through the configured spatial engine: the
+        vectorized wavefront (default; numpy or cupy) or the per-ordinate row
+        reference (``sweep="rows"``, CPU cross-check). Both take the per-ordinate
+        time source ``q_ang`` and return the angular flux."""
+        self._sweep_count += 1
+        if self.sweep_mode == "rows":
+            if currents:
+                raise ValueError("currents accumulation needs sweep='wavefront'")
+            return self._sweep_ang(q, st_g, inc, q_ang, want_psi=want_psi)
+        return self._sweep_wavefront(q, st_g, inc, currents=currents,
+                                     q_ang=q_ang, want_psi=want_psi)
+
     def _sweep_ang(self, q, st_g, inc, q_ang=None, want_psi=False):
         """Per-ordinate reference sweep extended for the transient: it accepts a
         per-ordinate additive source ``q_ang`` (M, nx, ny) -- the backward-Euler
         time source theta*psi_old -- and returns the full angular flux ``psi``
         (M, nx, ny) needed to carry that source to the next step. The isotropic
         part ``q`` (nx, ny) is added to every ordinate, exactly as in the steady
-        sweeps. CPU/numpy; the transient's within-group workhorse (the vectorized
-        wavefront path is Phase 2)."""
-        self._sweep_count += 1
+        sweeps. CPU/numpy reference for the vectorized wavefront path."""
         nx, ny = self.nx, self.ny
         q = asnumpy(q)
         st_g = asnumpy(st_g)
@@ -919,28 +984,26 @@ class SNTransportSolver:
                              ((BC_VACUUM, BC_VACUUM), (BC_VACUUM, BC_VACUUM)))
         return factorized(A)
 
-    def _solve_group_transient(self, qext, ss_g, st_shift, inc, q_ang, dsa_fac,
-                               tol, g):
-        """Within-group solve for one backward-Euler step: the scattering fixed
-        point at the shifted total XS ``st_shift`` (= Sigma_t + theta) with the
-        fixed per-ordinate time source ``q_ang`` (= theta*psi_old). Returns the
-        scalar flux, the outgoing edge fluxes and the full angular flux ``psi``
-        (the next step's psi_old). DSA-accelerated when ``dsa_fac`` is given (the
-        shift makes the within-group problem strictly more diffusive, so DSA is
-        very effective). Reflective boundaries in the transient are Phase 2."""
-        if self.bc != BC_VACUUM:
-            raise NotImplementedError(
-                "transient S_N currently supports bc='vacuum' only "
-                "(reflective boundary fixed point is Phase 2)")
+    def _scatter_solve_transient(self, qext, ss_g, st_shift, inc, q_ang,
+                                 dsa_fac, tol, phi0):
+        """DSA-accelerated scattering fixed point for one backward-Euler step at
+        the shifted total XS ``st_shift`` (= Sigma_t + theta), with the boundary
+        incoming fluxes ``inc`` and the per-ordinate time source ``q_ang`` (=
+        theta*psi_old) held fixed. Returns (flux, outgoing edges, angular flux).
+
+        The shift makes the within-group problem strictly more diffusive than the
+        steady one (the effective scattering ratio drops from Sigma_s/Sigma_t to
+        Sigma_s/(Sigma_t + theta)), so this converges *faster* than the steady
+        scattering solve -- the smaller the time step, the faster."""
         xp = self.xp
-        phi = xp.zeros((self.nx, self.ny))
+        phi = xp.zeros((self.nx, self.ny)) if phi0 is None else xp.asarray(phi0)
         q0 = xp.asarray(qext)
         accelerate = dsa_fac is not None
         prev = None
         bad = 0
         for _ in range(self.max_inner):
-            half, out, psi = self._sweep_ang(ss_g * phi + q0, st_shift, inc,
-                                             q_ang, want_psi=True)
+            half, out, psi = self._sweep_transient(ss_g * phi + q0, st_shift,
+                                                   inc, q_ang)
             half = xp.asarray(half)
             if accelerate:
                 r = ss_g * (half - phi)
@@ -965,9 +1028,30 @@ class SNTransportSolver:
         # DSA perturbs phi off the last sweep, so psi/out belong to the previous
         # iterate; one final clean sweep at the converged phi makes the returned
         # angular flux and edges exactly consistent with it.
-        _, out, psi = self._sweep_ang(ss_g * phi + q0, st_shift, inc, q_ang,
-                                      want_psi=True)
+        _, out, psi = self._sweep_transient(ss_g * phi + q0, st_shift, inc, q_ang)
         return phi, out, psi
+
+    def _solve_group_transient(self, qext, ss_g, st_shift, inc, q_ang, dsa_fac,
+                               tol, g, phi0=None):
+        """Within-group solve for one backward-Euler step: the scattering solve
+        above nested in the reflective-boundary fixed point (one solve for
+        vacuum). Returns the scalar flux, the angular flux ``psi`` (the next
+        step's psi_old) and the converged incoming edge fluxes, which the caller
+        warm-starts the next sweep/step from."""
+        phi, out, psi = self._scatter_solve_transient(
+            qext, ss_g, st_shift, inc, q_ang, dsa_fac, tol, phi0)
+        if self.bc == BC_VACUUM:
+            return phi, psi, inc
+
+        def gstep(inc_v, state):
+            p, o, ps = self._scatter_solve_transient(
+                qext, ss_g, st_shift, inc_v, q_ang, dsa_fac, tol, state[0])
+            return (self._flat_inc(self._reflect(o)), (p, o, ps),
+                    float(self.xp.max(p)))
+
+        (p, _, ps), inc_new = self._boundary_fixed_point(
+            inc, tol, gstep, (phi, out, psi))
+        return p, ps, inc_new
 
     def solve(self, tol_k: float = 1e-7, tol_source: float = 1e-7,
               max_outer: int = 500, verbose: bool = False) -> SNResult:

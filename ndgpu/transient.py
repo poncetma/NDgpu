@@ -35,7 +35,7 @@ when the returned objects change identity.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -106,6 +106,9 @@ class TransientResult:
     total_inner_iterations: int
     solve_seconds: float
     device: str
+    # Fixed-point (fission source) iterations per time step -- the transient's
+    # outer convergence telemetry, per the benchmark protocol.
+    step_iterations: list = field(default_factory=list)
 
     @property
     def flux_numpy(self) -> np.ndarray:
@@ -899,15 +902,34 @@ class TransientSNSolver:
     engine_cls : the steady S_N solver class used as the transport engine
         (:class:`~ndgpu.sn.SNTransportSolver` for Cartesian; the tri/prism
         engine gains the same hooks in Phase 3). ``engine_kwargs`` are forwarded
-        to it (n_polar, n_azi, acceleration, ...).
-    bc : "vacuum" only for now (the reflective boundary fixed point in the
-        transient sweep is Phase 2).
+        to it (n_polar, n_azi, acceleration, sweep, ...).
+    bc : "vacuum" or "reflective" (the reflective boundary fixed point is
+        Anderson-accelerated and warm-started across sweeps and time steps).
+    device : "cpu" (default) or "gpu"/"cuda" -- the transient runs on the
+        vectorized wavefront sweep, so the whole per-step transport solve is a
+        fixed sequence of batched numpy/cupy kernels.
+    step_acceleration : "auto" (default; "cmfd" whenever the engine accumulates
+        face currents, else "none"), "cmfd" or "none" -- drift-corrected
+        diffusion acceleration of the within-step fission fixed point. The
+        theta = 1/(v dt) shift already damps that fixed point (the smaller the
+        step, the stronger), so CMFD helps most at *large* steps; measured on a
+        40x40 bare core (fixed-point iterations per step, wall time):
+        dt = 5e-2 s 12.6 -> 3.2 its, 3.1x faster; 1e-2 s 13.7 -> 3.6, 2.4x;
+        1e-4 s 6.0 -> 4.0, 1.3x. Power traces agree to ~1e-6 (the fixed point is
+        the same; only its convergence rate changes).
     """
+
+    STEP_ACCELERATIONS = ("auto", "none", "cmfd")
 
     def __init__(self, grid: Grid, problem_at, kinetics: Kinetics,
                  engine_cls=SNTransportSolver, bc: str = "vacuum",
-                 device: str = "cpu", dtype=np.float64, **engine_kwargs):
+                 device: str = "cpu", dtype=np.float64,
+                 step_acceleration: str = "auto", **engine_kwargs):
         _require_global_kinetics(kinetics, "TransientSNSolver")
+        if step_acceleration not in self.STEP_ACCELERATIONS:
+            raise ValueError(f"step_acceleration must be one of "
+                             f"{self.STEP_ACCELERATIONS}")
+        self.step_acceleration = step_acceleration
         self.grid = grid
         self.problem_at = problem_at
         self.kinetics = kinetics
@@ -922,6 +944,68 @@ class TransientSNSolver:
     def _engine(self, mats, mmap):
         return self.engine_cls(self.grid, mats, mmap, bc=self.bc,
                                device=self.device_arg, **self.engine_kwargs)
+
+    def _cmfd_step(self, eng, S, phi, ctx):
+        """One CMFD acceleration of the within-step fission fixed point.
+
+        Integrating the time-shifted transport equation over angle gives an
+        *exact* scalar balance -- the per-ordinate time source theta*psi_old
+        integrates to theta*phi_old -- so the coarse problem is precisely the
+        drift-corrected *diffusion* backward-Euler step:
+
+            [div(-D grad) + Sigma_t + theta - Sigma_s,gg] phi
+                = w_fis,g S + delayed_g + inscatter_g + theta phi_old,g
+
+        with D and the removal carrying the same theta shift and the face
+        currents drift-fitted to the transport currents. At the transport fixed
+        point the coarse operator reproduces the transport balance, so CMFD
+        changes the convergence rate only, never the converged step. One
+        current-accumulating transport sweep per group builds it; the coarse
+        fixed point on S is then solved with cheap sparse back-solves.
+
+        Returns the accelerated fission source, or None to fall back."""
+        xp, G = self.xp, ctx["G"]
+        facs = []
+        for g in range(G):
+            qext = ctx["w_fis"][g] * S + ctx["dsrc"][g]
+            for gf in range(G):
+                s = ctx["scatter"][gf][g]
+                if gf != g and s is not None:
+                    qext = qext + s * phi[gf]
+            src = ctx["ss"][g] * phi[g] + qext
+            p, _, (Jx, Jy) = eng._sweep_transient(
+                src, ctx["st_shift"][g], ctx["inc"][g],
+                ctx["theta"][g] * ctx["psi_old"][g],
+                want_psi=False, currents=True)
+            facs.append(eng._cmfd_factor(g, asnumpy(p), asnumpy(Jx),
+                                         asnumpy(Jy), shift=ctx["theta"][g]))
+        # Coarse fixed point on the fission source: identical structure to the
+        # transport fixed point but with sparse back-solves instead of sweeps.
+        nsf = ctx["nsf_h"]
+        ph = [asnumpy(p).ravel().copy() for p in phi]
+        Sv = asnumpy(S).ravel().copy()
+        hist = []
+        for _ in range(200):
+            for g in range(G):
+                q = (ctx["w_fis_h"][g] * Sv + ctx["dsrc_h"][g]
+                     + ctx["theta"][g] * ctx["phi_old_h"][g])
+                for gf in range(G):
+                    s = ctx["scatter_h"][gf][g]
+                    if gf != g and s is not None:
+                        q = q + s * ph[gf]
+                ph[g] = facs[g](q)
+            S_new = sum(nsf[g] * ph[g] for g in range(G)) / ctx["k0"]
+            if not np.all(np.isfinite(S_new)) or np.any(S_new < 0.0):
+                return None
+            d = np.linalg.norm(S_new - Sv) / max(np.linalg.norm(S_new), 1e-300)
+            hist.append((Sv, S_new))
+            hist = hist[-5:]
+            Sv = S_new if len(hist) < 2 else _anderson_mix(hist, S_new, np)
+            if d < 1e-10:
+                break
+        else:
+            return None
+        return xp.asarray(Sv.reshape(asnumpy(S).shape))
 
     def solve(self, t_end: float, dt: float, tol_step: float = 1e-6,
               max_sweeps: int = 200, anderson_depth: int = 5,
@@ -942,6 +1026,15 @@ class TransientSNSolver:
         G = eng.G
         if kin.velocities.shape[-1] != G:
             raise ValueError("kinetics.velocities must have one entry per group")
+        # CMFD needs face currents, which only the wavefront sweep accumulates.
+        # Resolved before the (expensive) steady solve so misuse fails fast.
+        accel = self.step_acceleration
+        if accel == "auto":
+            accel = ("cmfd" if getattr(eng, "sweep_mode", "wavefront")
+                     == "wavefront" else "none")
+        elif accel == "cmfd" and getattr(eng, "sweep_mode", "") == "rows":
+            raise ValueError("step_acceleration='cmfd' needs the wavefront "
+                             "sweep (face-current accumulation)")
         steady = eng.solve(**(steady_kwargs or dict(tol_k=1e-8, tol_source=1e-7)))
         if not steady.converged:
             raise RuntimeError(f"initial steady state did not converge: {steady}")
@@ -977,7 +1070,9 @@ class TransientSNSolver:
         # very first time source theta*psi_old.
         phi = [fld(steady.flux[g]) for g in range(G)]
         S = fission_source(phi) / k0
-        zero_inc = eng._zero_inc()
+        # Incoming edge fluxes: zero for vacuum, the steady reflective fixed
+        # point's converged faces otherwise (carried and refreshed every step).
+        inc = [eng._zero_inc() for _ in range(G)]
         psi = []
         for g in range(G):
             qext = chi[g] * S
@@ -985,8 +1080,18 @@ class TransientSNSolver:
                 s = scatter[gf][g]
                 if gf != g and s is not None:
                     qext = qext + s * phi[gf]
-            _, _, psi_g = eng._sweep_ang(ss[g] * phi[g] + qext, st[g], zero_inc,
-                                         want_psi=True)
+            src = ss[g] * phi[g] + qext
+            if self.bc != "vacuum":
+                # Reflective: recover the steady boundary fluxes from the
+                # converged steady source before seeding psi with them.
+                for _ in range(200):
+                    _, out = eng._sweep(src, st[g], inc[g])
+                    new = eng._reflect(out)
+                    d = max(np.max(np.abs(new[f] - inc[g][f])) for f in new)
+                    inc[g] = new
+                    if d < 1e-10 * max(1.0, float(xp.max(phi[g]))):
+                        break
+            _, _, psi_g = eng._sweep_transient(src, st[g], inc[g], None)
             psi.append(fld(psi_g))
 
         scale = 1.0 / total_power(S)                     # P(0) = 1
@@ -1023,6 +1128,7 @@ class TransientSNSolver:
 
         times = [0.0]
         power = [1.0]
+        step_its = []
         inner_total = 0
         sweeps0 = eng._sweep_count
 
@@ -1039,9 +1145,21 @@ class TransientSNSolver:
                 sweeps0 = eng._sweep_count
                 last = (mats, mmap)
 
-            # psi_old is fixed within the step; the time source is theta*psi_old.
+            # psi_old is fixed within the step; the time source is theta*psi_old
+            # (its angular integral, theta*phi_old, is the CMFD-level source).
             psi_old = list(psi)
+            phi_old = [p.copy() for p in phi]
             dsrc_g = delayed_source_by_group(C)
+            if accel == "cmfd":
+                ctx = dict(G=G, k0=k0, theta=theta, st_shift=st_shift, ss=ss,
+                           scatter=scatter, w_fis=w_fis, dsrc=dsrc_g,
+                           psi_old=psi_old, inc=inc,
+                           nsf_h=[asnumpy(nsf[g]).ravel() for g in range(G)],
+                           w_fis_h=[asnumpy(w_fis[g]).ravel() for g in range(G)],
+                           dsrc_h=[asnumpy(dsrc_g[g]).ravel() for g in range(G)],
+                           phi_old_h=[asnumpy(p).ravel() for p in phi_old],
+                           scatter_h=[[None if s is None else asnumpy(s).ravel()
+                                       for s in row] for row in scatter])
 
             change = 1.0
             change_prev = np.inf
@@ -1058,8 +1176,9 @@ class TransientSNSolver:
                             src = phi_new[gf] if gf < g else phi[gf]  # Gauss-Seidel
                             qext = qext + s * src
                     q_ang = theta[g] * psi_old[g]
-                    p, _, ps = eng._solve_group_transient(
-                        qext, ss[g], st_shift[g], zero_inc, q_ang, dsa[g], rtol, g)
+                    p, ps, inc[g] = eng._solve_group_transient(
+                        qext, ss[g], st_shift[g], inc[g], q_ang, dsa[g], rtol, g,
+                        phi0=phi[g])
                     phi_new[g] = fld(p)
                     psi_new[g] = fld(ps)
                 G_S = fission_source(phi_new) / k0
@@ -1069,6 +1188,16 @@ class TransientSNSolver:
                 if change < tol_step:
                     S = G_S
                     break
+                if accel == "cmfd":
+                    # The coarse solve collapses the slow fission modes; on
+                    # fallback (non-finite/negative flux or a stalled coarse
+                    # fixed point) the plain Anderson iterate is used instead.
+                    S_c = self._cmfd_step(eng, G_S, phi, ctx)
+                    if S_c is not None:
+                        S = S_c
+                        hist = []      # stale pairs: the map just changed
+                        change_prev = change
+                        continue
                 if change > _ANDERSON_RESTART_GROWTH * change_prev:
                     hist = []
                 change_prev = change
@@ -1087,6 +1216,7 @@ class TransientSNSolver:
 
             times.append(t)
             power.append(total_power(S))
+            step_its.append(sweep)
             if verbose and (n % max(1, n_steps // 20) == 0 or n == n_steps):
                 print(f"  t = {t:8.4f} s   P/P0 = {power[-1]:.5f}   ({sweep} sweeps)")
 
@@ -1097,4 +1227,5 @@ class TransientSNSolver:
             flux=xp.stack(phi), precursors=xp.stack(C),
             total_inner_iterations=inner_total,
             solve_seconds=time.perf_counter() - t0, device=self.device,
+            step_iterations=step_its,
         )
