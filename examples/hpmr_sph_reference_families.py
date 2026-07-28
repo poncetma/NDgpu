@@ -44,7 +44,11 @@ device = sys.argv[2] if len(sys.argv) > 2 else "cpu"
 TIGHT = dict(tol_k=1e-9, tol_source=1e-8)
 FAMILIES = {"SP3": TriSP3EigenSolver, "SDP1": TriSDP1EigenSolver,
             "SDP2": TriSDP2EigenSolver}
-WITHDRAWN, INSERTED = 0.0, 180.0        # drum-arc rotation: outward vs core-facing
+# Drum-arc rotation. These were swapped until verified against the eigenvalue:
+# 0 deg gives the LOWER k (more absorption), i.e. the arc faces the core and the
+# drum is INSERTED; 180 deg turns it outward (withdrawn). Confirmed for both the
+# raster and polar absorbers.
+INSERTED, WITHDRAWN = 0.0, 180.0
 
 
 def solve_state(angle):

@@ -93,6 +93,41 @@ _ASSEMBLY_VOLUME_FRACTIONS = {
 }
 
 
+def hpmr_materials_builtin(fuel, three_d=False):
+    """Core material list in MATERIAL_NAMES order, from VENDORED cross sections.
+
+    The structural constants (graphite/central cell, Be reflector, drum body,
+    B4C arc) are the same real 11-group ENDF/B-8 data
+    :func:`hpmr_endfb8_materials` reads, extracted once into
+    ``data/hpmr_core_xs_g11.npz`` -- so a full-core run needs no external
+    library file. ``fuel`` is the assembly material, normally the FLUX-weighted
+    homogenization of a heterogeneous assembly solve
+    (:mod:`ndgpu.benchmarks.hpmr_assembly`) rather than a flat-flux volume mix.
+    """
+    import os
+    path = os.path.join(os.path.dirname(__file__), "data",
+                        "hpmr_core_xs_g11.npz")
+    d = np.load(path, allow_pickle=False)
+
+    def mat(mid, name):
+        n = str(mid)
+        chi = d[f"{n}.chi"]
+        return Material(name=name, diffusion=d[f"{n}.D"], sigma_a=d[f"{n}.sa"],
+                        nu_sigma_f=d[f"{n}.nsf"], sigma_s=d[f"{n}.ss"],
+                        chi=chi if chi.sum() > 0 else None,
+                        kappa_fission=(d[f"{n}.kf"]
+                                       if d[f"{n}.kf"].sum() > 0 else None))
+
+    G = int(d["G"])
+    void = Material(name="void", diffusion=[1.0] * G, sigma_a=[0.0] * G,
+                    nu_sigma_f=[0.0] * G, sigma_s=np.zeros((G, G)))
+    mats = [void, fuel, mat(803, "central"), mat(805, "be_reflector"),
+            mat(810, "drum_be"), mat(811, "drum_absorber")]
+    if three_d:
+        mats.append(mat(805, "axial_reflector"))
+    return mats
+
+
 def hpmr_endfb8_materials(xs_path, grid_index="3 3", three_d=True,
                           sph_fuel=None) -> list:
     """Real multigroup HP-MR materials from a Griffin/YakXs library.
@@ -366,6 +401,11 @@ class HpmrProblem:
     drum_angle_deg: np.ndarray = None
     mix_material: np.ndarray = None   # polar absorber volume-mixing (optional)
     mix_weight: np.ndarray = None
+    # The rasterizer's physical frame (side + lattice origin). Needed to place
+    # anything given in CORE coordinates onto the mesh -- e.g. pin positions for
+    # pin-power reconstruction (ndgpu.pin_power), which must land in the same
+    # frame the raster used or the sampled flux is taken from the wrong cells.
+    raster: object = None
 
 
 def build_hpmr2d(refine: int = 4, drum_angle_deg=0.0,
@@ -424,7 +464,8 @@ def build_hpmr2d(refine: int = 4, drum_angle_deg=0.0,
                        materials=mats, material_map=mmap, active=mmap > 0,
                        mask_bc="vacuum", kinetics=HPMR_KINETICS,
                        drum_angle_deg=np.array(angles),
-                       mix_material=mix_material, mix_weight=mix_weight)
+                       mix_material=mix_material, mix_weight=mix_weight,
+                       raster=raster)
 
 
 def hpmr_transport_mask(problem: HpmrProblem, region: str = "drum") -> np.ndarray:

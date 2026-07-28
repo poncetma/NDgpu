@@ -111,6 +111,7 @@ class TriSNTransportSolver:
                  mix_material=None, mix_weight=None, acceleration: str = "dsa",
                  outer_acceleration: str = "cmfd", max_inner: int = 800,
                  engine: str | None = None, device: str = "cpu",
+                 lu_cache: str = "all",
                  dsa_rtol: float = 1e-4, dsa_maxiter: int = 100,
                  cmfd_solver: str = "lu", sigma_t_shift=None):
         if len(grid.shape) not in (3, 4) or grid.shape[2] != 2:
@@ -225,7 +226,21 @@ class TriSNTransportSolver:
         self._sweep_count = 0
         if not self.is3d:
             self._build_nbr_maps()                           # CMFD/currents: 2D only
-        self._prefactor()
+        self.lu_cache = lu_cache
+        if self.lu_cache not in ("all", "group"):
+            raise ValueError("lu_cache must be 'all' or 'group'")
+        # lu_cache="group" defers factorization: _ensure_group builds one group
+        # on demand and drops the others. See _prefactor for why this matters.
+        if self.lu_cache == "all":
+            self._prefactor()
+        else:
+            # Allocate the cache, then run the dispatcher with an EMPTY group
+            # list: that still builds the geometry it owns (SCB corner data,
+            # level schedules) while factorizing nothing. Skipping the call
+            # entirely leaves _scb unbuilt and the first sweep fails.
+            self._solvers = [[None] * self.M for _ in range(self.G)]
+            self._lu_resident = None
+            self._prefactor([])
 
     def _build_nbr_maps(self):
         """Per _EDGES entry: the neighbour lookup (clipped indices + activity
@@ -246,7 +261,47 @@ class TriSNTransportSolver:
             self._nbr_maps.append(
                 (t, tn, nic, njc, nbr_act, self.active[:, :, t], nrm))
 
-    def _prefactor(self):
+    def _lu(self, g, m):
+        """The (group, ordinate) factorization, making group g resident first.
+
+        Every consumer reads through here rather than indexing ``_solvers``
+        directly, so lu_cache="group" cannot be defeated by a sweep path that
+        forgot to ask -- there are six of them, and a missed one fails only on
+        the schemes that use it.
+        """
+        self._ensure_group(g)
+        return self._solvers[g][m]
+
+    def _ensure_group(self, g):
+        """Make group g's ordinate factorizations resident (lu_cache="group").
+
+        The default cache holds one sparse LU per (group, ordinate) for the
+        whole solve -- 11 groups x 16 ordinates = 176 factorizations of a
+        3K x 3K matrix, which is what dominates memory on a refined mesh
+        (measured 9.3 GB at 33 800 cells, against ~140 MB for the angular flux
+        itself). The matrices depend only on Sigma_t and the ordinate, not on
+        the iterate, so holding them all is pure speed-for-memory.
+
+        With lu_cache="group" only the current group stays resident, cutting
+        that by ~G at the cost of re-factorizing when the sweep moves to
+        another group -- once per group per outer, not per sweep. Use it when
+        the mesh, not the runtime, is the binding constraint.
+        """
+        if self.lu_cache == "all" or self._solvers[g][0] is not None:
+            return
+        if self._lu_resident is not None and self._lu_resident != g:
+            self._solvers[self._lu_resident] = [None] * self.M
+            # Only the TRANSPORT factorizations are evicted. Dropping DSA's
+            # per-group diffusion LU (_dsa_fac) as well was tried and showed no
+            # benefit -- 1.85 and 1.71 GB with it against 1.61 GB without, on a
+            # measurement whose run-to-run spread is ~0.1 GB -- while adding a
+            # rebuild per group switch. Plausible cause: a rebuild holds the
+            # assembled matrix and its factorization at once, and freed blocks
+            # are not returned to the OS, so the high-water mark does not fall.
+        self._prefactor([g])
+        self._lu_resident = g
+
+    def _prefactor(self, groups=None):
         if self.is3d:
             if self.engine == "levels":
                 if self.scheme == "scb":
@@ -254,9 +309,9 @@ class TriSNTransportSolver:
                 self._setup_levels_3d()
             elif self.scheme == "scb":
                 self._build_corners_3d()
-                self._prefactor_scb_3d()
+                self._prefactor_scb_3d(groups)
             else:
-                self._prefactor_step_3d()
+                self._prefactor_step_3d(groups)
             return
         if self.engine == "levels":
             if self.scheme == "scb":
@@ -265,11 +320,11 @@ class TriSNTransportSolver:
             return
         if self.scheme == "scb":
             self._build_corners()
-            self._prefactor_scb()
+            self._prefactor_scb(groups)
         else:
-            self._prefactor_step()
+            self._prefactor_step(groups)
 
-    def _prefactor_step(self):
+    def _prefactor_step(self, groups=None):
         """Assemble and LU-factorize L_Omega = Omega.grad + Sigma_t (upwind) for
         every ordinate and group, once."""
         h, area = self.h, self.area
@@ -277,8 +332,9 @@ class TriSNTransportSolver:
         cell = self._cell
         act = self.active
         # base diagonal per group = Sigma_t * area (collision); streaming adds to it.
-        self._solvers = [[None] * self.M for _ in range(self.G)]
-        for g in range(self.G):
+        if getattr(self, "_solvers", None) is None or groups is None:
+            self._solvers = [[None] * self.M for _ in range(self.G)]
+        for g in (range(self.G) if groups is None else groups):
             st_area = (self.st[g] * area).reshape(-1)
             for m in range(self.M):
                 mu, eta = self.mu[m], self.eta[m]
@@ -336,7 +392,7 @@ class TriSNTransportSolver:
             rows.append(s); cols.append(nbr[valid])
             vals.append(np.full(s.size, On))
 
-    def _prefactor_step_3d(self):
+    def _prefactor_step_3d(self, groups=None):
         """Assemble + LU-factorize L_Omega = Omega.grad + Sigma_t (step upwind)
         per ordinate and group on the extruded triangular-prism mesh. Each prism
         has 3 lateral faces (tri edges extruded: area h*dz, in-plane normal, the
@@ -348,8 +404,9 @@ class TriSNTransportSolver:
         ii, jj = np.meshgrid(np.arange(nr), np.arange(nc), indexing="ij")
         rad_per = self.bc_radial == "periodic"               # in-plane wrap
         ax_per = self.bc_axial == "periodic"                 # axial wrap
-        self._solvers = [[None] * self.M for _ in range(self.G)]
-        for g in range(self.G):
+        if getattr(self, "_solvers", None) is None or groups is None:
+            self._solvers = [[None] * self.M for _ in range(self.G)]
+        for g in (range(self.G) if groups is None else groups):
             st_vol = (self.st[g] * vol).reshape(-1)
             for m in range(self.M):
                 mu, eta, xi = self.mu[m], self.eta[m], self.xi[m]
@@ -572,9 +629,10 @@ class TriSNTransportSolver:
         psi_m = L_Omega^-1 (src * cell-volume) for active cells."""
         self._sweep_count += 1
         rhs = np.where(self._act_flat, src_flat * self.vol, 0.0)
+        self._ensure_group(g)
         phi = np.zeros(self.N)
         for m in range(self.M):
-            phi += self.w[m] * self._solvers[g][m](rhs)
+            phi += self.w[m] * self._lu(g, m)(rhs)
         return phi
 
     # ---- level-scheduled sweep (engine="levels", the GPU path) -------------
@@ -990,6 +1048,135 @@ class TriSNTransportSolver:
         phi[ac] = asnumpy(bufs["phk"]).ravel()
         return phi, bufs["psi"]
 
+    def partial_currents_from_psi(self, g, psi):
+        """Per-edge PARTIAL currents (J_out, J_in), step scheme, host-side.
+
+        Implemented for both the step and SCB spatial schemes.
+
+        ``_currents_from_psi`` folds both hemispheres into the NET current
+        sum_m w_m (Omega.n) psi. Discontinuity factors are instead generated to
+        reproduce reference *partial outgoing* currents at macro-region
+        interfaces (Laboure et al., PHYSOR 2018), and boundary coefficients do
+        the same at vacuum boundaries -- so the two half-range integrals are
+        needed separately:
+
+            J_out = sum_{Omega.n > 0} w_m (Omega.n) psi_m
+            J_in  = sum_{Omega.n < 0} w_m |Omega.n| psi_m
+
+        Net = J_out - J_in recovers _currents_from_psi, which is the check.
+        A region's net leakage is a sum over its faces and so does NOT
+        determine the per-face partial currents -- which is why a net-leakage
+        equivalence condition leaves the DFs underdetermined.
+        """
+        psi = asnumpy(psi)
+        M = self.M
+        if self.scheme == "scb":
+            # SCB carries psi on corner sub-volumes; the net fold accumulates
+            # w * oe * (h/2) * face over ALL ordinates. Splitting on the sign of
+            # oe = Omega.n gives the two half-range integrals, then the same
+            # half-edge fold as the net version.
+            d = self._scb
+            K = d["K"]
+            # Two SCB angular-flux layouts are in circulation: the levels
+            # engine's buffer (flat, which _currents_from_psi indexes as
+            # psi[m*3*K:]) and t_seed_psi's (M, K, 3). ext_nbr indexes a flat
+            # per-ordinate block of length 3*K, so normalize to flat here and
+            # take both. _currents_from_psi is only ever called on the levels
+            # buffer, so it is correct as written and is left alone.
+            psi = np.asarray(psi)
+            pflat = psi.reshape(M, 3 * K) if psi.size == M * 3 * K else None
+            if pflat is None:
+                raise ValueError(f"unexpected SCB psi size {psi.size}, "
+                                 f"expected {M * 3 * K}")
+            psi3 = pflat.reshape(M, K, 3)
+            nbr = d["ext_nbr"]
+            # Omega.n on the external corner faces. The level-scheduled engine
+            # caches this as _lv_oe; the default LU engine does not build it, so
+            # compute it on demand from the same data (it depends only on the
+            # face normals and the ordinate set, not on the sweep engine).
+            oe_all = getattr(self, "_lv_oe", None)
+            if oe_all is None:
+                extn = d["ext_n"]
+                oe_all = (self.mu[:, None, None, None] * extn[None, ..., 0]
+                          + self.eta[:, None, None, None] * extn[None, ..., 1])
+            Jh_out = np.zeros((K, 3, 2))
+            Jh_in = np.zeros((K, 3, 2))
+            for m in range(M):
+                oe = oe_all[m]
+                pm = psi3[m]
+                nbr_psi = np.where(nbr >= 0, pflat[m][np.maximum(nbr, 0)], 0.0)
+                out_m = np.where(oe > 0, pm[:, :, None], 0.0)
+                in_m = np.where(oe < 0, nbr_psi, 0.0)
+                Jh_out += self.w[m] * np.maximum(oe, 0.0) * (self.h / 2.0) * out_m
+                Jh_in += self.w[m] * np.maximum(-oe, 0.0) * (self.h / 2.0) * in_m
+            return (self._fold_half_currents(Jh_out),
+                    self._fold_half_currents(Jh_in))
+        psi3 = psi.reshape(M, self.nr, self.nc, 2)
+        Jout = np.zeros((6, self.nr, self.nc))
+        Jin = np.zeros((6, self.nr, self.nc))
+        for k, (t, tn, nic, njc, nbr_act, src_act, (nxv, nyv)) in \
+                enumerate(self._nbr_maps):
+            for m in range(M):
+                On = self.mu[m] * nxv + self.eta[m] * nyv
+                if On > 0:
+                    face = psi3[m, :, :, t]
+                    Jout[k] += (self.w[m] * On) * np.where(src_act, face, 0.0)
+                elif On < 0:
+                    face = np.where(nbr_act, psi3[m, nic, njc, tn], 0.0)
+                    Jin[k] += (self.w[m] * -On) * np.where(src_act, face, 0.0)
+        return Jout, Jin
+
+    def aggregate_partial_currents(self, region_map, Jout, Jin, edge_length=None):
+        """Aggregate per-edge partial currents onto equivalence-region surfaces.
+
+        Discontinuity factors live on the interface between two macro-regions
+        and boundary coefficients on vacuum boundaries, so the per-edge
+        (J_out, J_in) of :meth:`partial_currents_from_psi` must be summed onto
+        those surfaces. Returns
+
+            interfaces : {(region_from, region_to): [J_out, J_in]}
+            boundaries : {region: [J_out, J_in]}
+
+        keyed by the ORDERED region pair, because the outgoing current from A
+        into B is a different quantity from B into A -- each side of an
+        interface carries its own factor. Edges interior to one region are
+        skipped: they carry no discontinuity.
+
+        ``edge_length`` scales a current density to a current; pass None to use
+        the triangle edge length h (the step scheme accumulates a density, the
+        SCB fold already carries h/2 per half-edge -- see the check in
+        tests/scratch, which compares the summed surface currents against each
+        region's net leakage from the balance).
+        """
+        reg = np.asarray(region_map).reshape(self.nr, self.nc, 2)
+        Jout = np.asarray(Jout)
+        Jin = np.asarray(Jin)
+        L = self.h if edge_length is None else float(edge_length)
+        act = self.active
+        interfaces, boundaries = {}, {}
+        for k, (t, di, dj, tn, _n) in enumerate(_EDGES):
+            for i in range(self.nr):
+                ii = i + di
+                for j in range(self.nc):
+                    jj = j + dj
+                    o = float(Jout[k, i, j]) * L
+                    n = float(Jin[k, i, j]) * L
+                    if o == 0.0 and n == 0.0:
+                        continue
+                    rs = int(reg[i, j, t])
+                    inside = (0 <= ii < self.nr) and (0 <= jj < self.nc)
+                    nbr_ok = inside and (act is None or bool(act[ii, jj, tn]))
+                    if not nbr_ok:                      # outer / masked boundary
+                        b = boundaries.setdefault(rs, [0.0, 0.0])
+                        b[0] += o; b[1] += n
+                        continue
+                    rn = int(reg[ii, jj, tn])
+                    if rn == rs:                        # interior to a region
+                        continue
+                    e = interfaces.setdefault((rs, rn), [0.0, 0.0])
+                    e[0] += o; e[1] += n
+        return interfaces, boundaries
+
     def _currents_from_psi(self, g, psi):
         """Fold the level-swept angular fluxes into the per-cell-edge net
         currents J6 (same convention as _sweep_currents), host-side."""
@@ -1038,9 +1225,10 @@ class TriSNTransportSolver:
             return self._sweep_scb(g, src_flat, iface_in)
         rhs = src_flat * self.area
         rhs = np.where(self._act_flat, rhs, 0.0)
+        self._ensure_group(g)
         phi = np.zeros(self.N)
         for m in range(self.M):
-            phi += self.w[m] * self._solvers[g][m](rhs)
+            phi += self.w[m] * self._lu(g, m)(rhs)
         return phi
 
     # ---- transient engine adapter -----------------------------------------
@@ -1082,17 +1270,19 @@ class TriSNTransportSolver:
             base = np.repeat(src_flat[ac] * (meas / 3.0), 3).reshape(K, 3)
             phi = np.zeros(self.N)
             psi = np.empty((self.M, K, 3))
+            self._ensure_group(g)
             for m in range(self.M):
                 rhs = base if q_ang is None else base + q_ang[m] * (meas / 3.0)
-                p = self._solvers[g][m](rhs.ravel()).reshape(K, 3)
+                p = self._lu(g, m)(rhs.ravel()).reshape(K, 3)
                 psi[m] = p
                 phi[ac] += self.w[m] * p.mean(1)   # cell flux = mean of corners
             return phi, psi
+        self._ensure_group(g)
         phi = np.zeros(self.N)
         psi = np.empty((self.M, self.N))
         for m in range(self.M):
             s = src_flat if q_ang is None else src_flat + q_ang[m]
-            p = self._solvers[g][m](np.where(self._act_flat, s * meas, 0.0))
+            p = self._lu(g, m)(np.where(self._act_flat, s * meas, 0.0))
             psi[m] = p
             phi += self.w[m] * p
         return phi, psi
@@ -1230,7 +1420,7 @@ class TriSNTransportSolver:
                      "ext_cell": ext_cell, "int_n": int_n, "int_w": int_w,
                      "edge_of": edge_of, "ci": ci, "cj": cj, "ct": ct}
 
-    def _prefactor_scb(self):
+    def _prefactor_scb(self, groups=None):
         """Assemble and factorize the 3*K corner system per ordinate and group."""
         d = self._scb
         K = d["K"]
@@ -1239,8 +1429,9 @@ class TriSNTransportSolver:
         A3 = self.area / 3.0                                 # corner volume
         row = (np.arange(K)[:, None, None] * 3 + np.arange(3)[None, :, None])
         row = np.broadcast_to(row, (K, 3, 2))
-        self._solvers = [[None] * self.M for _ in range(self.G)]
-        for g in range(self.G):
+        if getattr(self, "_solvers", None) is None or groups is None:
+            self._solvers = [[None] * self.M for _ in range(self.G)]
+        for g in (range(self.G) if groups is None else groups):
             st_c = self.st[g].reshape(-1)[d["ac"]]           # (K,)
             for m in range(self.M):
                 oe = self.mu[m] * d["ext_n"][..., 0] + self.eta[m] * d["ext_n"][..., 1]
@@ -1280,7 +1471,7 @@ class TriSNTransportSolver:
         phi = np.zeros(self.N)
         for m in range(self.M):
             rhs = base if iface_in is None else base + self._iface_rhs(m, iface_in)[0].ravel()
-            psi = self._solvers[g][m](rhs).reshape(K, 3)
+            psi = self._lu(g, m)(rhs).reshape(K, 3)
             phi[ac] += self.w[m] * psi.mean(1)                # cell flux = mean of corners
         return phi
 
@@ -1359,7 +1550,7 @@ class TriSNTransportSolver:
                      "int_n": int_n, "int_w": int_w, "ax_nbr": ax_nbr,
                      "edge_corners": edge_corners}
 
-    def _prefactor_scb_3d(self):
+    def _prefactor_scb_3d(self, groups=None):
         """Factorize the 3K corner system per ordinate/group on prisms: the 2D
         corner operator with lateral face areas scaled by dz, plus two axial cap
         faces (area = corner cap A3 = area/3, cosine +/-xi) upwind-coupled to the
@@ -1376,8 +1567,9 @@ class TriSNTransportSolver:
         rid = (np.arange(K)[:, None] * 3 + np.arange(3)[None, :]).ravel()
         arow = np.broadcast_to(
             np.arange(K)[:, None, None] * 3 + np.arange(3)[None, :, None], (K, 3, 2))
-        self._solvers = [[None] * self.M for _ in range(self.G)]
-        for g in range(self.G):
+        if getattr(self, "_solvers", None) is None or groups is None:
+            self._solvers = [[None] * self.M for _ in range(self.G)]
+        for g in (range(self.G) if groups is None else groups):
             st_c = self.st[g].reshape(-1)[d["ac"]]
             for m in range(self.M):
                 oe = self.mu[m] * d["ext_n"][..., 0] + self.eta[m] * d["ext_n"][..., 1]
@@ -1411,7 +1603,7 @@ class TriSNTransportSolver:
         base = np.repeat(src_flat[ac] * (self.vol / 3.0), 3)
         phi = np.zeros(self.N)
         for m in range(self.M):
-            psi = self._solvers[g][m](base).reshape(K, 3)
+            psi = self._lu(g, m)(base).reshape(K, 3)
             phi[ac] += self.w[m] * psi.mean(1)
         return phi
 
@@ -1442,7 +1634,7 @@ class TriSNTransportSolver:
         J = np.zeros((K, 3, 2))
         for m in range(self.M):
             add, oe = self._iface_rhs(m, iface_in)
-            psi = self._solvers[g][m](base + add.ravel()).reshape(K, 3)
+            psi = self._lu(g, m)(base + add.ravel()).reshape(K, 3)
             phi[ac] += self.w[m] * psi.mean(1)
             face_flux = np.where(oe > 0, psi[:, :, None], psi_in)
             J += self.w[m] * np.where(is_iface, oe * (self.h / 2.0) * face_flux, 0.0)
@@ -1460,7 +1652,7 @@ class TriSNTransportSolver:
         J = np.zeros((K, 3, 2))
         for m in range(self.M):
             add, oe = self._iface_rhs(m, iface_in)
-            psi = self._solvers[g][m](base + add.ravel()).reshape(K, 3)
+            psi = self._lu(g, m)(base + add.ravel()).reshape(K, 3)
             # outflow face uses this corner's flux; inflow uses the incoming.
             face_flux = np.where(oe > 0, psi[:, :, None], iface_in[0])
             J += self.w[m] * np.where(is_iface, oe * (self.h / 2.0) * face_flux, 0.0)
@@ -1621,7 +1813,7 @@ class TriSNTransportSolver:
         phi = np.zeros(self.N)
         J6 = np.zeros((6, nr, nc))
         for m in range(self.M):
-            psi = self._solvers[g][m](rhs)
+            psi = self._lu(g, m)(rhs)
             phi += self.w[m] * psi
             psi3 = psi.reshape(nr, nc, 2)
             for k, (t, tn, nic, njc, nbr_act, src_act, (nxv, nyv)) in \
@@ -1641,7 +1833,7 @@ class TriSNTransportSolver:
         phi = np.zeros(self.N)
         Jh = np.zeros((K, 3, 2))                 # per half-edge (length h/2 folded in)
         for m in range(self.M):
-            psi = self._solvers[g][m](base).reshape(K, 3)
+            psi = self._lu(g, m)(base).reshape(K, 3)
             phi[ac] += self.w[m] * psi.mean(1)
             oe = self.mu[m] * d["ext_n"][..., 0] + self.eta[m] * d["ext_n"][..., 1]
             nbr = d["ext_nbr"]
@@ -1763,7 +1955,7 @@ class TriSNTransportSolver:
         else:
             self._sweep_count += 1
             rhs = np.where(self._act_flat, src_flat * self.vol, 0.0)
-            psi_mn = np.stack([self._solvers[g][m](rhs) for m in range(M)])
+            psi_mn = np.stack([self._lu(g, m)(rhs) for m in range(M)])
             phi = (self.w[:, None] * psi_mn).sum(0)
         currents = []
         for (src, src_act, nbr, nbr_act, (nx, ny, nz_), Lv, beta, hd) \
@@ -1798,7 +1990,7 @@ class TriSNTransportSolver:
         else:
             self._sweep_count += 1
             base = np.repeat(src_flat[ac] * (self.vol / 3.0), 3)
-            psi3 = np.stack([self._solvers[g][m](base).reshape(K, 3)
+            psi3 = np.stack([self._lu(g, m)(base).reshape(K, 3)
                              for m in range(M)])
             phi = np.zeros(N)
             phi[ac] = (self.w[:, None] * psi3.mean(2)).sum(0)

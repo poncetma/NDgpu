@@ -192,11 +192,28 @@ def test_tri_transient_periodic_is_kinf_and_stays_steady(scheme, is3d):
 
 
 @pytest.mark.parametrize("scheme", ["step", "scb"])
-def test_tri_transient_matches_point_kinetics_to_first_order(scheme):
-    """Zero leakage and a flat flux make both schemes spatially exact, so the
-    deviation from exact point kinetics is *purely* backward Euler and must halve
-    with dt (measured 8.81e-4, 4.42e-4, 2.21e-4 for dt = 4e-4 .. 1e-4, i.e.
-    ratios of 2.00). step and scb agree to all printed digits, as they must."""
+@pytest.mark.parametrize("time_scheme,ratio,rtol,max_err", [
+    ("backward-euler", 2.0, 0.15, 5e-4),
+    ("bdf2", 4.0, 0.30, 1e-5),
+])
+def test_tri_transient_matches_point_kinetics_at_scheme_order(
+        scheme, time_scheme, ratio, rtol, max_err):
+    """Zero leakage and a flat flux make both spatial schemes exact, so the
+    deviation from exact point kinetics is *purely* the time discretization and
+    must fall at that scheme's order. Measured errors for dt = 4e-4 .. 1e-4:
+
+        backward Euler  8.81e-4, 4.42e-4, 2.21e-4   (ratios 2.00, first order)
+        BDF2            5.04e-5, 1.31e-5, 3.35e-6   (ratios 3.85/3.91, second)
+
+    so BDF2 is ~66x more accurate here at the finest step. step and scb agree to
+    all printed digits, as they must.
+
+    Crank-Nicolson is deliberately excluded: the prompt mode sits at
+    |lambda dt| ~ 1-3 for these steps, where a non-L-stable scheme stops damping
+    it, and CN degrades to first order with ~5x backward Euler's error. That is
+    correct behaviour for CN, not a defect -- but it is a configuration worth
+    leaving unpinned rather than enshrining as expected.
+    """
     from scipy.integrate import solve_ivp
 
     eps = 0.5 * BETA / (1.0 - 0.5 * BETA)
@@ -204,7 +221,7 @@ def test_tri_transient_matches_point_kinetics_to_first_order(scheme):
     errs = []
     for dt in (4e-4, 2e-4, 1e-4):
         res = tri_solver(grid, tri_nsf_step(eps), scheme).solve(
-            t_end=0.02, dt=dt, tol_step=1e-9)
+            t_end=0.02, dt=dt, tol_step=1e-9, time_scheme=time_scheme)
         a = NU_SIGMA_F / res.k0
         ap = a * (1.0 + eps)
         rhs = lambda t, y: [V * (((1.0 - BETA) * ap - a) * y[0] + LAM * y[1]),
@@ -214,9 +231,9 @@ def test_tri_transient_matches_point_kinetics_to_first_order(scheme):
                         atol=1e-14).y[0]
         n = res.power / (1.0 + eps)
         errs.append(float(np.max(np.abs(n[1:] - ref[1:]) / ref[1:])))
-    assert errs[-1] < 5e-4, errs
-    for coarse, fine in zip(errs, errs[1:]):        # first order in dt
-        assert coarse / fine == pytest.approx(2.0, abs=0.15), errs
+    assert errs[-1] < max_err, errs
+    for coarse, fine in zip(errs, errs[1:]):        # order of the time scheme
+        assert coarse / fine == pytest.approx(ratio, abs=rtol), errs
 
 
 def test_tri_transient_vacuum_leaks_and_stays_steady():
@@ -273,10 +290,18 @@ def test_sn_unperturbed_transient_stays_steady():
     assert np.allclose(res.power, 1.0, atol=1e-5), res.power
 
 
-def test_sn_transient_tracks_point_kinetics():
+@pytest.mark.parametrize("time_scheme,max_err", [
+    ("backward-euler", 5e-4),
+    ("bdf2", 5e-5),
+])
+def test_sn_transient_tracks_point_kinetics(time_scheme, max_err):
     """A +$0.50 nu*Sigma_f step in the low-leakage slab: the S_N power (population
-    part) tracks exact point kinetics to backward-Euler O(dt), and the prompt jump
-    reaches the beta/(beta-rho) = 2.0 plateau."""
+    part) tracks exact point kinetics at the time scheme's order, and the prompt
+    jump reaches the beta/(beta-rho) = 2.0 plateau.
+
+    Crank-Nicolson is excluded for the reason given in the tri order test: the
+    prompt mode is stiff at this dt and CN, not being L-stable, stops damping it.
+    """
     from scipy.integrate import solve_ivp
 
     k0 = TransientSNSolver(SLAB, lambda t: ([BASE], None), KIN, bc="vacuum",
@@ -288,7 +313,8 @@ def test_sn_transient_tracks_point_kinetics():
 
     t_end, dt = 0.08, 1e-4
     res = TransientSNSolver(SLAB, nsf_step(eps), KIN, bc="vacuum",
-                            **QUAD).solve(t_end=t_end, dt=dt, tol_step=1e-8)
+                            **QUAD).solve(t_end=t_end, dt=dt, tol_step=1e-8,
+                                          time_scheme=time_scheme)
 
     # Exact point kinetics for the production step: prompt production
     # (1-beta) a (1+eps), loss a (unchanged operator), delayed lam C, with the
@@ -303,7 +329,7 @@ def test_sn_transient_tracks_point_kinetics():
     # unperturbed steady state (power 1), excluded from the population comparison.
     n = res.power / (1.0 + eps)
     err = np.max(np.abs(n[1:] - ref.y[0][1:]) / ref.y[0][1:])
-    assert err < 5e-4, f"max relative deviation from point kinetics: {err:.2e}"
+    assert err < max_err, f"max relative deviation from point kinetics: {err:.2e}"
     # The prompt jump is real and resolved: the population rises well past the
     # delayed-only rate toward the beta/(beta-rho) = 2.0 plateau (the approach
     # time constant ~ Lambda/(beta-rho) puts the full plateau past this window),

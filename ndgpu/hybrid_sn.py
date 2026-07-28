@@ -105,6 +105,9 @@ class HybridSNDiffusionSolver:
         if not np.any(self.nsf):
             raise ValueError("no fissile material: k-eigenvalue is undefined")
 
+        # Within-group scatter, for the transient driver's load_fields (the
+        # steady path reads it off each box's own S_N solver instead).
+        self.ss_self = np.maximum(self.st - self.removal, 0.0)
         self.sn_mask = (np.zeros((self.nx, self.ny), bool) if sn_mask is None
                         else np.asarray(sn_mask).reshape(self.nx, self.ny))
         self.acceleration = acceleration
@@ -334,8 +337,163 @@ class HybridSNDiffusionSolver:
                 break
         M = self.boxes[0]["sn"].M if self.boxes else 0
         n_sweeps = sum(box["sn"]._sweep_count for box in self.boxes)
+        self._steady_phi = phi          # seeds the transient's first psi
         return HybridSNResult(k_eff=k, flux=phi, converged=converged,
                               outer_iterations=outer,
                               solve_seconds=time.perf_counter() - t0,
                               n_ordinates=M, schwarz_iterations=schwarz_total,
                               n_sweeps=n_sweeps)
+
+    # ---- transient engine adapter -----------------------------------------
+    # TransientSNSolver drives any engine through these methods only (see the
+    # t_* contract on SNTransportSolver). The hybrid's "angular flux" is a
+    # *packed* vector: the bulk scalar flux first -- the diffusion side's time
+    # term needs theta*phi_old -- then each box's angular flux, which the
+    # transport side needs as the per-ordinate theta*psi_old. Packing both into
+    # one flat array keeps the driver's arithmetic on it (power scaling, and the
+    # time-scheme recursion Psi <- u + c(u - Psi)) valid without the driver ever
+    # learning the layout.
+    #
+    # The time source is folded into the *constant* of the interface solve, not
+    # its operator: it does not depend on phi, so (I - L) is unchanged and the
+    # GMRES interface iteration converges the scattering and interface fixed
+    # points together exactly as in the steady case.
+
+    T_SHIFT_AT_CONSTRUCTION = False
+    T_CMFD_STEP = False        # coarse-mesh step acceleration not wired here
+    # Cap on the per-step interface GMRES tolerance. A time-accurate coupling
+    # can need this tighter than a steady eigenvalue does, since the interface
+    # error enters every step instead of being iterated away.
+    t_interface_rtol = 1e-4
+
+    @property
+    def _sweep_count(self):
+        return sum(b["sn"]._sweep_count for b in self.boxes)
+
+    def _pack(self, phi, box_psi):
+        return np.concatenate([np.asarray(phi, float).ravel()]
+                              + [asnumpy(p).ravel() for p in box_psi])
+
+    def _unpack(self, v):
+        n = self.nx * self.ny
+        phi = np.asarray(v[:n], float).reshape(self.nx, self.ny)
+        out, off = [], n
+        for b in self.boxes:
+            sn = b["sn"]
+            sz = sn.M * sn.nx * sn.ny
+            out.append(np.asarray(v[off:off + sz], float)
+                       .reshape(sn.M, sn.nx, sn.ny))
+            off += sz
+        return phi, out
+
+    def t_state0(self):
+        """No persistent boundary state: each box's incoming flux is rebuilt
+        from the bulk scalar flux every step (unlike a reflective S_N, whose
+        incoming edges are a fixed point carried across steps)."""
+        return [None] * self.G
+
+    def t_setup(self, theta):
+        """Shift both sides by the scheme's a0*theta -- Sigma_t inside the boxes,
+        the diffusion removal in the bulk -- and refactorize the bulk LU."""
+        self._t_theta = [float(t) for t in theta]
+        for b in self.boxes:
+            b["sn"].t_setup(theta)
+        self._t_dfac = [
+            factorized(diffusion_matrix(
+                self.D[g], self.removal[g] + self._t_theta[g], self.hx, self.hy,
+                self.bc_spec, active=self._active))
+            for g in range(self.G)]
+
+    def _apply_step_t(self, g, phi, qext, tsrc_ang, tsrc_bulk, want_psi=False):
+        """Transient counterpart of _apply_step: jointly affine in phi, qext and
+        the time sources, so the same operator/constant split applies."""
+        nx, ny = self.nx, self.ny
+        rhs = ((qext + tsrc_bulk) * self._active).copy()
+        phi_boxes, psi_boxes = [], []
+        for k, box in enumerate(self.boxes):
+            i0, i1, j0, j1 = box["span"]
+            sn = box["sn"]
+            inc = self._box_incoming(box, g, phi)
+            src = sn._t_ss[g] * phi[i0:i1, j0:j1] + qext[i0:i1, j0:j1]
+            p, _, (Jx, Jy), psi = sn._sweep_transient(
+                src, sn._t_st[g], inc, tsrc_ang[k], want_psi=True, currents=True)
+            phi_boxes.append(asnumpy(p))
+            psi_boxes.append(psi)
+            Jx, Jy = asnumpy(Jx), asnumpy(Jy)
+            if i0 > 0:
+                rhs[i0 - 1, j0:j1] += -Jx[0] / self.hx
+            if i1 < nx:
+                rhs[i1, j0:j1] += Jx[-1] / self.hx
+            if j0 > 0:
+                rhs[i0:i1, j0 - 1] += -Jy[:, 0] / self.hy
+            if j1 < ny:
+                rhs[i0:i1, j1] += Jy[:, -1] / self.hy
+        new = self._t_dfac[g](rhs.ravel()).reshape(nx, ny)
+        for box, pb in zip(self.boxes, phi_boxes):
+            i0, i1, j0, j1 = box["span"]
+            new[i0:i1, j0:j1] = pb
+        return (new, psi_boxes) if want_psi else new
+
+    def t_solve_group(self, g, qext, psi_old, tol, phi0, state):
+        """One within-step coupled solve: GMRES on the interface fixed point
+        with the time sources in the constant term. Returns the full-domain
+        scalar flux, the packed carried field, and the (unused) state."""
+        nx, ny = self.nx, self.ny
+        th = self._t_theta[g]
+        qext = asnumpy(qext)
+        phi_old, psi_old_boxes = self._unpack(psi_old)
+        tsrc_bulk = th * phi_old
+        if not self.boxes:                                  # pure diffusion
+            phi = self._t_dfac[g]((qext + tsrc_bulk).ravel()).reshape(nx, ny)
+            return phi, self._pack(phi, []), state
+
+        tsrc_ang = [th * p for p in psi_old_boxes]
+        zero_ang = [np.zeros_like(p) for p in tsrc_ang]
+        zero = np.zeros((nx, ny))
+        c = self._apply_step_t(g, zero, qext, tsrc_ang, tsrc_bulk)
+
+        def op(x):
+            return x - self._apply_step_t(g, x.reshape(nx, ny), zero,
+                                          zero_ang, zero).ravel()
+
+        def prec(x):
+            out = x.copy().reshape(nx, ny)
+            for box in self.boxes:
+                i0, i1, j0, j1 = box["span"]
+                sn = box["sn"]
+                fac = sn._t_dsa[g]
+                if fac is None:
+                    continue
+                r = sn._t_ss[g] * x.reshape(nx, ny)[i0:i1, j0:j1]
+                out[i0:i1, j0:j1] += fac(asnumpy(r).ravel()).reshape(
+                    i1 - i0, j1 - j0)
+            return out.ravel()
+
+        n = nx * ny
+        A = LinearOperator((n, n), matvec=op, dtype=float)
+        M = LinearOperator((n, n), matvec=prec, dtype=float)
+        x0 = asnumpy(phi0).ravel() if phi0 is not None else c.ravel()
+        phi_v, _ = gmres(A, c.ravel(), x0=x0, M=M,
+                         rtol=min(tol, self.t_interface_rtol), atol=0.0,
+                         maxiter=400)
+        phi = phi_v.reshape(nx, ny)
+        # One more step at the converged flux to read off the angular flux the
+        # next time step carries (the GMRES iterate itself is scalar).
+        phi, psi_boxes = self._apply_step_t(g, phi, qext, tsrc_ang, tsrc_bulk,
+                                            want_psi=True)
+        return phi, self._pack(phi, psi_boxes), state
+
+    def t_seed_psi(self, g, src, state):
+        """Packed carried field for the steady state: the steady bulk flux plus
+        one unshifted sweep per box against it."""
+        phi_g = np.asarray(asnumpy(self._steady_phi)[g], float)
+        src = asnumpy(src)
+        psis = []
+        for box in self.boxes:
+            i0, i1, j0, j1 = box["span"]
+            sn = box["sn"]
+            inc = self._box_incoming(box, g, phi_g)
+            _, _, psi = sn._sweep_transient(src[i0:i1, j0:j1], sn.st[g], inc,
+                                            None, want_psi=True)
+            psis.append(psi)
+        return self._pack(phi_g, psis), state

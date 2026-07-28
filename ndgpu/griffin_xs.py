@@ -70,6 +70,7 @@ def read_material(path, mid, grid_index="3 3", name=None) -> Material:
     total = vec("Total")
     sigma_a = vec("Absorption")
     nu_sigma_f = vec("nuFission")
+    kappa_fission = vec("kappaFission")
     chi = vec("FissionSpectrum")
 
     # P0 scattering: first G rows of the profile/value blocks. Profile row g
@@ -90,7 +91,9 @@ def read_material(path, mid, grid_index="3 3", name=None) -> Material:
         chi = None
     return Material(name=name or f"griffin-{mid}", diffusion=1.0 / (3.0 * total),
                     sigma_a=sigma_a, nu_sigma_f=nu_sigma_f, sigma_s=sigma_s,
-                    chi=chi, total=total)
+                    chi=chi, total=total,
+                    kappa_fission=(kappa_fission
+                                   if np.any(kappa_fission > 0) else None))
 
 
 def read_library(path, ids, grid_index="3 3") -> dict:

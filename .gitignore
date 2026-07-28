@@ -17,3 +17,6 @@ venv/
 docs/*.pdf
 *Zone.Identifier
 results/
+
+# Claude Code scratch worktrees
+.claude/worktrees/

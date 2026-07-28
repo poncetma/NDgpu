@@ -91,7 +91,8 @@ from scipy.sparse.linalg import LinearOperator, factorized, gmres
 from .backend import asnumpy, get_backend
 from .grid import Grid
 from .materials import Material
-from .stencil import harmonic_mean
+from .ldfe import mirror_maps
+from .stencil import harmonic_mean, normalize_bc
 
 BC_VACUUM = "vacuum"
 BC_REFLECTIVE = "reflective"
@@ -370,8 +371,22 @@ class SNTransportSolver:
     material_map  : int array of shape (nx, ny) or (nx, ny, 1); omit for a
                     homogeneous medium.
     n_polar, n_azi: product-quadrature sizes (n_azi a multiple of 4). Total
-                    ordinates M = n_polar * n_azi.
-    bc            : "vacuum" or "reflective" (all four in-plane faces).
+                    ordinates M = n_polar * n_azi. Ignored when ``quadrature``
+                    is given.
+    quadrature    : optional explicit ordinate set (mu, eta, w) replacing the
+                    product set -- e.g. ``ndgpu.ldfe.ldfe_quadrature_2d(level)``
+                    for a locally refinable LDFE set. Weights must sum to 1 and
+                    the set must be closed under mu -> -mu and eta -> -eta (the
+                    reflective-boundary mirrors are matched from it, and a
+                    non-symmetric set is rejected rather than silently
+                    mistreated).
+    bc            : "vacuum" or "reflective", applied to all four in-plane
+                    faces, or a per-face spec in the shared ``normalize_bc``
+                    form -- ((x_lo, x_hi), (y_lo, y_hi)) -- so a symmetry
+                    quarter-core is ``(("reflective", "vacuum"),
+                    ("reflective", "vacuum"))``. Only the in-plane faces are
+                    read (the solve is 2D); each must be "vacuum" or
+                    "reflective" (albedo/zero-flux are diffusion-only specs).
     acceleration  : within-group scattering acceleration -- "dsa" (default,
                     DSA-accelerated source iteration), "dsa-gmres" (DSA-
                     preconditioned GMRES), "gmres" (plain GMRES), "si" (plain
@@ -392,14 +407,24 @@ class SNTransportSolver:
 
     def __init__(self, grid: Grid, materials, material_map=None,
                  n_polar: int = 3, n_azi: int = 12, bc: str = BC_VACUUM,
+                 quadrature=None,
                  require_fissile: bool = True, acceleration: str = "dsa",
                  outer_acceleration: str | None = None,
                  sweep: str = "wavefront", device: str = "cpu",
                  max_inner: int = 800):
         if grid.shape[2] != 1:
             raise ValueError("SNTransportSolver is 2D: grid must have nz == 1")
-        if bc not in (BC_VACUUM, BC_REFLECTIVE):
-            raise ValueError(f"bc must be {BC_VACUUM!r} or {BC_REFLECTIVE!r}")
+        # normalize_bc speaks the 6-face (3-axis) language of the 3D stencils;
+        # this solve is 2D, so an in-plane-only ((x_lo, x_hi), (y_lo, y_hi))
+        # spec gets a dummy z axis appended before normalizing.
+        if not isinstance(bc, (str, int, float)) and len(list(bc)) == 2:
+            bc = tuple(bc) + (BC_REFLECTIVE,)
+        bc_faces = normalize_bc(bc)[:2]                  # in-plane faces only
+        for spec in bc_faces[0] + bc_faces[1]:
+            if spec not in (BC_VACUUM, BC_REFLECTIVE):
+                raise ValueError(
+                    f"S_N face bc must be {BC_VACUUM!r} or {BC_REFLECTIVE!r}, "
+                    f"got {spec!r}")
         if acceleration not in self.ACCELERATIONS:
             raise ValueError(f"acceleration must be one of {self.ACCELERATIONS}")
         if sweep not in ("wavefront", "rows"):
@@ -415,7 +440,12 @@ class SNTransportSolver:
         self.grid = grid
         self.nx, self.ny = grid.shape[0], grid.shape[1]
         self.hx, self.hy = grid.spacing[0], grid.spacing[1]
-        self.bc = bc
+        self.bc = bc_faces
+        # Per-face reflection flags in _FACES order, and the cheap "any face
+        # reflects" test that decides whether a boundary fixed point is needed.
+        self._refl = {f: spec == BC_REFLECTIVE for f, spec in
+                      zip(_FACES, bc_faces[0] + bc_faces[1])}
+        self._reflective = any(self._refl.values())
         self.acceleration = acceleration
         self.outer_acceleration = outer_acceleration
         self.sweep_mode = sweep
@@ -456,9 +486,22 @@ class SNTransportSolver:
         if require_fissile and not np.any(self.nsf):
             raise ValueError("no fissile material: k-eigenvalue is undefined")
 
-        self.mu, self.eta, self.w = quadrature_2d(n_polar, n_azi)
+        if quadrature is None:
+            self.mu, self.eta, self.w = quadrature_2d(n_polar, n_azi)
+            self.xmir, self.ymir = _azimuth_mirrors(n_polar, n_azi)
+        else:
+            mu, eta, w = (np.asarray(a, float).ravel() for a in quadrature)
+            if not (mu.size == eta.size == w.size) or mu.size == 0:
+                raise ValueError("quadrature must be three equal-length arrays "
+                                 "(mu, eta, w)")
+            if not np.isclose(w.sum(), 1.0, atol=1e-10):
+                raise ValueError(f"quadrature weights must sum to 1, "
+                                 f"got {w.sum()!r}")
+            self.mu, self.eta, self.w = mu, eta, w
+            # Analytic mirrors only exist for the product layout; a general set
+            # has its mirrors matched (and its symmetry checked) instead.
+            self.xmir, self.ymir = mirror_maps(mu, eta)
         self.M = self.mu.size
-        self.xmir, self.ymir = _azimuth_mirrors(n_polar, n_azi)
         # Precompute per-direction sweep constants.
         self._a = 2.0 * np.abs(self.mu) / self.hx
         self._b = 2.0 * np.abs(self.eta) / self.hy
@@ -640,12 +683,19 @@ class SNTransportSolver:
         return phi, out
 
     def _reflect(self, out):
-        """Incoming edge fluxes from a sweep's outgoing fluxes under reflection
-        (vacuum -> all zero)."""
-        if self.bc == BC_VACUUM:
+        """Incoming edge fluxes from a sweep's outgoing fluxes, face by face.
+
+        A reflecting face returns its own outgoing flux in the mirrored ordinate
+        (mu -> -mu on the x faces, eta -> -eta on the y faces); a vacuum face
+        admits nothing. All-vacuum short-circuits to zeros."""
+        if not self._reflective:
             return self._zero_inc()
-        return {"x0": out["x0"][self.xmir], "x1": out["x1"][self.xmir],
-                "y0": out["y0"][self.ymir], "y1": out["y1"][self.ymir]}
+        inc = self._zero_inc()
+        for f, mir in (("x0", self.xmir), ("x1", self.xmir),
+                       ("y0", self.ymir), ("y1", self.ymir)):
+            if self._refl[f]:
+                inc[f] = out[f][mir]
+        return inc
 
     def _zero_inc(self):
         return {"x0": np.zeros((self.M, self.ny)), "x1": np.zeros((self.M, self.ny)),
@@ -863,7 +913,7 @@ class SNTransportSolver:
         over the flattened face fluxes. Vacuum has no incoming flux -- one solve.
         """
         phi = self._scatter_solve(qext, ss_g, st_g, phi0, inc, tol, g)
-        if self.bc == BC_VACUUM:
+        if not self._reflective:
             return phi, inc
 
         def gstep(inc_v, state):                               # one fixed-point step
@@ -1040,7 +1090,7 @@ class SNTransportSolver:
         warm-starts the next sweep/step from."""
         phi, out, psi = self._scatter_solve_transient(
             qext, ss_g, st_shift, inc, q_ang, dsa_fac, tol, phi0)
-        if self.bc == BC_VACUUM:
+        if not self._reflective:
             return phi, psi, inc
 
         def gstep(inc_v, state):
@@ -1085,7 +1135,7 @@ class SNTransportSolver:
         converged first, so the updated state comes back too."""
         xp = self.xp
         st_g = xp.asarray(self.st[g])
-        if self.bc != BC_VACUUM:
+        if self._reflective:
             scale = max(1.0, float(xp.max(xp.abs(xp.asarray(src)))))
             for _ in range(200):
                 _, out = self._sweep(src, st_g, state)

@@ -33,6 +33,11 @@ class Material:
     sigma_s: np.ndarray | None = None
     chi: np.ndarray | None = None
     total: np.ndarray | None = None
+    # kappa*Sigma_f: energy release per unit flux, shape (G,). POWER is
+    # proportional to this, NOT to nu_sigma_f -- nu varies by group, so
+    # nu-weighting tilts a power distribution by the local spectrum. Optional:
+    # solvers only need nu_sigma_f; power edits use this when present.
+    kappa_fission: np.ndarray | None = None
     name: str = ""
 
     def __post_init__(self):

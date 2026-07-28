@@ -34,6 +34,7 @@ when the returned objects change identity.
 
 from __future__ import annotations
 
+import copy
 import time
 from dataclasses import dataclass, field
 
@@ -46,6 +47,7 @@ from .materials import Kinetics
 from .sn import SNTransportSolver
 from .sp3 import SP3GroupOperator
 from .spn import SDPNGroupOperator, _SPN_C
+from .timescheme import make_time_scheme
 from .stencil import BC_VACUUM, BC_ZERO_FLUX, GroupOperator
 from .solver import (DiffusionEigenSolver, Fields, Result, SDP1EigenSolver,
                      SDPNEigenSolver)
@@ -1013,12 +1015,47 @@ class TransientSNSolver:
     def solve(self, t_end: float, dt: float, tol_step: float = 1e-6,
               max_sweeps: int = 200, anderson_depth: int = 5,
               steady_kwargs: dict | None = None,
+              time_scheme: str = "backward-euler", time_weight: float | None = None,
               verbose: bool = False) -> TransientResult:
         """March from the steady S_N state at t=0 to t_end with fixed step dt
-        (see :meth:`TransientSolver.solve` for the shared parameters)."""
+        (see :meth:`TransientSolver.solve` for the shared parameters).
+
+        time_weight : the theta-method weight w on the end-of-step operator --
+            w = 1 (default) is backward Euler, w = 1/2 Crank-Nicolson. Written
+            (1/v) du/dt = F(u), the scheme is
+
+                theta (u^{n+1} - u^n) = w F^{n+1} + (1 - w) F^n,
+                theta = 1/(v_g dt)
+
+            which rearranges to a *backward-Euler-shaped* solve -- collision
+            shift theta/w and a per-ordinate source (theta/w) Psi^n -- with the
+            carried angular field
+
+                Psi^{n+1} = u^{n+1} + ((1 - w)/w) (u^{n+1} - Psi^n),  Psi^0 = u^0.
+
+            The recursion is what keeps F^n out of the picture: evaluating it
+            directly would cost an extra streaming apply (a whole sweep) per
+            step. At w = 1 it degenerates to Psi = u^{n+1}, i.e. bit-for-bit the
+            backward-Euler path, and the shift theta/w >= theta means the
+            within-step fixed point is *better* damped for w < 1, not worse.
+
+            Note w < 1 is opt-in on purpose: Crank-Nicolson is A-stable but not
+            L-stable, so a prompt jump can ring rather than decay. Backward
+            Euler stays the default for stiff reactor kinetics.
+        """
         xp, kin = self.xp, self.kinetics
         beta = [float(b) for b in kin.beta]
         lam = kin.decay
+        scheme = make_time_scheme(time_scheme, time_weight)
+        if not scheme.is_bdf and any(b != 0.0 for b in beta):
+            # The precursor substitution is of BDF form (see timescheme.py);
+            # the theta-method carries F^n instead of past states and has no
+            # matching treatment, so refuse rather than silently run a
+            # mismatched-order scheme.
+            raise NotImplementedError(
+                f"{scheme.name} is prompt-only: its precursor treatment has "
+                f"not been derived. Use time_scheme='backward-euler' or 'bdf2' "
+                f"with delayed neutrons (beta != 0).")
         n_steps = int(round(t_end / dt))
         synchronize(xp)
         t0 = time.perf_counter()
@@ -1065,8 +1102,12 @@ class TransientSNSolver:
         def total_power(S):
             return float(xp.sum(S))
 
-        # theta_g = 1/(v_g dt) is the backward-Euler collision shift.
-        theta = [1.0 / (float(kin.velocities[g]) * dt) for g in range(G)]
+        # theta_g = 1/(v_g dt); every scheme solves with the shift a0*theta and
+        # a carried field Psi supplied by the scheme (see ndgpu/timescheme.py).
+        # a0 may change once, when a multistep formula leaves its bootstrap.
+        theta_base = [1.0 / (float(kin.velocities[g]) * dt) for g in range(G)]
+        a0 = scheme.a0(1)
+        theta = [a0 * tb for tb in theta_base]
 
         # Steady scalar flux, and its angular flux from one clean sweep of the
         # converged steady source. This psi seeds the very first time source
@@ -1101,20 +1142,32 @@ class TransientSNSolver:
         S = S * scale
         C = [(beta[i] / lam[i]) * S for i in range(kin.n_families)]  # equilibrium
 
-        # End-of-step fission weight and delayed emission -- the same analytic
-        # backward-Euler precursor substitution as TransientSolver, global data.
-        bcoef = [beta[i] / (1.0 + lam[i] * dt) for i in range(kin.n_families)]
-        bcoef_sum = sum(bcoef)
+        # Analytic BDF precursor substitution (see ndgpu/timescheme.py): with
+        # the scheme's history combination H,
+        #     C^{n+1} = (dt beta S^{n+1} + H) / (a0 + lam dt),
+        # so the end-of-step fission weight carries beta a0/(a0 + lam dt) and
+        # the delayed source lam H/(a0 + lam dt). At a0 = 1 both reduce to the
+        # familiar backward-Euler beta/(1 + lam dt). Consistency (sum a_j = 0)
+        # makes H = a0 C at equilibrium, so an unperturbed state is preserved
+        # exactly for any a0.
+        # The scheme owns the precursor substitution -- BDF form or theta form,
+        # each derived in ndgpu/timescheme.py and each preserving the t=0
+        # equilibrium exactly. The driver only weights the result by the
+        # delayed spectrum.
+        lam_l = [float(l) for l in lam]
 
-        def fission_weights():
+        def bcoef_sum_at(step):
+            return sum(scheme.precursor_bcoef(step, beta, lam_l, dt))
+
+        bcoef_sum = bcoef_sum_at(1)
+
+        def fission_weights(bsum):
             if kin.chi_delayed is not None:
-                return [chi[g] - float(kin.chi_delayed[g]) * bcoef_sum
+                return [chi[g] - float(kin.chi_delayed[g]) * bsum
                         for g in range(G)]
-            return [chi[g] * (1.0 - bcoef_sum) for g in range(G)]
+            return [chi[g] * (1.0 - bsum) for g in range(G)]
 
-        def delayed_source_by_group(C):
-            decayed = [(lam[i] / (1.0 + lam[i] * dt)) * C[i]
-                       for i in range(kin.n_families)]
+        def delayed_source_by_group(decayed):
             dsum = decayed[0]
             for d in decayed[1:]:
                 dsum = dsum + d
@@ -1122,8 +1175,17 @@ class TransientSNSolver:
                 return [float(kin.chi_delayed[g]) * dsum for g in range(G)]
             return [chi[g] * dsum for g in range(G)]
 
-        w_fis = fission_weights()
+        w_fis = fission_weights(bcoef_sum)
         last = (mats, mmap)
+
+        # Carried fields Psi (angular and its scalar integral), seeded from the
+        # steady state; the scheme owns how they advance. One scheme instance
+        # per field so each keeps its own history.
+        sch_psi, sch_phi = scheme, copy.deepcopy(scheme)
+        psi_c = sch_psi.start(psi)
+        phi_c = sch_phi.start([p.copy() for p in phi])
+        C_hist = [C, None]        # [C^n, C^{n-1}]; the theta form also needs
+        S_prev = S                # the previous step's fission source
 
         times = [0.0]
         power = [1.0]
@@ -1142,15 +1204,33 @@ class TransientSNSolver:
                 eng = self._engine(mats, mmap, **shift)
                 ss, nsf, chi, scatter = load_fields(eng)
                 eng.t_setup(theta)
-                w_fis = fission_weights()
+                w_fis = fission_weights(bcoef_sum)
                 sweeps0 = eng._sweep_count
                 last = (mats, mmap)
 
-            # psi_old is fixed within the step; the time source is theta*psi_old
-            # (its angular integral, theta*phi_old, is the CMFD-level source).
-            psi_old = list(psi)
-            phi_old = [p.copy() for p in phi]
-            dsrc_g = delayed_source_by_group(C)
+            # A multistep scheme raises a0 once it leaves its bootstrap step;
+            # the shift, the DSA/CMFD factors and the precursor coefficients
+            # all move with it, so refresh them on that transition only.
+            a0_n = scheme.a0(n)
+            if a0_n != a0:
+                a0 = a0_n
+                theta = [a0 * tb for tb in theta_base]
+                bcoef_sum = bcoef_sum_at(n)
+                if getattr(self.engine_cls, "T_SHIFT_AT_CONSTRUCTION", False):
+                    inner_total += eng._sweep_count - sweeps0
+                    eng = self._engine(mats, mmap, sigma_t_shift=theta)
+                    ss, nsf, chi, scatter = load_fields(eng)
+                    sweeps0 = eng._sweep_count
+                eng.t_setup(theta)
+                w_fis = fission_weights(bcoef_sum)
+
+            # The carried Psi is fixed within the step; the time source is
+            # a0*theta*Psi (its angular integral is the CMFD-level source).
+            # For backward Euler these are just the previous step's psi/phi.
+            psi_old = sch_psi.carried(n)
+            phi_old = sch_phi.carried(n)
+            dsrc_g = delayed_source_by_group(
+                scheme.precursor_decayed(n, C_hist, S_prev, beta, lam_l, dt))
             if accel == "cmfd":
                 ctx = dict(G=G, k0=k0, theta=theta, ss=ss, scatter=scatter,
                            w_fis=w_fis, dsrc=dsrc_g, psi_old=psi_old,
@@ -1210,8 +1290,15 @@ class TransientSNSolver:
                     f"time step at t={t:g} s did not converge "
                     f"({max_sweeps} sweeps, source change {change:.2e})")
 
-            for i in range(kin.n_families):
-                C[i] = (C[i] + (dt * beta[i]) * S) / (1.0 + lam[i] * dt)
+            # Precursors first: they must see the same step index (hence the
+            # same a0) the flux solve just used. Then advance the carried
+            # fields.
+            C_prev = C
+            C = scheme.precursor_update(n, C_hist, S, S_prev, beta, lam_l, dt)
+            C_hist, S_prev = [C, C_prev], S
+
+            sch_psi.push(psi)
+            sch_phi.push(phi)
 
             times.append(t)
             power.append(total_power(S))

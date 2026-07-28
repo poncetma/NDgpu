@@ -26,10 +26,13 @@ from .solver import (DiffusionEigenSolver, Result, SDP1EigenSolver,
                      SP3EigenSolver, SP5EigenSolver, SP7EigenSolver)
 from .hybrid_sn import HybridSNDiffusionSolver, HybridSNResult
 from .hybrid_tri_sn import HybridTriSNDiffusionSolver
+from .ldfe import ldfe_quadrature_2d, ldfe_sphere, mirror_maps
 from .sn import SNResult, SNTransportSolver, quadrature_2d
 from .tri_sn import TriSNTransportSolver
-from .sph import (SphResult, flux_weighted_homogenize, region_average,
-                  sph_correct)
+from .sph import (SphResult, flux_weighted_homogenize, production_weight,
+                  region_average,
+                  sph_correct, sph_correct_monolithic,
+                  sph_get_correct)
 from .tri import (TriDiffusionEigenSolver, TriGrid, TriSDP1EigenSolver,
                   TriSDP2EigenSolver, TriSDP3EigenSolver, TriSP1EigenSolver,
                   TriSP3EigenSolver, TriSP5EigenSolver, TriSP7EigenSolver)
@@ -101,12 +104,18 @@ __all__ = [
     "assemble_mesh_3d",
     "flux_weighted_homogenize",
     "region_average",
+    "production_weight",
     "sph_correct",
+    "sph_correct_monolithic",
+    "sph_get_correct",
     "SphResult",
     "SNTransportSolver",
     "TriSNTransportSolver",
     "SNResult",
     "quadrature_2d",
+    "ldfe_quadrature_2d",
+    "ldfe_sphere",
+    "mirror_maps",
     "HybridSNDiffusionSolver",
     "HybridSNResult",
     "HybridTriSNDiffusionSolver",
