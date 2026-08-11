@@ -24,7 +24,7 @@ integration, see [coupling.md](coupling.md).
 | Neutron kinetics | `transient()` | Multigroup diffusion with delayed-neutron families |
 | SPH hand-off | `TriReactor.with_materials()` | Reuse the same geometry with corrected constants |
 | Thermal feedback | `configure_thermal()` | Material conductivity, heat capacity, sinks, Doppler and density feedback |
-| Coupled calculations | `coupled_steady()`, `coupled_transient()` | In-process, device-resident diffusion/conduction coupling |
+| Coupled calculations | `coupled_steady()`, `coupled_transient()`, `quasistatic_transient()` | In-process, device-resident diffusion/conduction coupling |
 | Moving controls | `state_at(t)` | Cached same-shaped reactor states, including rotating drum frames |
 | CPU/GPU portability | `device="auto"` | NumPy CPU fallback or CuPy/CUDA GPU execution |
 
@@ -363,6 +363,13 @@ coupled = core.coupled_transient(
     state_at=control_state,     # cached-state callback; see below
     profile=True,
 )
+
+# Slow control motion / long thermal follow-through: advance amplitude at dt,
+# but correct the full spatial shape every 2 s and the adjoint every 5 shapes.
+qs = core.quasistatic_transient(
+    t_end=60.0, dt=0.2, dt_thermal=1.0, shape_dt=2.0,
+    adjoint_every=5, device="gpu", state_at=control_state, profile=True,
+)
 ```
 
 The coupled transient keeps flux, cross-section fields, precursors, power, and
@@ -384,6 +391,14 @@ coupled.steady                   # initial coupled equilibrium
 coupled.phase_seconds            # populated by profile=True
 coupled.counters                 # steps, iterations, rebuilds, transfers
 ```
+
+`quasistatic_transient` is the adiabatic quasi-static treatment for slow
+drum/rod ramps. It projects cached control frames and thermal feedback between
+warm-started forward shape solves, maintains total-power continuity when the
+shape changes, and records `shape_update_times`, `shape_update_reasons`, and
+`shape_k_eff`. It is not yet an IQS shape equation: use the full
+`coupled_transient` path for rapid localized changes until the transient shape
+corrector and automatic residual fallback are available.
 
 Useful performance controls are `precond_degree`, `check_every`,
 `thermal_precond_degree`, `thermal_check_every`, and
@@ -474,7 +489,7 @@ validation in `tests/verification/` and `tests/validation/`.
 |---|---|
 | `examples/custom_tri_reactor.py` | New 3-D design, named thermal data, coupled transient |
 | `examples/hpmr_hexlattice.py` | Full hex lattice, 12 control drums, worth sweep |
-| `examples/hpmr_coupled_transient.py` | Device-resident coupled transient and profiling |
+| `examples/hpmr_coupled_transient.py` | Full-diffusion or quasi-static coupled transient and profiling |
 | `examples/hpmr_sph_reference_families.py` | SPH generation and reference-method comparison |
 | `examples/twigl_benchmark.py` | Validated static and transient Cartesian workflow |
 | `examples/unstructured_mesh.py` | Gmsh/finite-volume `MeshModel` workflow |
@@ -500,6 +515,7 @@ TriReactor
   .configure_thermal(thermal_materials, total_power=..., feedback=...)
   .coupled_steady(...)
   .coupled_transient(t_end, dt, dt_thermal=..., state_at=..., profile=...)
+  .quasistatic_transient(t_end, dt, shape_dt=..., adjoint_every=...)
 
 Model(size, cells)
   .fill(...) / .add_box(...) / .set_boundary(...) / .set_kinetics(...)

@@ -6,7 +6,8 @@ import pytest
 from ndgpu import (DiffusionEigenSolver, EffectiveKinetics, Grid, Kinetics,
                    Material, ThermalFeedback, ThermalMaterial, TransientSolver,
                    equilibrium_precursors, fixed_shape_coupled_transient,
-                   integrate_point_kinetics, project_effective_kinetics)
+                   integrate_point_kinetics, project_effective_kinetics,
+                   quasistatic_coupled_transient)
 from ndgpu.coupling import CoupledSolver, CouplingContext, coupled_transient
 
 
@@ -152,3 +153,59 @@ def test_fixed_shape_coupling_matches_full_shape_preserving_insertion():
                                rtol=0, atol=3e-10)
     np.testing.assert_allclose(accelerated.mean_temperature,
                                full.mean_temperature, rtol=0, atol=2e-9)
+
+
+def test_adiabatic_shape_updates_preserve_exact_uniform_solution():
+    ctx = coupled_context()
+    material_map = ctx.material_map
+    delta = 0.35 * BETA * SA
+    perturbed = Material(
+        name="uniform insertion", diffusion=[D], sigma_a=[SA - delta],
+        nu_sigma_f=[NF])
+    base_state = ([BASE], material_map)
+    perturbed_state = ([perturbed], material_map)
+
+    def problem_at(t):
+        return base_state if t <= 0.0 else perturbed_state
+
+    fixed = fixed_shape_coupled_transient(
+        ctx, t_end=0.02, dt=2e-4, dt_thermal=0.002,
+        problem_at=problem_at)
+    adiabatic = quasistatic_coupled_transient(
+        coupled_context(), t_end=0.02, dt=2e-4, dt_thermal=0.002,
+        shape_dt=0.005, adjoint_every=2, problem_at=problem_at)
+    np.testing.assert_allclose(adiabatic.power, fixed.power,
+                               rtol=0, atol=3e-11)
+    assert adiabatic.counters["shape_updates"] == 4
+    assert adiabatic.counters["forward_shape_solves"] == 4
+    assert adiabatic.counters["adjoint_eigen_solves"] == 3
+    np.testing.assert_allclose(
+        adiabatic.shape_update_times, [0.005, 0.010, 0.015, 0.020])
+    assert adiabatic.shape_update_reasons == ["maximum_interval"] * 4
+
+
+def test_adiabatic_quasistatic_tracks_reduced_hpmr_drum_ramp():
+    """The intended use case: cached drum frames plus coupled feedback."""
+    from ndgpu.benchmarks.hpmr import build_hpmr2d
+    from ndgpu.benchmarks.hpmr_thermal import (build_hpmr_coupling,
+                                               hpmr_drum_ramp)
+
+    problem = build_hpmr2d(
+        refine=2, drum_angle_deg=150.0, absorber="polar")
+    problem_at = hpmr_drum_ramp(
+        problem, angle_from=150.0, angle_to=154.0,
+        t_start=0.1, t_ramp=0.2, n_angles=5, refine=2)
+    full = coupled_transient(
+        build_hpmr_coupling(problem), t_end=0.5, dt=0.05,
+        dt_thermal=0.1, problem_at=problem_at)
+    qs = quasistatic_coupled_transient(
+        build_hpmr_coupling(problem), t_end=0.5, dt=0.05,
+        dt_thermal=0.1, shape_dt=0.1, adjoint_every=2,
+        problem_at=problem_at)
+
+    power_error = np.max(np.abs(qs.power - full.power) / full.power)
+    assert power_error < 5e-3, (power_error, full.power, qs.power)
+    assert abs(qs.mean_temperature[-1] - full.mean_temperature[-1]) < 0.02
+    assert qs.counters["shape_updates"] == 5
+    assert qs.counters["forward_shape_solves"] == 5
+    assert qs.counters["adjoint_eigen_solves"] == 3

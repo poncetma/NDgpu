@@ -24,7 +24,7 @@ the existing backward-Euler transient as the shape-update interval is reduced.
 
 ## Implementation status (2026-08-11)
 
-Phase 0 and the fixed-shape portion of Phase 1 are now executable:
+Phase 0, Phase 1, and the periodic adiabatic core of Phase 2 are now executable:
 
 - `TransientSolver.solve(initial_steady=...)` accepts a compatible eigenpair,
   and `coupled_transient` automatically hands off its converged hot coupled
@@ -38,16 +38,22 @@ Phase 0 and the fixed-shape portion of Phase 1 are now executable:
   changed control/feedback operators, keeps the fixed fission-power shape and
   temperature on the selected device, and advances the existing conduction
   solver at `dt_thermal` cadence.
+- `quasistatic_coupled_transient` adds periodic warm-started forward eigen
+  shapes, configurable adjoint refresh, device-resident normalized power-shape
+  replacement, and shape-update timing/counters. `TriReactor` exposes the same
+  workflow as `quasistatic_transient(...)`.
 - CPU regression gates cover exact homogeneous projection, normalization
   invariance, analytic absorption worth, stationary point kinetics, equality
   with the full spatial transient for a shape-preserving insertion, stationary
-  coupled equilibrium, and initial-state reuse.
+  coupled equilibrium, initial-state reuse, shape/adjoint cadence, and a
+  reduced HP-MR coupled drum ramp against the full diffusion transient.
 
-The current result type reports `shape_updates == 0` intentionally. It is an
-explicit fixed-shape prototype, suitable for exact shape-preserving cases and
-small-perturbation experiments—not yet the production path for a large black
-absorber movement. Phase 2 starts with warm-started forward re-anchoring,
-continuity at shape updates, and interval refinement against 2-D HP-MR ramps.
+The fixed-shape entry point still reports `shape_updates == 0` intentionally.
+The adiabatic entry point performs scheduled updates and maintains amplitude
+and total-power continuity. It is suitable for slow control motion, but it is
+not yet the final production path for rapid black-absorber movement: adaptive
+residual triggers, full-step fallback, interval-convergence studies, and the
+IQS transient shape equation remain.
 
 ## Mathematical split
 

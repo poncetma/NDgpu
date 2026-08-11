@@ -24,11 +24,13 @@ from .noise import (NoiseResult, NoiseSolver, NoiseSource,
 from .perturbation import first_order_reactivity
 from .power import fission_energy_xs, power_density
 from .quasistatic import (EffectiveKinetics, FixedShapeQuasiStaticResult,
-                          PointKineticsResult, advance_point_kinetics,
+                          PointKineticsResult, QuasiStaticResult,
+                          advance_point_kinetics,
                           equilibrium_precursors,
                           fixed_shape_coupled_transient,
                           integrate_point_kinetics,
-                          project_effective_kinetics)
+                          project_effective_kinetics,
+                          quasistatic_coupled_transient)
 from .feedback import ThermalFeedback
 from .thermal import ConductionSolver, ThermalMaterial, ThermalResult
 from .solver import (DiffusionEigenSolver, Result, SDP1EigenSolver,
@@ -114,12 +116,14 @@ __all__ = [
     "fission_energy_xs",
     "EffectiveKinetics",
     "FixedShapeQuasiStaticResult",
+    "QuasiStaticResult",
     "PointKineticsResult",
     "project_effective_kinetics",
     "equilibrium_precursors",
     "advance_point_kinetics",
     "integrate_point_kinetics",
     "fixed_shape_coupled_transient",
+    "quasistatic_coupled_transient",
     "ConductionSolver",
     "ThermalMaterial",
     "ThermalResult",

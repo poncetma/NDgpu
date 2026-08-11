@@ -73,14 +73,13 @@ class PointKineticsResult:
 
 
 @dataclass
-class FixedShapeQuasiStaticResult:
-    """Coupled fixed-shape quasi-static transient result.
+class QuasiStaticResult:
+    """Coupled fixed-shape or adiabatic quasi-static transient result.
 
-    This is the first acceleration stage, not yet an improved quasi-static
-    (IQS) solve: the forward and adjoint shapes remain anchored at time zero.
-    ``rho`` records the reactivity projected from each current control and
-    temperature operator, while ``power`` is the independently marched
-    amplitude ``P(t)/P(0)``.
+    This is not yet an improved quasi-static (IQS) solve: shapes are either
+    frozen or replaced by periodic adiabatic eigen shapes. ``rho`` records the
+    reactivity projected from each current control and temperature operator,
+    while ``power`` is the independently marched amplitude ``P(t)/P(0)``.
     """
 
     times: np.ndarray
@@ -97,14 +96,21 @@ class FixedShapeQuasiStaticResult:
     initialization_seconds: float
     device: str
     steps: int
+    shape_update_times: np.ndarray = field(default_factory=lambda: np.empty(0))
+    shape_update_reasons: list = field(default_factory=list)
+    shape_k_eff: np.ndarray = field(default_factory=lambda: np.empty(0))
     phase_seconds: dict = field(default_factory=dict)
     counters: dict = field(default_factory=dict)
 
     def __repr__(self):
-        return (f"FixedShapeQuasiStaticResult(P/P0 {self.power.min():.4f} .. "
+        return (f"QuasiStaticResult(P/P0 {self.power.min():.4f} .. "
                 f"{self.power.max():.4f}, peak T "
                 f"{self.peak_temperature.max():.1f} K, {self.steps} steps in "
                 f"{self.seconds:.1f} s)")
+
+
+# Compatibility name used by the Phase-1 public API.
+FixedShapeQuasiStaticResult = QuasiStaticResult
 
 
 def _flux_array(value, name: str, groups: int, shape: tuple[int, ...], xp,
@@ -346,13 +352,15 @@ def _unpack_problem(spec, mix_material, mix_weight):
                      f"got {len(spec)} elements")
 
 
-def fixed_shape_coupled_transient(
+def _coupled_quasistatic(
         ctx, t_end, dt, *, problem_at=None, dt_thermal=None,
-        initial_coupled=None, steady_kwargs=None, adjoint_kwargs=None,
+        initial_coupled=None, steady_kwargs=None, shape_kwargs=None,
+        adjoint_kwargs=None,
         thermal_rtol=1e-8, thermal_maxiter=20000,
         thermal_check_every=4, thermal_precond_degree=0,
-        thermal_diagnostics_every=0, profile=False):
-    """Run a coupled transient with an adjoint-projected fixed flux shape.
+        thermal_diagnostics_every=0, profile=False, shape_dt=None,
+        adjoint_every=1, shape_on_final=True):
+    """Shared fixed-shape/adiabatic quasi-static coupled implementation.
 
     This is the deliberately conservative first stage of quasi-static
     acceleration. One initial adjoint eigenvalue solve establishes the shape
@@ -368,13 +376,14 @@ def fixed_shape_coupled_transient(
     driver can avoid redundant operator construction. ``initial_coupled`` can
     reuse a previously computed converged :class:`CoupledResult`.
 
-    The limitation is explicit: control motion and feedback change the
-    projected amplitude but not the spatial flux or power shape. Use this for
-    performance/correctness experiments and small shape perturbations; black
-    absorber motion needs the adaptive IQS re-anchoring stage planned next.
+    With ``shape_dt=None`` the time-zero spatial shape remains fixed. Otherwise
+    a forward eigen shape is warm-started and re-anchored every ``shape_dt``;
+    this is adiabatic quasi-static treatment. It is intended for slow control
+    motion, while an IQS shape equation remains necessary for rapid localized
+    changes.
     """
     from .coupling import (CoupledResult, CoupledSolver, _CoupledPhaseProfiler,
-                           _device_fission_energy, _fuel_mask)
+                           _fuel_mask)
     from .thermal import ConductionSolver
 
     if ctx.kinetics is None:
@@ -388,6 +397,21 @@ def fixed_shape_coupled_transient(
     if every < 1 or not np.isclose(every * dt, dt_thermal, rtol=1e-12,
                                    atol=1e-14 * max(1.0, dt_thermal)):
         raise ValueError("dt_thermal must be an integer multiple of dt")
+    if shape_dt is None:
+        shape_every = None
+    else:
+        shape_dt = float(shape_dt)
+        if not np.isfinite(shape_dt) or shape_dt <= 0.0:
+            raise ValueError("shape_dt must be finite and positive")
+        shape_every = int(round(shape_dt / dt))
+        if (shape_every < 1
+                or not np.isclose(shape_every * dt, shape_dt, rtol=1e-12,
+                                  atol=1e-14 * max(1.0, shape_dt))):
+            raise ValueError("shape_dt must be an integer multiple of dt")
+    adjoint_every = int(adjoint_every)
+    if adjoint_every < 1:
+        raise ValueError("adjoint_every must be positive")
+    shape_on_final = bool(shape_on_final)
     thermal_maxiter = int(thermal_maxiter)
     thermal_check_every = int(thermal_check_every)
     thermal_precond_degree = int(thermal_precond_degree)
@@ -398,6 +422,10 @@ def fixed_shape_coupled_transient(
         raise ValueError("thermal precondition/diagnostic controls must be non-negative")
     if not np.isfinite(thermal_rtol) or thermal_rtol <= 0.0:
         raise ValueError("thermal_rtol must be finite and positive")
+    reserved = {"adjoint", "state0"} & (shape_kwargs or {}).keys()
+    if reserved:
+        raise ValueError("shape_kwargs cannot set "
+                         + ", ".join(sorted(reserved)))
 
     xp = ctx.thermal_solver().xp
     profiler = _CoupledPhaseProfiler(xp, enabled=profile)
@@ -437,6 +465,10 @@ def fixed_shape_coupled_transient(
     counters["operator_rebuilds"] += 1
     adjoint_options = dict(ctx.eigen_kwargs)
     adjoint_options.update(adjoint_kwargs or {})
+    reserved = {"adjoint", "state0"} & adjoint_options.keys()
+    if reserved:
+        raise ValueError("adjoint_kwargs cannot set "
+                         + ", ".join(sorted(reserved)))
     with profiler.region("initial_adjoint_solve"):
         adjoint = anchor_solver.solve(adjoint=True, **adjoint_options)
     counters["adjoint_eigen_solves"] += 1
@@ -472,16 +504,31 @@ def fixed_shape_coupled_transient(
     volume = thermal.cell_volume
     fuel = _fuel_mask(ctx)
     fuel_dev = xp.asarray(fuel)
-    flux_stack = (forward_flux if hasattr(forward_flux, "shape")
-                  else xp.stack(forward_flux))
-    kappa_xs = xp.stack(_device_fission_energy(ctx, xp, thermal.dtype))
-    raw_power = xp.sum(kappa_xs * flux_stack, axis=0)
-    if ctx.active is not None:
-        raw_power = xp.where(xp.asarray(ctx.active).astype(bool), raw_power, 0.0)
-    power_integral = float(xp.sum(raw_power * volume))
-    if not np.isfinite(power_integral) or power_integral <= 0.0:
-        raise RuntimeError("no finite positive fission power in the anchor flux")
-    unit_power_shape = raw_power / power_integral
+    active_dev = (None if ctx.active is None
+                  else xp.asarray(ctx.active).astype(bool))
+
+    def normalized_power_shape(spec, flux):
+        from .blend import MaterialBlend
+        from .power import fission_energy_xs
+
+        mats, mmap, mix_m, mix_w = spec
+        table, _ = fission_energy_xs(mats)
+        blend = MaterialBlend(
+            xp, ctx.grid.shape, mmap, len(mats), dtype=thermal.dtype,
+            mix_material=mix_m, mix_weight=mix_w)
+        kappa_xs = xp.stack(
+            [blend.linear(table[:, g]) for g in range(table.shape[1])])
+        flux_stack = flux if hasattr(flux, "shape") else xp.stack(flux)
+        raw = xp.sum(kappa_xs * flux_stack, axis=0)
+        if active_dev is not None:
+            raw = xp.where(active_dev, raw, 0.0)
+        integral = float(xp.sum(raw * volume))
+        if not np.isfinite(integral) or integral <= 0.0:
+            raise RuntimeError("no finite positive fission power in the anchor flux")
+        return raw / integral
+
+    with profiler.region("power_shape"):
+        unit_power_shape = normalized_power_shape(spec0, forward_flux)
 
     steady_temperature = np.asarray(steady.temperature)
     cached_peak = float(steady_temperature[fuel].max())
@@ -491,8 +538,14 @@ def fixed_shape_coupled_transient(
     rhos = [0.0]
     peaks = [cached_peak]
     means = [cached_mean]
-    amplitude_sum = 0.0
+    power_accum = None
     window_steps = 0
+    shape_times = []
+    shape_reasons = []
+    shape_ks = [float(steady.k_eff)]
+    shape_state = getattr(ctx, "_state", None)
+    adjoint_state = anchor_solver.state
+    shape_updates = 0
     # Object identity is the cache contract used by TransientSolver too.
     current_key = tuple(id(item) for item in spec0) + (id(feedback_hook),)
 
@@ -530,7 +583,10 @@ def fixed_shape_coupled_transient(
             counters["amplitude_steps"] += 1
             powers.append(amplitude)
             rhos.append(parameters.rho)
-            amplitude_sum += amplitude
+            with profiler.region("power_edit"):
+                weighted_shape = amplitude * unit_power_shape
+                power_accum = (weighted_shape if power_accum is None
+                               else power_accum + weighted_shape)
             window_steps += 1
 
             final_window = n == steps
@@ -538,10 +594,7 @@ def fixed_shape_coupled_transient(
                 width = window_steps * dt
                 stepper = (thermal if window_steps == every
                            else thermal_solver_for(width))
-                mean_amplitude = amplitude_sum / window_steps
-                with profiler.region("power_edit"):
-                    power_density = (ctx.total_power * mean_amplitude
-                                     * unit_power_shape)
+                power_density = ctx.total_power * power_accum / window_steps
                 next_thermal = counters["thermal_steps"] + 1
                 diagnostics = (thermal_diagnostics_every > 0 and
                                next_thermal % thermal_diagnostics_every == 0)
@@ -565,8 +618,67 @@ def fixed_shape_coupled_transient(
                         xp.mean(temperature[fuel_dev]))))
                 counters["telemetry_transfers"] += 1
                 cached_peak, cached_mean = map(float, packet)
-                amplitude_sum = 0.0
+                power_accum = None
                 window_steps = 0
+
+            due_interval = (shape_every is not None
+                            and n % shape_every == 0)
+            due_final = (shape_every is not None and final_window
+                         and shape_on_final and not due_interval)
+            if due_interval or due_final:
+                # Re-anchor against the end-of-step control and temperature
+                # state. Amplitude and effective precursor values remain
+                # continuous; normalizing the new power shape to unit integral
+                # makes total fission power continuous as well.
+                with profiler.region("shape_operator_rebuild"):
+                    shape_solver = build_solver(spec, feedback_hook)
+                counters["operator_rebuilds"] += 1
+                forward_options = dict(ctx.eigen_kwargs)
+                forward_options.update(shape_kwargs or {})
+                with profiler.region("forward_shape_solve"):
+                    forward = shape_solver.solve(
+                        state0=shape_state, **forward_options)
+                counters["forward_shape_solves"] += 1
+                counters["forward_shape_outer_iterations"] += \
+                    forward.outer_iterations
+                counters["forward_shape_inner_iterations"] += \
+                    forward.inner_iterations
+                if not forward.converged:
+                    raise RuntimeError(
+                        f"quasi-static forward shape did not converge: {forward}")
+                shape_state = shape_solver.state
+                forward_flux = forward.flux
+                shape_updates += 1
+
+                if shape_updates % adjoint_every == 0:
+                    with profiler.region("adjoint_shape_solve"):
+                        adjoint = shape_solver.solve(
+                            adjoint=True, state0=adjoint_state,
+                            **adjoint_options)
+                    counters["adjoint_eigen_solves"] += 1
+                    counters["adjoint_shape_outer_iterations"] += \
+                        adjoint.outer_iterations
+                    counters["adjoint_shape_inner_iterations"] += \
+                        adjoint.inner_iterations
+                    if not adjoint.converged:
+                        raise RuntimeError(
+                            f"quasi-static adjoint shape did not converge: {adjoint}")
+                    adjoint_state = shape_solver.state
+
+                with profiler.region("reactivity_projection"):
+                    raw = project_effective_kinetics(
+                        shape_solver, forward_flux, adjoint.flux,
+                        ctx.kinetics, k0=steady.k_eff)
+                counters["reactivity_projections"] += 1
+                parameters = replace(raw, rho=raw.rho - rho_reference)
+                with profiler.region("power_shape"):
+                    unit_power_shape = normalized_power_shape(spec, forward_flux)
+                current_key = (tuple(id(item) for item in spec)
+                               + (id(feedback_hook),))
+                shape_times.append(t)
+                shape_reasons.append("maximum_interval" if due_interval
+                                     else "final_state")
+                shape_ks.append(float(forward.k_eff))
             peaks.append(cached_peak)
             means.append(cached_mean)
 
@@ -575,10 +687,10 @@ def fixed_shape_coupled_transient(
     with profiler.region("result_transfer"):
         final_temperature = asnumpy(temperature)
     counters["result_transfers"] += 1
-    counters["shape_updates"] = 0
+    counters["shape_updates"] = shape_updates
     phase_seconds = profiler.seconds()
     phase_seconds.pop("neutronics_solve", None)
-    return FixedShapeQuasiStaticResult(
+    return QuasiStaticResult(
         times=times, power=np.asarray(powers), rho=np.asarray(rhos),
         peak_temperature=np.asarray(peaks),
         mean_temperature=np.asarray(means), temperature=final_temperature,
@@ -586,4 +698,44 @@ def fixed_shape_coupled_transient(
         steady=steady, seconds=seconds,
         initialization_seconds=initialization_seconds,
         device=ctx.device, steps=steps,
+        shape_update_times=np.asarray(shape_times),
+        shape_update_reasons=shape_reasons,
+        shape_k_eff=np.asarray(shape_ks),
         phase_seconds=phase_seconds, counters=dict(counters))
+
+
+def fixed_shape_coupled_transient(ctx, t_end, dt, **kwargs):
+    """Coupled quasi-static prototype with the time-zero shape frozen.
+
+    Control and temperature changes are represented through adjoint-projected
+    effective kinetics, but no forward shape correction is made. This is exact
+    for shape-preserving perturbations and useful as the cheapest comparison
+    mode. Use :func:`quasistatic_coupled_transient` for control-drum motion.
+    """
+    forbidden = {"shape_dt", "adjoint_every", "shape_on_final"} & kwargs.keys()
+    if forbidden:
+        raise TypeError("fixed_shape_coupled_transient does not accept "
+                        + ", ".join(sorted(forbidden)))
+    return _coupled_quasistatic(
+        ctx, t_end, dt, shape_dt=None, adjoint_every=1,
+        shape_on_final=False, **kwargs)
+
+
+def quasistatic_coupled_transient(ctx, t_end, dt, *, shape_dt=2.0,
+                                  adjoint_every=1, shape_on_final=True,
+                                  **kwargs):
+    """Run an adiabatic quasi-static coupled transient.
+
+    The amplitude and effective delayed precursors advance every ``dt`` while
+    a warm-started forward eigen shape is corrected every ``shape_dt``. The
+    adjoint is refreshed every ``adjoint_every`` shape corrections; use one
+    initially, then relax it only after an accuracy/cost study. Temperature
+    feedback and cached control frames are still projected between corrections.
+
+    This path targets slow HP-MR drum manoeuvres and long thermal follow-through
+    periods. It is not yet IQS: rapid localized insertions can require the
+    forthcoming time-dependent shape corrector or the full diffusion stepper.
+    """
+    return _coupled_quasistatic(
+        ctx, t_end, dt, shape_dt=shape_dt, adjoint_every=adjoint_every,
+        shape_on_final=shape_on_final, **kwargs)

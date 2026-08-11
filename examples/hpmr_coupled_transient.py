@@ -2,6 +2,7 @@
 
     python examples/hpmr_coupled_transient.py [--refine 6] [--groups 11]
         [--t-end 120] [--dt 0.05] [--dt-thermal 0.5] [--device auto] [--nz 0]
+        [--quasistatic-shape-dt 2.0] [--adjoint-every 5]
 
 Starts from the converged coupled steady state at rated power, withdraws the
 control drums a few degrees over a few seconds, and marches both physics
@@ -21,6 +22,11 @@ stability).
 This is also the script to time on a GPU: it reports wall time per neutronics
 step, which is the number that decides whether a realistic transient is minutes
 or hours. See ``notebooks/colab_hpmr_coupled_transient.ipynb``.
+
+With ``--quasistatic-shape-dt``, amplitude and precursors still advance at
+``--dt`` but the expensive spatial diffusion shape is corrected only at the
+requested cadence. This adiabatic mode is intended for slow drum ramps; omit
+the option to retain the full transient-diffusion reference treatment.
 """
 
 import argparse
@@ -34,6 +40,7 @@ from ndgpu.benchmarks.hpmr_thermal import (RATED_POWER_W,
                                            build_hpmr_coupling,
                                            hpmr_drum_ramp, hpmr_endfb8_builtin,
                                            sink_coefficient)
+from ndgpu import quasistatic_coupled_transient
 from ndgpu.coupling import coupled_transient
 
 ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -59,6 +66,11 @@ ap.add_argument("--n-angles", type=int, default=13)
 ap.add_argument("--device", default="auto")
 ap.add_argument("--profile", action="store_true",
                 help="collect CUDA-event/CPU phase timings and counters")
+ap.add_argument("--quasistatic-shape-dt", type=float, default=None,
+                help="use adiabatic quasi-static treatment and update the "
+                     "spatial shape at this cadence in seconds")
+ap.add_argument("--adjoint-every", type=int, default=1,
+                help="quasi-static adjoint refresh cadence in shape updates")
 ap.add_argument("--quiet", action="store_true")
 args = ap.parse_args()
 
@@ -77,6 +89,9 @@ if args.drum_to is None:
         args.drum_from, args.dollars, refine=args.refine, nz=args.nz,
         materials=mats, device=args.device, with_worth=True)
     args.dollars = achieved_pcm / 1e5 / float(HPMR_KINETICS.beta.sum())
+    insertion = f"{args.dollars:+.3f} $ actually inserted"
+else:
+    insertion = "angle override; reactivity not measured"
 problem = build(args.drum_from)
 ctx = build_hpmr_coupling(problem, device=args.device)
 problem_at = hpmr_drum_ramp(problem, angle_from=args.drum_from,
@@ -94,7 +109,7 @@ print(f"HP-MR coupled transient — {'3D' if three_d else '2D'}, refine {args.re
       f"{ctx.materials[1].n_groups} groups, {n_cells:,} active cells")
 print(f"  drums {args.drum_from:g}° → {args.drum_to:.2f}° over {args.t_ramp:g} s "
       f"starting at t = {args.t_start:g} s   "
-      f"({args.dollars:+.3f} $ actually inserted)   "
+      f"({insertion})   "
       f"({RATED_POWER_W/1e6:g} MWt rated)")
 print(f"  {args.t_end:g} s at dt = {args.dt:g} s → {n_steps:,} neutronics steps; "
       f"thermal step {args.dt_thermal:g} s")
@@ -102,14 +117,26 @@ print(f"  fuel thermal time constant rho*cp/h = {tau:.0f} s "
       f"({tau/args.t_end:.1f}x the run length)\n")
 
 t0 = time.perf_counter()
-res = coupled_transient(ctx, t_end=args.t_end, dt=args.dt,
-                        dt_thermal=args.dt_thermal, problem_at=problem_at,
-                        verbose=not args.quiet, profile=args.profile)
+if args.quasistatic_shape_dt is None:
+    res = coupled_transient(
+        ctx, t_end=args.t_end, dt=args.dt,
+        dt_thermal=args.dt_thermal, problem_at=problem_at,
+        verbose=not args.quiet, profile=args.profile)
+    mode = "full diffusion"
+else:
+    res = quasistatic_coupled_transient(
+        ctx, t_end=args.t_end, dt=args.dt,
+        dt_thermal=args.dt_thermal, problem_at=problem_at,
+        shape_dt=args.quasistatic_shape_dt,
+        adjoint_every=args.adjoint_every, profile=args.profile)
+    mode = (f"adiabatic quasi-static, shape dt "
+            f"{args.quasistatic_shape_dt:g} s")
 wall = time.perf_counter() - t0
 
 print(f"\n  {'steady state (before t=0)':<32}: {res.steady.iterations} coupling "
       f"iterations, {res.steady.seconds:.1f} s")
 print(f"  {'k_eff at the initial state':<32}: {res.k0:.6f}")
+print(f"  {'transient treatment':<32}: {mode}")
 print(f"  {'peak P/P0':<32}: {res.power.max():.4f} at t = "
       f"{res.times[int(np.argmax(res.power))]:.2f} s")
 print(f"  {'final P/P0':<32}: {res.power[-1]:.4f}")
@@ -122,6 +149,10 @@ print(f"\n  {'problem build + drum frames':<32}: {t_build:.1f} s")
 print(f"  {'transient':<32}: {wall:.1f} s  ({res.steps:,} steps, "
       f"{1000 * wall / max(res.steps, 1):.1f} ms/step)")
 print(f"  {'device':<32}: {res.device}")
+if args.quasistatic_shape_dt is not None:
+    print(f"  {'shape / adjoint solves':<32}: "
+          f"{res.counters['forward_shape_solves']} / "
+          f"{res.counters['adjoint_eigen_solves']}")
 if res.phase_seconds:
     print("\n  transient phase timings (overlap-free CUDA events on GPU):")
     for name, value in sorted(res.phase_seconds.items()):

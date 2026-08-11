@@ -125,6 +125,14 @@ def test_custom_reactor_runs_coupled_transient_without_benchmark_helpers():
     assert result.counters["thermal_steps"] == 1
     assert np.all(np.isfinite(result.temperature))
 
+    qs = reactor.quasistatic_transient(
+        t_end=0.10, dt=0.05, dt_thermal=0.10, shape_dt=0.10,
+        device="cpu", profile=True)
+    np.testing.assert_allclose(qs.power, 1.0, atol=2e-8)
+    assert qs.counters["shape_updates"] == 1
+    assert qs.counters["forward_shape_solves"] == 1
+    assert np.all(np.isfinite(qs.temperature))
+
 
 def test_named_thermal_mapping_rejects_missing_active_material():
     reactor = seven_site_lattice(refine=1).build()

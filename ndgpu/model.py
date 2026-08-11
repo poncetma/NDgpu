@@ -964,6 +964,36 @@ class TriReactor:
         return coupled_transient(ctx, t_end=t_end, dt=dt,
                                  problem_at=problem_at, **kwargs)
 
+    def quasistatic_transient(self, t_end, dt, *, shape_dt=2.0,
+                              device="auto", problem_at=None, state_at=None,
+                              **kwargs):
+        """Run an adiabatic quasi-static coupled transient.
+
+        Amplitude/precursors advance every ``dt`` while the full spatial shape
+        is warm-started every ``shape_dt``. This targets slow drum/rod motion
+        and long thermal follow-through; use :meth:`coupled_transient` for a
+        rapid localized event until the IQS shape corrector is available.
+        """
+        from .quasistatic import quasistatic_coupled_transient
+
+        if self.kinetics is None:
+            raise ValueError("no kinetics: call set_kinetics() first")
+        if problem_at is not None and state_at is not None:
+            raise ValueError("use problem_at or state_at, not both")
+        if state_at is not None:
+            def problem_at(t):
+                state = state_at(t)
+                if not isinstance(state, TriReactor):
+                    raise TypeError("state_at must return a TriReactor")
+                if state.shape != self.shape:
+                    raise ValueError("state_at returned a different grid shape")
+                return (state.materials, state.material_map,
+                        state.mix_material, state.mix_weight)
+        ctx = self.coupling_context(device=device)
+        return quasistatic_coupled_transient(
+            ctx, t_end=t_end, dt=dt, shape_dt=shape_dt,
+            problem_at=problem_at, **kwargs)
+
 
 def _drum_absorber_mix(raster, pitch, drums, samples):
     """Per-cell volume fraction of each drum's absorber arc (mix_material/weight).

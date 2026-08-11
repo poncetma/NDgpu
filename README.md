@@ -22,8 +22,8 @@ flux = result.flux     # (groups, nx, ny, nz), on the solve device
 | Geometry | Cartesian 1-D/2-D/3-D, cylindrical r-z, unstructured meshes, and body-fitted 2-D/3-D tri-grids |
 | Neutronics | Multigroup diffusion, SP1/3/5/7, SDP1/2/3, adjoint, delayed-neutron transients, and advanced SN/noise interfaces |
 | Equivalence | SPH generation tools and direct corrected-material hand-off without rebuilding the reactor |
-| Coupling | Steady and transient heat conduction with Doppler/density feedback and cached moving-control states |
-| Performance | Matrix-free CPU/GPU execution, device-resident coupled fields, thermal subcycling, reusable operators, and profiling counters |
+| Coupling | Steady/full-diffusion/quasi-static transient conduction with Doppler/density feedback and cached moving-control states |
+| Performance | Matrix-free CPU/GPU execution, device-resident coupled fields, thermal subcycling, warm-started shape updates, and profiling counters |
 
 ## Physics
 

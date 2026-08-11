@@ -368,13 +368,20 @@ The first quasi-static acceleration stage is available as an explicit advanced
 API:
 
 ```python
-from ndgpu import fixed_shape_coupled_transient
+from ndgpu import (fixed_shape_coupled_transient,
+                   quasistatic_coupled_transient)
 
 qs = fixed_shape_coupled_transient(
     ctx, t_end=60.0, dt=0.2, dt_thermal=1.0,
     problem_at=drum_frames, profile=True,
 )
 print(qs.power, qs.rho, qs.counters)
+
+adiabatic = quasistatic_coupled_transient(
+    ctx, t_end=60.0, dt=0.2, dt_thermal=1.0,
+    shape_dt=2.0, adjoint_every=5,
+    problem_at=drum_frames, profile=True,
+)
 ```
 
 It reuses the converged coupled forward flux, solves one adjoint, projects each
@@ -385,9 +392,12 @@ solves from the time loop. `problem_at(0)` must be physically identical to the
 base `ctx`, and callers should return cached objects between real state changes
 to avoid redundant operator rebuilds.
 
-This API is deliberately named `fixed_shape_coupled_transient`: it performs no
-shape correction and is not a production approximation for a large drum or
-rod movement. The next stage adds warm-started spatial shape re-anchoring,
-adjoint refresh/error triggers, and convergence to `coupled_transient` as the
-maximum shape interval is reduced. See
+`fixed_shape_coupled_transient` performs no shape correction and is not an
+appropriate approximation for a large drum or rod movement.
+`quasistatic_coupled_transient` adds periodic warm-started forward shape solves,
+configurable adjoint refresh, normalized power-shape replacement, and complete
+shape timing/counters. It is the intended path for slow HP-MR drum ramps and
+long thermal holds. The remaining production work is an IQS transient shape
+equation, residual-triggered updates, and automatic fallback for rapid or large
+localized changes. See
 [the quasi-static acceleration plan](quasistatic_acceleration_plan.md).
