@@ -148,11 +148,13 @@ MODES = (
 )
 
 # Calibrated against the refine-3 cached-frame residuals used below.  The soft
-# limit shortens an IQS macro interval; the hard limit sends that fine interval
-# through full transient diffusion.  These are benchmark controls, not claimed
+# residual limit shortens an IQS macro interval; the hard limit sends that fine
+# interval through full transient diffusion. Predictor disagreement above 2%
+# halves subsequent macro intervals. These are benchmark controls, not claimed
 # universal production tolerances.
 RESIDUAL_TOL = 0.012
 FALLBACK_RESIDUAL = 0.020
+PREDICTOR_TOL = 0.020
 
 
 def run_mode(problem, problem_at, case, mode):
@@ -168,7 +170,8 @@ def run_mode(problem, problem_at, case, mode):
             shape_method=("adiabatic" if mode == "adiabatic" else "iqs"))
         if mode == "guarded_iqs":
             options.update(residual_tol=RESIDUAL_TOL,
-                           fallback_residual=FALLBACK_RESIDUAL)
+                           fallback_residual=FALLBACK_RESIDUAL,
+                           iqs_predictor_tol=PREDICTOR_TOL)
         result = quasistatic_coupled_transient(
             ctx, t_end=case.t_end, dt=case.dt,
             dt_thermal=case.dt_thermal, problem_at=problem_at,
@@ -229,6 +232,19 @@ def result_metrics(case, mode, label, result, wall, dynamic, reference,
         "max_shape_residual": float(residual.max()) if residual.size else 0.0,
         "residual_shape_updates": int(reasons["residual"]),
         "fallback_intervals": int(counters.get("full_diffusion_fallbacks", 0)),
+        "final_power_shape_factor": float(
+            np.asarray(getattr(result, "power_shape_factor", [1.0]))[-1]),
+        "max_shape_derivative_correction": (
+            1e-6 * int(counters.get(
+                "max_shape_derivative_correction_ppm", 0))),
+        "iqs_corrector_substeps": int(
+            counters.get("iqs_corrector_substeps", 0)),
+        "iqs_precursor_shape_corrections": int(
+            counters.get("iqs_precursor_shape_corrections", 0)),
+        "predictor_interval_reductions": int(
+            counters.get("iqs_predictor_interval_reductions", 0)),
+        "predictor_interval_recoveries": int(
+            counters.get("iqs_predictor_interval_recoveries", 0)),
         "max_iqs_predictor_error": (
             1e-6 * int(counters.get("iqs_max_amplitude_error_ppm", 0))),
         "neutron_inner_iterations": int(counters.get("neutron_inner_iterations", 0)),
@@ -383,7 +399,8 @@ def main():
         "python": platform.python_version(), "refine": args.refine,
         "groups": int(args.groups), "quick": args.quick,
         "guarded_iqs": {"residual_tol": RESIDUAL_TOL,
-                        "fallback_residual": FALLBACK_RESIDUAL},
+                        "fallback_residual": FALLBACK_RESIDUAL,
+                        "predictor_tol": PREDICTOR_TOL},
         "total_benchmark_seconds": total_seconds,
         "cases": case_metadata,
     }

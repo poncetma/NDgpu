@@ -399,9 +399,21 @@ appropriate approximation for a large drum or rod movement.
 corrector. It removes the corrector's independent global amplitude mode and
 uses its time-dependent spatial flux shape, while retaining the spatial
 precursor inventory advanced by the accepted fine-step amplitude history.
-That inventory is projected back into the effective amplitude system after
-each correction. Set `shape_method="adiabatic"` for periodic eigen shapes
-instead.
+At each replacement, the old/new ``<phi*,V^-1 psi>`` ratio keeps the
+adjoint-weighted population coordinate continuous and converts it to physical
+fission power. Results expose that split as `.amplitude`, `.power`, and
+`.power_shape_factor`. The precursor inventory is projected back into the same
+adjoint coordinate after each correction. Set `shape_method="adiabatic"` for
+periodic eigen shapes instead.
+
+`iqs_predictor_tol` adds a forward-looking amplitude guard. If the independent
+macro corrector and accepted power differ by more than this relative tolerance,
+subsequent shape intervals are halved; they recover geometrically after the
+disagreement falls below one quarter of the tolerance. This concentrates shape
+work around rapid control motion without immediately replaying a full interval.
+`iqs_substeps>1` also makes a macro corrector traverse cached intermediate
+`problem_at` states, but is primarily a convergence control: the HP-MR CPU
+sweep found substantially more cost than accuracy benefit from 2–4 substeps.
 
 `residual_tol` measures the current loss/fission shape defect after projecting
 out the adjoint amplitude mode and forces an early correction.

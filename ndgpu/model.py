@@ -969,11 +969,14 @@ class TriReactor:
                               **kwargs):
         """Run an improved quasi-static coupled transient.
 
-        Amplitude/precursors advance every ``dt`` while the full spatial shape
-        is corrected every ``shape_dt``. Time-dependent IQS is the default;
-        ``shape_method="adiabatic"`` selects instantaneous eigen shapes.
-        Residual thresholds can force early corrections or full-diffusion
-        fallback intervals for rapid localized motion.
+        The adjoint-weighted population amplitude and precursors advance every
+        ``dt`` while the full spatial shape is corrected every ``shape_dt``;
+        the returned power includes the shape's adjoint-weighted fission-power
+        factor. Time-dependent IQS is the default; ``shape_method="adiabatic"``
+        selects instantaneous eigen shapes. Residual thresholds can force early
+        corrections or full-diffusion fallback intervals for rapid localized
+        motion; ``iqs_predictor_tol`` adaptively shortens subsequent shape
+        intervals after a large amplitude-predictor disagreement.
         """
         from .quasistatic import quasistatic_coupled_transient
 

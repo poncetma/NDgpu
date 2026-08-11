@@ -9,6 +9,9 @@ from ndgpu import (DiffusionEigenSolver, EffectiveKinetics, Grid, Kinetics,
                    integrate_point_kinetics, project_effective_kinetics,
                    projected_shape_residual, quasistatic_coupled_transient)
 from ndgpu.coupling import CoupledSolver, CouplingContext, coupled_transient
+from ndgpu.quasistatic import (_match_spatial_precursor_importance,
+                               _project_spatial_precursors,
+                               _shape_time_importance)
 
 
 D, SA, NF, V = 1.3, 0.030, 0.035, 2.2e5
@@ -74,6 +77,21 @@ def test_projection_is_invariant_to_forward_and_adjoint_normalization():
     assert b.rho == pytest.approx(a.rho, abs=2e-14)
     assert b.generation_time == pytest.approx(a.generation_time, rel=2e-13)
     np.testing.assert_allclose(b.beta, a.beta, rtol=2e-13)
+
+
+def test_iqs_precursor_shape_matching_preserves_accepted_projection():
+    solver, _, adjoint = shapes()
+    candidate = np.linspace(0.2, 1.1, np.prod(GRID.shape)).reshape(
+        (1,) + GRID.shape)
+    target = np.array([3.75])
+    matched, factors = _match_spatial_precursor_importance(
+        solver, adjoint.flux, candidate, target, KIN,
+        time_importance=0.42)
+    projected = _project_spatial_precursors(
+        solver, adjoint.flux, matched, KIN, time_importance=0.42)
+
+    np.testing.assert_allclose(projected, target, rtol=2e-14)
+    np.testing.assert_allclose(matched, candidate * factors[0], rtol=2e-14)
 
 
 def test_projected_shape_residual_removes_only_the_amplitude_mode():
@@ -269,6 +287,9 @@ def test_iqs_keeps_accepted_precursor_history_across_shape_corrections():
     iqs = quasistatic_coupled_transient(
         build_hpmr_coupling(problem), shape_dt=0.25, adjoint_every=2,
         shape_method="iqs", **options)
+    adaptive = quasistatic_coupled_transient(
+        build_hpmr_coupling(problem), shape_dt=0.25, adjoint_every=2,
+        shape_method="iqs", iqs_predictor_tol=0.02, **options)
     guarded = quasistatic_coupled_transient(
         build_hpmr_coupling(problem), shape_dt=0.25, adjoint_every=2,
         shape_method="iqs", residual_tol=1e-8, fallback_residual=1.0,
@@ -278,6 +299,8 @@ def test_iqs_keeps_accepted_precursor_history_across_shape_corrections():
     # percent. Its spatial shape is useful, but adopting its precursor field
     # used to leave the accepted point amplitude about 10% low after the ramp.
     assert iqs.counters["iqs_max_amplitude_error_ppm"] > 10_000
+    assert adaptive.counters["iqs_predictor_interval_reductions"] > 0
+    assert adaptive.counters["shape_updates"] > iqs.counters["shape_updates"]
     assert abs(iqs.power[-1] / full.power[-1] - 1.0) < 1e-3
     assert np.max(np.abs(guarded.power - full.power) / full.power) < 1e-2
     assert (np.max(np.abs(guarded.power - full.power) / full.power)
@@ -346,8 +369,54 @@ def test_iqs_time_dependent_shape_is_closer_than_instantaneous_eigen_shape():
     assert error(iqs) < error(adiabatic)
     assert iqs.counters["iqs_shape_solves"] == 2
     assert iqs.counters["iqs_predictor_checks"] == 2
+    assert iqs.counters["iqs_precursor_shape_corrections"] == 2
+    assert iqs.counters["iqs_max_precursor_shape_change_ppm"] > 0
     assert np.all(np.isfinite(iqs.spatial_precursors))
     assert np.all(iqs.effective_precursors >= 0.0)
+
+
+def test_iqs_power_includes_adjoint_weighted_shape_derivative():
+    """A changing fission-normalized shape must not make amplitude equal power.
+
+    With a fixed adjoint over this single macro interval, integrating
+    ``<phi*, V^-1 dpsi/dt>`` is exactly the old/new time-importance ratio.
+    This is a coordinate correction: the accepted precursor inventory remains
+    untouched and the point amplitude is converted to physical fission power.
+    """
+    changed = Material(
+        name="weak local fuel", diffusion=[D], sigma_a=[SA * 1.02],
+        nu_sigma_f=[0.8 * NF])
+    base_map = np.zeros(GRID.shape, dtype=np.int32)
+    changed_map = base_map.copy()
+    changed_map[:2] = 1
+    states = (([BASE, BASE], base_map), ([BASE, changed], changed_map))
+    problem_at = lambda t: states[0] if t <= 0.0 else states[1]
+
+    result = quasistatic_coupled_transient(
+        localized_context(), t_end=0.005, dt=0.005, dt_thermal=0.005,
+        shape_dt=0.005, adjoint_every=99, shape_method="iqs",
+        problem_at=problem_at)
+
+    final_solver = DiffusionEigenSolver(
+        GRID, states[1][0], states[1][1], bc="reflective", device="cpu")
+    initial_solver = DiffusionEigenSolver(
+        GRID, states[0][0], states[0][1], bc="reflective", device="cpu")
+    initial_flux = np.asarray(result.steady.neutronics.flux).copy()
+    initial_source = initial_solver.fields.fission_source(initial_flux)
+    initial_flux /= np.sum(initial_source / result.k0)
+    old_t = _shape_time_importance(
+        final_solver, initial_flux, result.adjoint_flux, KIN)
+    new_t = _shape_time_importance(
+        final_solver, result.flux, result.adjoint_flux, KIN)
+
+    assert result.power_shape_factor[-1] == pytest.approx(
+        old_t / new_t, rel=2e-12)
+    assert abs(result.power_shape_factor[-1] - 1.0) > 1e-3
+    np.testing.assert_allclose(
+        result.power, result.amplitude * result.power_shape_factor,
+        rtol=2e-14, atol=0.0)
+    assert result.counters["shape_derivative_corrections"] == 1
+    assert result.counters["max_shape_derivative_correction_ppm"] > 1000
 
 
 def test_residual_trigger_forces_early_iqs_correction():

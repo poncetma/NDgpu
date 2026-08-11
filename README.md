@@ -1,9 +1,10 @@
-# NDgpu — GPU-native neutron diffusion & SP3 solver
+# NDgpu — GPU-native diffusion, SPN & SDPN neutronics
 
 GPU-native finite-volume reactor physics for structured Cartesian,
 triangular, and triangular-prism grids, with a NumPy CPU fallback that shares
 the same code path. NDgpu is aimed particularly at SPH-corrected full-core
-diffusion and fast neutronics/thermal transient coupling.
+diffusion, higher-order simplified transport (SPN/SDPN), and fast
+neutronics/thermal transient coupling.
 
 ```python
 from ndgpu import DiffusionEigenSolver, Grid, PWR_TWO_GROUP
@@ -20,22 +21,38 @@ flux = result.flux     # (groups, nx, ny, nz), on the solve device
 |---|---|
 | Reactor models | Human-oriented `Model`, `MeshModel`, and `HexLattice` → `TriReactor` APIs |
 | Geometry | Cartesian 1-D/2-D/3-D, cylindrical r-z, unstructured meshes, and body-fitted 2-D/3-D tri-grids |
-| Neutronics | Multigroup diffusion, SP1/3/5/7, SDP1/2/3, adjoint, delayed-neutron transients, and advanced SN/noise interfaces |
+| Neutronics | Multigroup diffusion, SP1/3/5/7, simplified double-PN (SDP1/2/3), adjoint, delayed-neutron transients, and advanced SN/noise interfaces |
 | Equivalence | SPH generation tools and direct corrected-material hand-off without rebuilding the reactor |
 | Coupling | Steady/full-diffusion/quasi-static transient conduction with Doppler/density feedback and cached moving-control states |
 | Performance | Matrix-free CPU/GPU execution, device-resident coupled fields, thermal subcycling, warm-started shape updates, and profiling counters |
 
 ## Physics
 
-Solves the multigroup eigenvalue problem  `M φ = (1/k) F φ` with two
-selectable angular approximations:
+Solves the multigroup eigenvalue problem `M φ = (1/k) F φ` with three
+selectable angular families:
 
 - **`DiffusionEigenSolver`** — classic multigroup diffusion:
   `-∇·(D_g ∇φ_g) + Σ_r,g φ_g = Σ_{g'≠g} Σ_s,g'→g φ_g' + (χ_g/k) Σ_g' νΣ_f,g' φ_g'`
-- **`SP3EigenSolver`** — simplified P3 (Brantley–Larsen form): two coupled
-  diffusion-type equations per group in the moments `(φ0+2φ2, φ2)`,
-  symmetrized into an SPD block system. Captures leading transport effects
-  (steep gradients, strong absorbers, small cores) at ~2–3× diffusion cost.
+- **SPN** — `SP1EigenSolver`, `SP3EigenSolver`, `SP5EigenSolver`, and
+  `SP7EigenSolver`. SP3 uses two coupled diffusion-type equations per group in
+  the Brantley–Larsen moments `(φ0+2φ2, φ2)`; the unified SPN block extends
+  the same matrix-free formulation to three and four moments for SP5/SP7.
+- **SDPN** — `SDP1EigenSolver`, `SDP2EigenSolver`, and `SDP3EigenSolver`
+  implement the simplified double-PN closure of Carreno et al. (2024). Each
+  order has the same number of unknowns as its SPN partner (SDP1/SP3,
+  SDP2/SP5, SDP3/SP7), but the half-range closure is designed to represent
+  strongly heterogeneous media and near-discontinuous angular flux more
+  faithfully at matched cost.
+
+The human-facing `Model.run(method=...)` and `TriReactor.steady(method=...)`
+interfaces accept `"diffusion"`, `"sp1"`, `"sp3"`, `"sp5"`, `"sp7"`,
+`"sdp1"`, `"sdp2"`, or `"sdp3"`. Cartesian and body-fitted triangular SDPN
+operators use matrix-free moment blocks on both NumPy and CuPy; symmetric
+forms use CG where the closure and boundaries permit it, with BiCGStab for the
+remaining non-symmetric cases. Exact moment-coupled Marshak vacuum boundaries
+are available through the low-level solvers with `marshak_vacuum=True`.
+Time-dependent SPN and SDPN calculations are available through
+`TransientSPNSolver` and `TransientSDPNSolver`.
 
 Features: arbitrary group count with up/downscatter, heterogeneous cores via
 per-cell material maps (harmonic-mean face diffusion coefficients), per-face
@@ -148,16 +165,25 @@ NDgpu reactor solution
     fuel             12.5%    100.0%
 ```
 
-`Model` accepts 1-D, 2-D or 3-D `size`/`cells`, `method="diffusion"` or `"sp3"`,
-`adjoint=True` for the importance solve, and per-face boundary names (`"vacuum"`,
-`"reflective"`, `"zero-flux"`, or an albedo). Two sibling builders reach the other
-geometry backends with the same report:
+`Model` accepts 1-D, 2-D or 3-D `size`/`cells`, the full diffusion/SPN/SDPN
+method list above, `adjoint=True` for the importance solve, and per-face
+boundary names (`"vacuum"`, `"reflective"`, `"zero-flux"`, or an albedo). For
+example, the same painted model can be compared without rebuilding its
+geometry:
+
+```python
+diffusion = model.run(method="diffusion", device="auto")
+sdp2 = model.run(method="sdp2", device="auto")       # matched DoF with SP5
+print(diffusion.k_eff, sdp2.k_eff)
+```
+
+Two sibling builders reach the other geometry backends with the same report:
 
 | Builder | Geometry | Examples |
 |---|---|---|
-| `ndgpu.Model` | structured Cartesian (1/2/3-D), diffusion/SP3, adjoint | `bare_reactor.py`, `reflected_core.py`, `adjoint_importance.py` |
+| `ndgpu.Model` | structured Cartesian (1/2/3-D), diffusion/SPN/SDPN, adjoint | `bare_reactor.py`, `reflected_core.py`, `sdpn_brantley_larsen_2d.py` |
 | `ndgpu.MeshModel` | arbitrary unstructured mesh (Gmsh or assembled), 2/3-D | `unstructured_mesh.py` |
-| `ndgpu.HexLattice.build()` → `TriReactor` | reusable 2-D/3-D triangular core; steady, transient and thermal coupling | `custom_tri_reactor.py`, `hex_lattice.py` |
+| `ndgpu.HexLattice.build()` → `TriReactor` | reusable 2-D/3-D triangular core; diffusion/SPN/SDPN steady solves, transient and thermal coupling | `custom_tri_reactor.py`, `hex_lattice.py` |
 
 ```python
 # unstructured mesh: paint by tag, centroid box, or a predicate on the centroid
