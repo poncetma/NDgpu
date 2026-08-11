@@ -97,8 +97,9 @@ pip install -e .[cuda12]        # + CuPy for CUDA 12.x GPUs
   executable coverage of the current tri-grid and coupled-transient features,
   including an optional one-minute 3-D HP-MR workload.
 - **[Quasi-static acceleration plan](docs/quasistatic_acceleration_plan.md)** —
-  proposed amplitude/shape algorithm, GPU architecture, validation gates, and
-  performance targets for long coupled transients.
+  implemented fixed-shape foundation, proposed adaptive shape algorithm, GPU
+  architecture, validation gates, and performance targets for long coupled
+  transients.
 - **[Examples](examples/)** — complete scripts from simple Cartesian problems
   to the 3-D prismatic and HP-MR models.
 

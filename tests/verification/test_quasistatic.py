@@ -1,0 +1,154 @@
+"""Quasi-static projection and amplitude equations against exact limits."""
+
+import numpy as np
+import pytest
+
+from ndgpu import (DiffusionEigenSolver, EffectiveKinetics, Grid, Kinetics,
+                   Material, ThermalFeedback, ThermalMaterial, TransientSolver,
+                   equilibrium_precursors, fixed_shape_coupled_transient,
+                   integrate_point_kinetics, project_effective_kinetics)
+from ndgpu.coupling import CoupledSolver, CouplingContext, coupled_transient
+
+
+D, SA, NF, V = 1.3, 0.030, 0.035, 2.2e5
+BETA, LAM = 0.0065, 0.08
+GRID = Grid(shape=(6, 1, 1), size=(60.0, 1.0, 1.0))
+BASE = Material(name="base", diffusion=[D], sigma_a=[SA], nu_sigma_f=[NF])
+KIN = Kinetics(velocities=[V], beta=[BETA], decay=[LAM])
+
+
+def coupled_context():
+    material_map = np.zeros(GRID.shape, dtype=np.int32)
+    feedback = ThermalFeedback(t_ref=[600.0], doppler=[0.0])
+    thermal = ThermalMaterial(
+        conductivity=0.2, sink_coeff=0.04, sink_temperature=600.0,
+        heat_capacity=2.0, name="homogeneous fuel")
+    return CouplingContext(
+        grid=GRID, materials=[BASE], material_map=material_map,
+        thermal_materials=[thermal], feedback=feedback, total_power=120.0,
+        bc="reflective", thermal_bc="adiabatic", device="cpu",
+        kinetics=KIN, solver_cls=DiffusionEigenSolver,
+        eigen_kwargs={"tol_k": 1e-11, "tol_source": 1e-11})
+
+
+def shapes(material=BASE):
+    solver = DiffusionEigenSolver(
+        GRID, [material], bc="reflective", device="cpu")
+    forward = solver.solve(tol_k=1e-10, tol_source=1e-10)
+    adjoint = solver.solve(tol_k=1e-10, tol_source=1e-10, adjoint=True)
+    return solver, forward, adjoint
+
+
+def test_homogeneous_projection_recovers_exact_kinetics():
+    solver, forward, adjoint = shapes()
+    p = project_effective_kinetics(solver, forward, adjoint, KIN)
+    assert p.rho == pytest.approx(0.0, abs=2e-14)
+    assert p.generation_time == pytest.approx(1.0 / (V * SA), rel=2e-13)
+    np.testing.assert_allclose(p.beta, [BETA], rtol=0, atol=2e-14)
+    np.testing.assert_allclose(p.decay, [LAM], rtol=0, atol=0)
+
+
+def test_projection_is_invariant_to_forward_and_adjoint_normalization():
+    solver, forward, adjoint = shapes()
+    a = project_effective_kinetics(solver, forward, adjoint, KIN)
+    b = project_effective_kinetics(
+        solver, 17.0 * forward.flux, 0.031 * adjoint.flux, KIN,
+        k0=forward.k_eff)
+    assert b.rho == pytest.approx(a.rho, abs=2e-14)
+    assert b.generation_time == pytest.approx(a.generation_time, rel=2e-13)
+    np.testing.assert_allclose(b.beta, a.beta, rtol=2e-13)
+
+
+def test_local_rayleigh_projection_recovers_uniform_absorption_worth():
+    ref, forward, adjoint = shapes()
+    delta = 0.5 * BETA * SA
+    perturbed = Material(name="perturbed", diffusion=[D], sigma_a=[SA - delta],
+                         nu_sigma_f=[NF])
+    current = DiffusionEigenSolver(
+        GRID, [perturbed], bc="reflective", device="cpu")
+    p = project_effective_kinetics(
+        current, forward, adjoint, KIN, k0=forward.k_eff)
+    assert p.rho == pytest.approx(delta / SA, rel=2e-13)
+    assert p.rho / p.beta_total == pytest.approx(0.5, rel=2e-13)
+
+
+def test_critical_point_kinetics_equilibrium_is_stationary():
+    p = EffectiveKinetics(
+        rho=0.0, generation_time=1.5e-4,
+        beta=np.array([0.0015, 0.005]), decay=np.array([0.08, 0.2]),
+        time_importance=1.0, fission_importance=1.0)
+    c0 = equilibrium_precursors(p)
+    r = integrate_point_kinetics(p, t_end=10.0, dt=0.1)
+    np.testing.assert_allclose(r.power, 1.0, rtol=0, atol=2e-13)
+    np.testing.assert_allclose(r.precursors, np.broadcast_to(c0, r.precursors.shape),
+                               rtol=0, atol=2e-12)
+
+
+def test_projected_amplitude_matches_full_uniform_spatial_transient():
+    ref, forward, adjoint = shapes()
+    delta = 0.5 * BETA * (NF / forward.k_eff)
+    perturbed = Material(name="perturbed", diffusion=[D], sigma_a=[SA - delta],
+                         nu_sigma_f=[NF])
+    current = DiffusionEigenSolver(
+        GRID, [perturbed], bc="reflective", device="cpu")
+    p0 = project_effective_kinetics(ref, forward, adjoint, KIN)
+    p1 = project_effective_kinetics(
+        current, forward, adjoint, KIN, k0=forward.k_eff)
+    dt, t_end = 2e-4, 0.02
+    qs = integrate_point_kinetics(
+        lambda t: p0 if t <= 0.0 else p1, t_end=t_end, dt=dt)
+    full = TransientSolver(
+        GRID, lambda t: (([BASE] if t <= 0.0 else [perturbed]), None),
+        KIN, bc="reflective", device="cpu").solve(
+            t_end=t_end, dt=dt, tol_step=1e-9)
+    np.testing.assert_allclose(qs.power, full.power, rtol=0, atol=2e-11)
+
+
+def test_point_kinetics_rejects_family_changes():
+    p1 = EffectiveKinetics(0.0, 1e-4, np.array([0.0065]), np.array([0.08]),
+                           1.0, 1.0)
+    p2 = EffectiveKinetics(0.0, 1e-4, np.array([0.003, 0.0035]),
+                           np.array([0.08, 0.2]), 1.0, 1.0)
+    with pytest.raises(ValueError, match="family count"):
+        integrate_point_kinetics(lambda t: p1 if t <= 0 else p2,
+                                 t_end=0.1, dt=0.1)
+
+
+def test_fixed_shape_coupling_holds_a_stationary_equilibrium():
+    ctx = coupled_context()
+    steady = CoupledSolver(ctx).solve(tol=1e-10)
+    result = fixed_shape_coupled_transient(
+        ctx, t_end=0.2, dt=0.05, dt_thermal=0.1,
+        initial_coupled=steady, profile=True)
+    np.testing.assert_allclose(result.power, 1.0, rtol=0, atol=2e-13)
+    assert np.ptp(result.mean_temperature) < 2e-10
+    assert np.ptp(result.peak_temperature) < 2e-10
+    assert result.counters["initial_state_reuses"] == 1
+    assert result.counters["shape_updates"] == 0
+    assert result.counters["adjoint_eigen_solves"] == 1
+    assert result.counters["reactivity_projections"] == 2
+
+
+def test_fixed_shape_coupling_matches_full_shape_preserving_insertion():
+    ctx = coupled_context()
+    material_map = ctx.material_map
+    delta = 0.35 * BETA * SA
+    perturbed = Material(
+        name="uniform insertion", diffusion=[D], sigma_a=[SA - delta],
+        nu_sigma_f=[NF])
+    base_state = ([BASE], material_map)
+    perturbed_state = ([perturbed], material_map)
+
+    def problem_at(t):
+        return base_state if t <= 0.0 else perturbed_state
+
+    full = coupled_transient(
+        ctx, t_end=0.02, dt=2e-4, dt_thermal=0.002,
+        problem_at=problem_at)
+    accelerated = fixed_shape_coupled_transient(
+        coupled_context(), t_end=0.02, dt=2e-4, dt_thermal=0.002,
+        problem_at=problem_at)
+    np.testing.assert_allclose(accelerated.power, full.power,
+                               rtol=0, atol=3e-10)
+    np.testing.assert_allclose(accelerated.mean_temperature,
+                               full.mean_temperature, rtol=0, atol=2e-9)

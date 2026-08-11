@@ -364,7 +364,30 @@ Reported phases distinguish the neutron solve, feedback/operator rebuild,
 power edit, thermal solve, telemetry transfer and final result transfer.
 `examples/hpmr_coupled_transient.py --profile` prints both dictionaries.
 
-The next major performance step is algorithmic rather than another coupling
-micro-optimization: evolve amplitude and precursors on the fine time grid but
-update the full-core spatial shape only on thermal/control events or when a
-shape-defect criterion requires it.
+The first quasi-static acceleration stage is available as an explicit advanced
+API:
+
+```python
+from ndgpu import fixed_shape_coupled_transient
+
+qs = fixed_shape_coupled_transient(
+    ctx, t_end=60.0, dt=0.2, dt_thermal=1.0,
+    problem_at=drum_frames, profile=True,
+)
+print(qs.power, qs.rho, qs.counters)
+```
+
+It reuses the converged coupled forward flux, solves one adjoint, projects each
+changed control/temperature operator, marches only the small effective
+amplitude/precursor system at `dt`, and drives conduction with the
+amplitude-scaled fixed power shape. This eliminates full-core fixed-source
+solves from the time loop. `problem_at(0)` must be physically identical to the
+base `ctx`, and callers should return cached objects between real state changes
+to avoid redundant operator rebuilds.
+
+This API is deliberately named `fixed_shape_coupled_transient`: it performs no
+shape correction and is not a production approximation for a large drum or
+rod movement. The next stage adds warm-started spatial shape re-anchoring,
+adjoint refresh/error triggers, and convergence to `coupled_transient` as the
+maximum shape interval is reduced. See
+[the quasi-static acceleration plan](quasistatic_acceleration_plan.md).

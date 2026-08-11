@@ -176,6 +176,7 @@ def test_coupled_transient_matches_the_uncoupled_one_without_feedback():
                             precond_degree=1,
                             device="cpu").solve(
                                 t_end=0.5, dt=0.05,
+                                initial_steady=coupled.steady.neutronics,
                                 linsolve_kwargs={"check_every": 4})
     np.testing.assert_allclose(coupled.power, plain.power, rtol=1e-9, atol=1e-11)
 
@@ -283,6 +284,7 @@ def test_coupled_transient_flushes_a_partial_thermal_window():
     assert r.counters["neutron_fixed_point_sweeps"] >= 6
     assert r.counters["initial_eigen_outer_iterations"] > 0
     assert r.counters["initial_eigen_inner_iterations"] > 0
+    assert r.counters["initial_state_reuses"] == 1
     # Four changed ramp states plus the feedback-driven rebuild on the sixth
     # neutron step. The final feedback update has no following step to rebuild.
     assert r.counters["operator_rebuilds"] == 5

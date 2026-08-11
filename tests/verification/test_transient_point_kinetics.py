@@ -19,7 +19,8 @@ resolved in-window, and the match tightens to a few 1e-4 (backward-Euler O(dt)).
 import numpy as np
 import pytest
 
-from ndgpu import Grid, Kinetics, Material, TransientSolver, TransientSDP1Solver
+from ndgpu import (DiffusionEigenSolver, Grid, Kinetics, Material,
+                   TransientSolver, TransientSDP1Solver)
 
 D, SIGMA_A, NU_SIGMA_F = 1.3, 0.030, 0.035
 BASE = Material(name="1g", diffusion=[D], sigma_a=[SIGMA_A], nu_sigma_f=[NU_SIGMA_F])
@@ -60,6 +61,45 @@ def test_default_step_acceleration_matches_the_documented_configuration():
     explicit = TransientSolver(GRID, prob, KIN, device="cpu").solve(
         t_end=0.02, dt=0.002, anderson_depth=5, rebalance=False).power
     np.testing.assert_allclose(default, explicit, rtol=0, atol=1e-12)
+
+
+def test_compatible_initial_steady_skips_eigen_solve_without_moving_history():
+    """A coupled equilibrium hand-off is an optimization, not new physics."""
+    steady = DiffusionEigenSolver(GRID, [BASE], device="cpu").solve(
+        tol_k=1e-8, tol_source=1e-7)
+    prob = absorption_step_problem(0.001)
+    reference = TransientSolver(GRID, prob, KIN, device="cpu").solve(
+        t_end=0.02, dt=0.002)
+
+    class NoSecondEigenSolve(DiffusionEigenSolver):
+        def solve(self, **_kw):  # pragma: no cover - failure path is the test
+            raise AssertionError("initial eigenvalue solve was not skipped")
+
+    reused = TransientSolver(
+        GRID, prob, KIN, eig_solver=NoSecondEigenSolve,
+        device="cpu").solve(t_end=0.02, dt=0.002,
+                            initial_steady=steady)
+    assert reused.initial_state_reused
+    assert not reference.initial_state_reused
+    assert reused.k0 == pytest.approx(reference.k0, abs=1e-10)
+    np.testing.assert_allclose(reused.power, reference.power, rtol=0, atol=2e-10)
+    np.testing.assert_allclose(reused.flux_numpy, reference.flux_numpy,
+                               rtol=0, atol=2e-9)
+
+
+def test_initial_steady_handoff_validates_shape_and_convergence():
+    import copy
+
+    steady = DiffusionEigenSolver(GRID, [BASE], device="cpu").solve()
+    solver = TransientSolver(GRID, lambda t: ([BASE], None), KIN, device="cpu")
+    bad = copy.copy(steady)
+    bad.converged = False
+    with pytest.raises(ValueError, match="must be converged"):
+        solver.solve(t_end=0.01, dt=0.01, initial_steady=bad)
+    bad = copy.copy(steady)
+    bad.flux = bad.flux[:, :-1]
+    with pytest.raises(ValueError, match="flux shape"):
+        solver.solve(t_end=0.01, dt=0.01, initial_steady=bad)
 
 
 def test_matches_point_kinetics_for_uniform_perturbation():

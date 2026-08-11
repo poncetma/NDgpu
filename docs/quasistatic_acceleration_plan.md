@@ -22,6 +22,33 @@ requires it.
 This is an acceleration method, not a new physics model. It must converge to
 the existing backward-Euler transient as the shape-update interval is reduced.
 
+## Implementation status (2026-08-11)
+
+Phase 0 and the fixed-shape portion of Phase 1 are now executable:
+
+- `TransientSolver.solve(initial_steady=...)` accepts a compatible eigenpair,
+  and `coupled_transient` automatically hands off its converged hot coupled
+  eigenpair instead of repeating the time-zero power iteration.
+- `project_effective_kinetics` applies the current loss/fission operator to a
+  forward anchor and projects `rho`, `Lambda`, and delayed fractions with an
+  adjoint anchor. Global and per-material kinetics are supported.
+- `integrate_point_kinetics` and `advance_point_kinetics` provide the matching
+  backward-Euler amplitude/precursor march.
+- `fixed_shape_coupled_transient` performs one initial adjoint solve, projects
+  changed control/feedback operators, keeps the fixed fission-power shape and
+  temperature on the selected device, and advances the existing conduction
+  solver at `dt_thermal` cadence.
+- CPU regression gates cover exact homogeneous projection, normalization
+  invariance, analytic absorption worth, stationary point kinetics, equality
+  with the full spatial transient for a shape-preserving insertion, stationary
+  coupled equilibrium, and initial-state reuse.
+
+The current result type reports `shape_updates == 0` intentionally. It is an
+explicit fixed-shape prototype, suitable for exact shape-preserving cases and
+small-perturbation experiments—not yet the production path for a large black
+absorber movement. Phase 2 starts with warm-started forward re-anchoring,
+continuity at shape updates, and interval refinement against 2-D HP-MR ramps.
+
 ## Mathematical split
 
 Write the multigroup flux as

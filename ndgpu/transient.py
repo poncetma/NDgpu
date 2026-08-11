@@ -154,6 +154,9 @@ class TransientResult:
     # Fixed-point (fission source) iterations per time step -- the transient's
     # outer convergence telemetry, per the benchmark protocol.
     step_iterations: list = field(default_factory=list)
+    # True when the caller supplied the compatible time-zero eigenpair instead
+    # of asking this solve to repeat the initial critical calculation.
+    initial_state_reused: bool = False
 
     @property
     def flux_numpy(self) -> np.ndarray:
@@ -302,6 +305,7 @@ class TransientSolver:
               max_sweeps: int = 200, anderson_depth: int = 5,
               scatter_subsweeps: int | None = None,
               steady_kwargs: dict | None = None,
+              initial_steady: Result | None = None,
               rebalance: bool = False,
               linsolve_kwargs: dict | None = None,
               verbose: bool = False) -> TransientResult:
@@ -379,6 +383,13 @@ class TransientSolver:
             the C5G7-TD and TWIGL validations, which have not been re-measured;
             the HP-MR benchmark harness passes 6 explicitly. Raising the default
             is the right change once those are checked.
+        initial_steady : optional compatible time-zero diffusion eigenpair.
+            Supplying it skips the repeated eigenvalue solve and starts from
+            its flux and k_eff. The caller owns physical compatibility: it must
+            have been solved on this grid with ``problem_at(0)`` and the same
+            state-dependent cross sections. Shape, group count, convergence,
+            and finiteness are validated here. This is primarily the hand-off
+            from a just-converged coupled hot equilibrium.
         """
         xp, kin = self.xp, self.kinetics
         beta, lam = kin.beta, kin.decay
@@ -416,8 +427,26 @@ class TransientSolver:
                 if table.ndim == 2 and len(table) != n_mats:
                     raise ValueError(f"per-material kinetics.{name} must have one "
                                      f"row per entry of the materials list")
-            steady = eig.solve(
-                **(steady_kwargs or dict(tol_k=1e-8, tol_source=1e-7)))
+            if initial_steady is None:
+                steady = eig.solve(
+                    **(steady_kwargs or dict(tol_k=1e-8, tol_source=1e-7)))
+            else:
+                if not isinstance(initial_steady, Result):
+                    raise TypeError("initial_steady must be a solver Result")
+                if not initial_steady.converged:
+                    raise ValueError("initial_steady must be converged")
+                if (not np.isfinite(initial_steady.k_eff)
+                        or initial_steady.k_eff <= 0.0):
+                    raise ValueError("initial_steady.k_eff must be finite and positive")
+                initial_flux = xp.asarray(initial_steady.flux, dtype=self.dtype)
+                expected = (G,) + tuple(self.grid.shape)
+                if initial_flux.shape != expected:
+                    raise ValueError(
+                        f"initial_steady flux shape {initial_flux.shape} != {expected}")
+                if not bool(xp.all(xp.isfinite(initial_flux))):
+                    raise ValueError("initial_steady flux must be finite")
+                steady = copy.copy(initial_steady)
+                steady.flux = initial_flux.copy()
         if not steady.converged:
             raise RuntimeError(f"initial steady state did not converge: {steady}")
         k0 = steady.k_eff
@@ -804,6 +833,7 @@ class TransientSolver:
             precursors=xp.stack(C),
             total_inner_iterations=inner_total,
             step_iterations=step_its,
+            initial_state_reused=initial_steady is not None,
             solve_seconds=time.perf_counter() - t0,
             device=self.device,
         )

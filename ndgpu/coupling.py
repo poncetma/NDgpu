@@ -638,6 +638,11 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
     else:
         step_kwargs = dict(rebalance=False)
     step_kwargs.update(transient_kwargs or {})
+    # The coupled fixed point has already paid for a converged hot eigenpair.
+    # Hand it to the transient initializer instead of immediately solving the
+    # same time-zero problem again. Callers can still override this explicitly
+    # through transient_kwargs for a compatibility/convergence experiment.
+    step_kwargs.setdefault("initial_steady", steady.neutronics)
     lin_kw = dict(step_kwargs.get("linsolve_kwargs") or {})
     lin_kw.setdefault("check_every", check_every)
     step_kwargs["linsolve_kwargs"] = lin_kw
@@ -655,6 +660,7 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
         res.steady.outer_iterations
     profiler.counters["initial_eigen_inner_iterations"] = \
         res.steady.inner_iterations
+    profiler.counters["initial_state_reuses"] = int(res.initial_state_reused)
     profiler.counters["neutron_inner_iterations"] = res.total_inner_iterations
     profiler.counters["neutron_fixed_point_sweeps"] = sum(res.step_iterations)
     phase_seconds = profiler.seconds()
