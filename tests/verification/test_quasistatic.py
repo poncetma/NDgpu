@@ -7,7 +7,7 @@ from ndgpu import (DiffusionEigenSolver, EffectiveKinetics, Grid, Kinetics,
                    Material, ThermalFeedback, ThermalMaterial, TransientSolver,
                    equilibrium_precursors, fixed_shape_coupled_transient,
                    integrate_point_kinetics, project_effective_kinetics,
-                   quasistatic_coupled_transient)
+                   projected_shape_residual, quasistatic_coupled_transient)
 from ndgpu.coupling import CoupledSolver, CouplingContext, coupled_transient
 
 
@@ -27,6 +27,22 @@ def coupled_context():
     return CouplingContext(
         grid=GRID, materials=[BASE], material_map=material_map,
         thermal_materials=[thermal], feedback=feedback, total_power=120.0,
+        bc="reflective", thermal_bc="adiabatic", device="cpu",
+        kinetics=KIN, solver_cls=DiffusionEigenSolver,
+        eigen_kwargs={"tol_k": 1e-11, "tol_source": 1e-11})
+
+
+def localized_context():
+    other = Material(name="second fuel", diffusion=[D], sigma_a=[SA],
+                     nu_sigma_f=[NF])
+    material_map = np.zeros(GRID.shape, dtype=np.int32)
+    feedback = ThermalFeedback(t_ref=[600.0, 600.0], doppler=[0.0, 0.0])
+    thermal = [ThermalMaterial(
+        conductivity=0.2, sink_coeff=0.04, sink_temperature=600.0,
+        heat_capacity=2.0, name=f"fuel {i}") for i in range(2)]
+    return CouplingContext(
+        grid=GRID, materials=[BASE, other], material_map=material_map,
+        thermal_materials=thermal, feedback=feedback, total_power=120.0,
         bc="reflective", thermal_bc="adiabatic", device="cpu",
         kinetics=KIN, solver_cls=DiffusionEigenSolver,
         eigen_kwargs={"tol_k": 1e-11, "tol_source": 1e-11})
@@ -58,6 +74,19 @@ def test_projection_is_invariant_to_forward_and_adjoint_normalization():
     assert b.rho == pytest.approx(a.rho, abs=2e-14)
     assert b.generation_time == pytest.approx(a.generation_time, rel=2e-13)
     np.testing.assert_allclose(b.beta, a.beta, rtol=2e-13)
+
+
+def test_projected_shape_residual_removes_only_the_amplitude_mode():
+    ref, forward, adjoint = shapes()
+    assert projected_shape_residual(ref, forward, adjoint) < 2e-13
+    local = Material(name="local absorber", diffusion=[D],
+                     sigma_a=[SA * 1.02], nu_sigma_f=[NF])
+    mmap = np.zeros(GRID.shape, dtype=np.int32)
+    mmap[:2] = 1
+    current = DiffusionEigenSolver(
+        GRID, [BASE, local], mmap, bc="reflective", device="cpu")
+    residual = projected_shape_residual(current, forward, adjoint.flux)
+    assert residual > 1e-3
 
 
 def test_local_rayleigh_projection_recovers_uniform_absorption_worth():
@@ -173,7 +202,8 @@ def test_adiabatic_shape_updates_preserve_exact_uniform_solution():
         problem_at=problem_at)
     adiabatic = quasistatic_coupled_transient(
         coupled_context(), t_end=0.02, dt=2e-4, dt_thermal=0.002,
-        shape_dt=0.005, adjoint_every=2, problem_at=problem_at)
+        shape_dt=0.005, adjoint_every=2, shape_method="adiabatic",
+        problem_at=problem_at)
     np.testing.assert_allclose(adiabatic.power, fixed.power,
                                rtol=0, atol=3e-11)
     assert adiabatic.counters["shape_updates"] == 4
@@ -201,7 +231,11 @@ def test_adiabatic_quasistatic_tracks_reduced_hpmr_drum_ramp():
     qs = quasistatic_coupled_transient(
         build_hpmr_coupling(problem), t_end=0.5, dt=0.05,
         dt_thermal=0.1, shape_dt=0.1, adjoint_every=2,
-        problem_at=problem_at)
+        shape_method="adiabatic", problem_at=problem_at)
+    iqs = quasistatic_coupled_transient(
+        build_hpmr_coupling(problem), t_end=0.5, dt=0.05,
+        dt_thermal=0.1, shape_dt=0.1, adjoint_every=2,
+        shape_method="iqs", problem_at=problem_at)
 
     power_error = np.max(np.abs(qs.power - full.power) / full.power)
     assert power_error < 5e-3, (power_error, full.power, qs.power)
@@ -209,3 +243,89 @@ def test_adiabatic_quasistatic_tracks_reduced_hpmr_drum_ramp():
     assert qs.counters["shape_updates"] == 5
     assert qs.counters["forward_shape_solves"] == 5
     assert qs.counters["adjoint_eigen_solves"] == 3
+    iqs_power_error = np.max(np.abs(iqs.power - full.power) / full.power)
+    assert iqs_power_error < 5e-3, (iqs_power_error, full.power, iqs.power)
+    assert abs(iqs.mean_temperature[-1] - full.mean_temperature[-1]) < 0.02
+    assert iqs.counters["iqs_shape_solves"] == 5
+
+
+def test_residual_trigger_falls_back_to_full_diffusion_interval():
+    perturbed = Material(
+        name="local absorber", diffusion=[D], sigma_a=[SA * 1.02],
+        nu_sigma_f=[NF])
+    base_map = np.zeros(GRID.shape, dtype=np.int32)
+    changed_map = base_map.copy()
+    changed_map[:2] = 1
+    base_state = ([BASE, BASE], base_map)
+    changed_state = ([BASE, perturbed], changed_map)
+
+    def problem_at(t):
+        return base_state if t <= 0.0 else changed_state
+
+    full = coupled_transient(
+        localized_context(), t_end=0.002, dt=0.002,
+        dt_thermal=0.002, problem_at=problem_at)
+    guarded = quasistatic_coupled_transient(
+        localized_context(), t_end=0.002, dt=0.002,
+        dt_thermal=0.002, shape_dt=1.0, problem_at=problem_at,
+        residual_tol=1e-8, fallback_residual=1e-6)
+    assert guarded.counters["full_diffusion_fallbacks"] == 1
+    assert guarded.shape_update_reasons == ["full_diffusion_fallback"]
+    np.testing.assert_allclose(guarded.fallback_times, [0.002])
+    np.testing.assert_allclose(guarded.power, full.power,
+                               rtol=0, atol=2e-10)
+
+
+def test_iqs_time_dependent_shape_is_closer_than_instantaneous_eigen_shape():
+    perturbed = Material(
+        name="local absorber", diffusion=[D], sigma_a=[SA * 1.02],
+        nu_sigma_f=[NF])
+    base_map = np.zeros(GRID.shape, dtype=np.int32)
+    changed_map = base_map.copy()
+    changed_map[:2] = 1
+    base_state = ([BASE, BASE], base_map)
+    changed_state = ([BASE, perturbed], changed_map)
+
+    def problem_at(t):
+        return base_state if t <= 0.0 else changed_state
+
+    options = dict(t_end=0.02, dt=0.002, dt_thermal=0.01,
+                   problem_at=problem_at)
+    full = coupled_transient(localized_context(), **options)
+    adiabatic = quasistatic_coupled_transient(
+        localized_context(), shape_dt=0.01,
+        shape_method="adiabatic", **options)
+    iqs = quasistatic_coupled_transient(
+        localized_context(), shape_dt=0.01, shape_method="iqs", **options)
+
+    reference = np.asarray(full.flux).ravel()
+    reference /= np.linalg.norm(reference)
+
+    def error(result):
+        shape = np.asarray(result.flux).ravel()
+        shape /= np.linalg.norm(shape)
+        return np.linalg.norm(shape - reference)
+
+    assert error(iqs) < error(adiabatic)
+    assert iqs.counters["iqs_shape_solves"] == 2
+    assert iqs.counters["iqs_predictor_checks"] == 2
+    assert np.all(np.isfinite(iqs.spatial_precursors))
+    assert np.all(iqs.effective_precursors >= 0.0)
+
+
+def test_residual_trigger_forces_early_iqs_correction():
+    perturbed = Material(
+        name="local absorber", diffusion=[D], sigma_a=[SA * 1.02],
+        nu_sigma_f=[NF])
+    base_map = np.zeros(GRID.shape, dtype=np.int32)
+    changed_map = base_map.copy()
+    changed_map[:2] = 1
+    states = (([BASE, BASE], base_map), ([BASE, perturbed], changed_map))
+    result = quasistatic_coupled_transient(
+        localized_context(), t_end=0.004, dt=0.002, dt_thermal=0.004,
+        shape_dt=1.0, shape_on_final=False, residual_tol=1e-6,
+        problem_at=lambda t: states[0] if t <= 0.0 else states[1])
+    assert result.shape_update_reasons == ["residual"]
+    np.testing.assert_allclose(result.shape_update_times, [0.002])
+    assert result.counters["iqs_shape_solves"] == 1
+    assert result.counters["full_diffusion_fallbacks"] == 0

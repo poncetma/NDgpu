@@ -24,7 +24,7 @@ the existing backward-Euler transient as the shape-update interval is reduced.
 
 ## Implementation status (2026-08-11)
 
-Phase 0, Phase 1, and the periodic adiabatic core of Phase 2 are now executable:
+Phases 0-3, including the guarded time-dependent IQS core, are now executable:
 
 - `TransientSolver.solve(initial_steady=...)` accepts a compatible eigenpair,
   and `coupled_transient` automatically hands off its converged hot coupled
@@ -42,18 +42,27 @@ Phase 0, Phase 1, and the periodic adiabatic core of Phase 2 are now executable:
   shapes, configurable adjoint refresh, device-resident normalized power-shape
   replacement, and shape-update timing/counters. `TriReactor` exposes the same
   workflow as `quasistatic_transient(...)`.
+- The default IQS method advances a coarse implicit time-dependent spatial
+  shape, carries normalized spatial precursor fields across macro intervals,
+  removes the corrector's amplitude mode, and projects the corrected precursor
+  history back into the point-amplitude coordinates.
+- `projected_shape_residual` removes the adjoint amplitude component. A soft
+  threshold forces early IQS correction; a hard threshold advances that fine
+  interval with the full spatial diffusion equations and adopts its flux and
+  precursor state.
 - CPU regression gates cover exact homogeneous projection, normalization
   invariance, analytic absorption worth, stationary point kinetics, equality
   with the full spatial transient for a shape-preserving insertion, stationary
-  coupled equilibrium, initial-state reuse, shape/adjoint cadence, and a
-  reduced HP-MR coupled drum ramp against the full diffusion transient.
+  coupled equilibrium, initial-state/precursor reuse, shape/adjoint cadence,
+  IQS shape improvement, residual/fallback behavior, and a reduced HP-MR
+  coupled drum ramp against the full diffusion transient.
 
 The fixed-shape entry point still reports `shape_updates == 0` intentionally.
-The adiabatic entry point performs scheduled updates and maintains amplitude
-and total-power continuity. It is suitable for slow control motion, but it is
-not yet the final production path for rapid black-absorber movement: adaptive
-residual triggers, full-step fallback, interval-convergence studies, and the
-IQS transient shape equation remain.
+The adiabatic option performs scheduled eigen updates; IQS is now the default.
+The remaining production work is threshold calibration on the one-minute 3-D
+case, interval-convergence studies, GPU projection fusion, and multi-interval
+fallback replay when thermal feedback changes substantially inside a rejected
+macro interval.
 
 ## Mathematical split
 

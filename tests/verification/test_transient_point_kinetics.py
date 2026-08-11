@@ -102,6 +102,36 @@ def test_initial_steady_handoff_validates_shape_and_convergence():
         solver.solve(t_end=0.01, dt=0.01, initial_steady=bad)
 
 
+def test_spatial_precursor_handoff_restarts_without_losing_history():
+    import copy
+
+    eps = 0.001
+    perturbed = Material(
+        name="perturbed", diffusion=[D],
+        sigma_a=[SIGMA_A - eps * NU_SIGMA_F],
+        nu_sigma_f=[NU_SIGMA_F])
+    problem = lambda t: ([BASE] if t <= 0.0 else [perturbed], None)
+    full = TransientSolver(GRID, problem, KIN, device="cpu").solve(
+        t_end=0.02, dt=0.002)
+    first = TransientSolver(GRID, problem, KIN, device="cpu").solve(
+        t_end=0.01, dt=0.002)
+
+    restart = copy.copy(first.steady)
+    restart.k_eff = first.k0
+    restart.flux = first.flux / first.power[-1]
+    second = TransientSolver(
+        GRID, lambda _t: ([perturbed], None), KIN,
+        device="cpu").solve(
+            t_end=0.01, dt=0.002, initial_steady=restart,
+            initial_precursors=first.precursors / first.power[-1])
+    joined_power = np.concatenate(
+        (first.power, first.power[-1] * second.power[1:]))
+    np.testing.assert_allclose(joined_power, full.power, rtol=0, atol=3e-12)
+    np.testing.assert_allclose(
+        first.power[-1] * second.flux_numpy, full.flux_numpy,
+        rtol=0, atol=3e-11)
+
+
 def test_matches_point_kinetics_for_uniform_perturbation():
     from scipy.integrate import solve_ivp
 

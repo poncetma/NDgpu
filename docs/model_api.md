@@ -302,7 +302,8 @@ run = core.coupled_transient(t_end=10, dt=0.05, dt_thermal=0.5,
                              device="gpu", profile=True)
 qs = core.quasistatic_transient(
     t_end=60, dt=0.2, dt_thermal=1.0, shape_dt=2.0,
-    adjoint_every=5, device="gpu", state_at=control_state, profile=True)
+    adjoint_every=5, residual_tol=2e-3, fallback_residual=1e-2,
+    device="gpu", state_at=control_state, profile=True)
 ```
 
 `total_power` is the power in the modeled domain. For a full 3-D core this is
@@ -314,12 +315,12 @@ For moving controls, prebuild a small set of same-shaped `TriReactor` frames and
 pass `state_at(t)` returning a cached frame. `problem_at=` remains available for
 the raw four-array callback used by low-level code.
 
-`quasistatic_transient` uses those cached frames in an adiabatic quasi-static
-solve: the amplitude and delayed families advance at `dt`, while forward flux
-shapes are warm-started at `shape_dt` and adjoints at `adjoint_every` shape
-updates. Its result adds shape-update times/reasons and anchor eigenvalues. Use
-the full coupled transient for rapid localized control motion until IQS
-residual control and fallback are implemented.
+`quasistatic_transient` uses those cached frames in a time-dependent IQS solve:
+the amplitude advances at `dt`, while spatial shape and precursor history are
+corrected at `shape_dt`. Adjoint-weighted residual thresholds can force an
+early correction or full-diffusion fine-interval fallback. Its result adds
+shape, residual, fallback, predictor-error, and iteration telemetry.
+`shape_method="adiabatic"` selects instantaneous eigen shapes instead.
 
 ### Control drums
 

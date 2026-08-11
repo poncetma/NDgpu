@@ -2,7 +2,8 @@
 
     python examples/hpmr_coupled_transient.py [--refine 6] [--groups 11]
         [--t-end 120] [--dt 0.05] [--dt-thermal 0.5] [--device auto] [--nz 0]
-        [--quasistatic-shape-dt 2.0] [--adjoint-every 5]
+        [--quasistatic-shape-dt 2.0] [--shape-method iqs]
+        [--adjoint-every 5]
 
 Starts from the converged coupled steady state at rated power, withdraws the
 control drums a few degrees over a few seconds, and marches both physics
@@ -25,8 +26,9 @@ or hours. See ``notebooks/colab_hpmr_coupled_transient.ipynb``.
 
 With ``--quasistatic-shape-dt``, amplitude and precursors still advance at
 ``--dt`` but the expensive spatial diffusion shape is corrected only at the
-requested cadence. This adiabatic mode is intended for slow drum ramps; omit
-the option to retain the full transient-diffusion reference treatment.
+requested cadence. IQS retains the time derivative and spatial precursor
+history; ``--shape-method adiabatic`` selects instantaneous eigen shapes.
+Omit the quasi-static option to retain the full transient-diffusion reference.
 """
 
 import argparse
@@ -71,6 +73,12 @@ ap.add_argument("--quasistatic-shape-dt", type=float, default=None,
                      "spatial shape at this cadence in seconds")
 ap.add_argument("--adjoint-every", type=int, default=1,
                 help="quasi-static adjoint refresh cadence in shape updates")
+ap.add_argument("--shape-method", choices=("iqs", "adiabatic"), default="iqs",
+                help="time-dependent IQS (default) or instantaneous eigen shape")
+ap.add_argument("--residual-tol", type=float, default=None,
+                help="force an early shape update above this projected defect")
+ap.add_argument("--fallback-residual", type=float, default=None,
+                help="use full diffusion for an interval above this defect")
 ap.add_argument("--quiet", action="store_true")
 args = ap.parse_args()
 
@@ -128,8 +136,11 @@ else:
         ctx, t_end=args.t_end, dt=args.dt,
         dt_thermal=args.dt_thermal, problem_at=problem_at,
         shape_dt=args.quasistatic_shape_dt,
-        adjoint_every=args.adjoint_every, profile=args.profile)
-    mode = (f"adiabatic quasi-static, shape dt "
+        adjoint_every=args.adjoint_every, shape_method=args.shape_method,
+        residual_tol=args.residual_tol,
+        fallback_residual=args.fallback_residual,
+        profile=args.profile)
+    mode = (f"{args.shape_method} quasi-static, shape dt "
             f"{args.quasistatic_shape_dt:g} s")
 wall = time.perf_counter() - t0
 
@@ -150,8 +161,10 @@ print(f"  {'transient':<32}: {wall:.1f} s  ({res.steps:,} steps, "
       f"{1000 * wall / max(res.steps, 1):.1f} ms/step)")
 print(f"  {'device':<32}: {res.device}")
 if args.quasistatic_shape_dt is not None:
+    shape_solves = res.counters["iqs_shape_solves" if args.shape_method == "iqs"
+                               else "forward_shape_solves"]
     print(f"  {'shape / adjoint solves':<32}: "
-          f"{res.counters['forward_shape_solves']} / "
+          f"{shape_solves} / "
           f"{res.counters['adjoint_eigen_solves']}")
 if res.phase_seconds:
     print("\n  transient phase timings (overlap-free CUDA events on GPU):")

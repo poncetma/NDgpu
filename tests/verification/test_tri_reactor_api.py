@@ -130,7 +130,7 @@ def test_custom_reactor_runs_coupled_transient_without_benchmark_helpers():
         device="cpu", profile=True)
     np.testing.assert_allclose(qs.power, 1.0, atol=2e-8)
     assert qs.counters["shape_updates"] == 1
-    assert qs.counters["forward_shape_solves"] == 1
+    assert qs.counters["iqs_shape_solves"] == 1
     assert np.all(np.isfinite(qs.temperature))
 
 

@@ -967,12 +967,13 @@ class TriReactor:
     def quasistatic_transient(self, t_end, dt, *, shape_dt=2.0,
                               device="auto", problem_at=None, state_at=None,
                               **kwargs):
-        """Run an adiabatic quasi-static coupled transient.
+        """Run an improved quasi-static coupled transient.
 
         Amplitude/precursors advance every ``dt`` while the full spatial shape
-        is warm-started every ``shape_dt``. This targets slow drum/rod motion
-        and long thermal follow-through; use :meth:`coupled_transient` for a
-        rapid localized event until the IQS shape corrector is available.
+        is corrected every ``shape_dt``. Time-dependent IQS is the default;
+        ``shape_method="adiabatic"`` selects instantaneous eigen shapes.
+        Residual thresholds can force early corrections or full-diffusion
+        fallback intervals for rapid localized motion.
         """
         from .quasistatic import quasistatic_coupled_transient
 

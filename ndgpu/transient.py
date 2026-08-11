@@ -306,6 +306,7 @@ class TransientSolver:
               scatter_subsweeps: int | None = None,
               steady_kwargs: dict | None = None,
               initial_steady: Result | None = None,
+              initial_precursors=None,
               rebalance: bool = False,
               linsolve_kwargs: dict | None = None,
               verbose: bool = False) -> TransientResult:
@@ -390,6 +391,12 @@ class TransientSolver:
             state-dependent cross sections. Shape, group count, convergence,
             and finiteness are validated here. This is primarily the hand-off
             from a just-converged coupled hot equilibrium.
+        initial_precursors : optional normalized spatial precursor fields,
+            shape ``(n_families, *grid.shape)``. These must use the same
+            normalization as ``initial_steady.flux`` after its fission source
+            is normalized to ``P(0)=1``. Supplying them carries delayed-source
+            history across an IQS macro interval; omitting them initializes the
+            critical equilibrium fields.
         """
         xp, kin = self.xp, self.kinetics
         beta, lam = kin.beta, kin.decay
@@ -512,7 +519,20 @@ class TransientSolver:
         for g in range(G):
             phi[g] *= scale
         S = S * scale
-        C = [(beta[i] / lam[i]) * S for i in range(kin.n_families)]  # equilibrium
+        if initial_precursors is None:
+            C = [(beta[i] / lam[i]) * S
+                 for i in range(kin.n_families)]  # equilibrium
+        else:
+            supplied = xp.asarray(initial_precursors, dtype=self.dtype)
+            expected = (kin.n_families,) + tuple(self.grid.shape)
+            if supplied.shape != expected:
+                raise ValueError(
+                    f"initial_precursors shape {supplied.shape} != {expected}")
+            if not bool(xp.all(xp.isfinite(supplied))):
+                raise ValueError("initial_precursors must be finite")
+            if bool(xp.any(supplied < 0.0)):
+                raise ValueError("initial_precursors must be non-negative")
+            C = [supplied[i].copy() for i in range(kin.n_families)]
 
         chi_d2 = kin.chi_delayed if (kin.chi_delayed is not None
                                      and kin.chi_delayed.ndim == 2) else None

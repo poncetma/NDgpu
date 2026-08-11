@@ -377,9 +377,10 @@ qs = fixed_shape_coupled_transient(
 )
 print(qs.power, qs.rho, qs.counters)
 
-adiabatic = quasistatic_coupled_transient(
+iqs = quasistatic_coupled_transient(
     ctx, t_end=60.0, dt=0.2, dt_thermal=1.0,
     shape_dt=2.0, adjoint_every=5,
+    residual_tol=2e-3, fallback_residual=1e-2,
     problem_at=drum_frames, profile=True,
 )
 ```
@@ -394,10 +395,16 @@ to avoid redundant operator rebuilds.
 
 `fixed_shape_coupled_transient` performs no shape correction and is not an
 appropriate approximation for a large drum or rod movement.
-`quasistatic_coupled_transient` adds periodic warm-started forward shape solves,
-configurable adjoint refresh, normalized power-shape replacement, and complete
-shape timing/counters. It is the intended path for slow HP-MR drum ramps and
-long thermal holds. The remaining production work is an IQS transient shape
-equation, residual-triggered updates, and automatic fallback for rapid or large
-localized changes. See
+`quasistatic_coupled_transient` defaults to a time-dependent IQS macro
+corrector. It carries normalized spatial precursor fields, removes the
+corrector's global amplitude mode, projects them back into the effective
+amplitude system, and replaces the normalized device power shape. Set
+`shape_method="adiabatic"` for periodic eigen shapes instead.
+
+`residual_tol` measures the current loss/fission shape defect after projecting
+out the adjoint amplitude mode and forces an early correction.
+`fallback_residual` is the hard guard: that fine interval is advanced with the
+full spatial diffusion equations and its precursor history replaces the IQS
+state. Results record residual/fallback times, reasons, predictor disagreement,
+iterations, and phase timings. See
 [the quasi-static acceleration plan](quasistatic_acceleration_plan.md).

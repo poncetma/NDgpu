@@ -369,6 +369,7 @@ coupled = core.coupled_transient(
 qs = core.quasistatic_transient(
     t_end=60.0, dt=0.2, dt_thermal=1.0, shape_dt=2.0,
     adjoint_every=5, device="gpu", state_at=control_state, profile=True,
+    residual_tol=2e-3, fallback_residual=1e-2,
 )
 ```
 
@@ -392,13 +393,14 @@ coupled.phase_seconds            # populated by profile=True
 coupled.counters                 # steps, iterations, rebuilds, transfers
 ```
 
-`quasistatic_transient` is the adiabatic quasi-static treatment for slow
-drum/rod ramps. It projects cached control frames and thermal feedback between
-warm-started forward shape solves, maintains total-power continuity when the
-shape changes, and records `shape_update_times`, `shape_update_reasons`, and
-`shape_k_eff`. It is not yet an IQS shape equation: use the full
-`coupled_transient` path for rapid localized changes until the transient shape
-corrector and automatic residual fallback are available.
+`quasistatic_transient` defaults to time-dependent IQS treatment. It carries
+spatial precursor history through each macro shape solve, removes the
+corrector's amplitude component, maintains total-power continuity, and records
+shape/residual/fallback histories. `residual_tol` forces an early correction;
+`fallback_residual` advances an unsafe fine interval with the full diffusion
+equations. Use `shape_method="adiabatic"` to select instantaneous eigen shapes.
+Thresholds are model- and mesh-dependent: establish them against a shorter
+full-diffusion reference before relying on them for a long production run.
 
 Useful performance controls are `precond_degree`, `check_every`,
 `thermal_precond_degree`, `thermal_check_every`, and
