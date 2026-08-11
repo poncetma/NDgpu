@@ -27,6 +27,8 @@ changes it), then applied everywhere that type appears.
 
 from __future__ import annotations
 
+from .backend import asnumpy
+from .power import power_density
 import numpy as np
 
 
@@ -64,31 +66,13 @@ def sample_power_shape(raster, flux, materials, material_map, points,
     smooth shape the reconstruction rides on, and it varies WITHIN an assembly
     because the core mesh resolves sub-assembly detail.
     """
-    flux = np.asarray(flux)
-    G = flux.shape[0]
-    mm = np.asarray(material_map)
-    # kappa*Sigma_f, not nu*Sigma_f -- see pin_powers. Power lives only in the
-    # fuel (both vanish elsewhere); the difference is the group weighting.
-    key = ("kappa_fission" if any(getattr(m, "kappa_fission", None) is not None
-                                  for m in materials) else "nu_sigma_f")
-
-    def _xs(m, g):
-        v = getattr(m, key, None)
-        return np.atleast_1d(m.nu_sigma_f if v is None else v)[g]
-
-    nsf = np.stack([np.array([_xs(m, g) for m in materials])[mm]
-                    for g in range(G)])
-    if mix_material is not None:
-        mmix = np.asarray(mix_material)
-        w = np.asarray(mix_weight)
-        has = mmix >= 0
-        for g in range(G):
-            part = np.array([_xs(m, g)
-                             for m in materials])[np.maximum(mmix, 0)]
-            nsf[g] = np.where(has, (1.0 - w) * nsf[g] + w * part, nsf[g])
-    dens = (nsf * flux).sum(axis=0)
-    if active is not None:
-        dens = np.where(np.asarray(active).astype(bool), dens, 0.0)
+    # kappa*Sigma_f, not nu*Sigma_f -- see ndgpu.power.fission_energy_xs. Power
+    # lives only in the fuel (both vanish elsewhere); the difference is the
+    # group weighting. Unnormalized: this is a shape, and it is the caller's
+    # form-function normalization that fixes the scale.
+    dens = power_density(flux, materials, material_map,
+                         mix_material=mix_material, mix_weight=mix_weight,
+                         active=active)
 
     cen = tri_cell_centroids(raster).reshape(-1, 2)
     val = dens.reshape(-1)

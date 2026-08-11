@@ -36,7 +36,9 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .backend import asnumpy, device_name, get_backend, synchronize
+from .blend import MaterialBlend
 from .grid import Grid
+from . import kernels
 from .linalg import get_linear_solver, neumann_preconditioner, pcg
 from .materials import Material
 from .sp3 import SP3GroupOperator
@@ -99,16 +101,50 @@ class Result:
         )
 
 
+def scatter_stack(xp, sigma_s, G, adjoint, shape, dtype):
+    """Dense (G, G, \\*shape) in-scatter matrix: ``S[g][gf]`` is the g' -> g
+    coupling, diagonal zeroed and absent couplings materialized as zeros.
+
+    Forward that is ``sigma_s[gf][g]``; the adjoint transposes to
+    ``sigma_s[g][gf]``. Kept a module-level function so the transpose -- the
+    part that a batched rewrite can silently get backwards, and that only the
+    adjoint solves would notice -- is testable without a GPU.
+    """
+    S = xp.zeros((G, G) + tuple(shape), dtype=dtype)
+    for g in range(G):
+        for gf in range(G):
+            sc = sigma_s[g][gf] if adjoint else sigma_s[gf][g]
+            if gf != g and sc is not None:
+                S[g, gf] = sc
+    return S
+
+
 class Fields:
     """Per-cell, per-group cross-section fields on the solve device.
 
     Attributes (lists of (nx, ny, nz) device arrays, length G, except
     sigma_s which is a G x G nested list with None for empty couplings):
-    nu_sigma_f, chi, removal, diffusion, sigma_t, sigma_s.
+    nu_sigma_f, chi, removal, diffusion, sigma_t, sigma_a, sigma_s.
+
+    ``xs_update`` is an optional callable ``fields -> None`` run as the LAST
+    step of construction, free to modify the assembled per-cell arrays in
+    place. It is the seam for state-dependent cross sections -- a temperature
+    feedback is one (see :mod:`ndgpu.feedback`) -- expressed per CELL, which is
+    something a per-material table cannot represent.
+
+    Two consequences worth knowing before using it:
+
+    * Operators COPY these arrays when they are built, so mutating a
+      ``Fields`` after its solver exists changes nothing. A driver that varies
+      the state must rebuild the solver (cheap: ~0.1% of a solve).
+    * ``TransientSolver`` rebuilds its fields only when ``problem_at(t)``
+      returns different *objects* (an identity check), so a hook that depends
+      on state rather than on t would silently freeze at t = 0. Feeding a
+      transient back needs that trigger widened first.
     """
 
     def __init__(self, xp, grid, materials, material_map, dtype,
-                 mix_material=None, mix_weight=None):
+                 mix_material=None, mix_weight=None, xs_update=None):
         mats = [materials] if isinstance(materials, Material) else list(materials)
         G = mats[0].n_groups
         if any(m.n_groups != G for m in mats):
@@ -129,42 +165,16 @@ class Fields:
         # blends by fission-production share (see below). Non-blended cells
         # stay bit-identical to the pure-index map.
         mix = mix_material is not None
-        if material_map is None:
-            if len(mats) > 1:
-                raise ValueError("material_map is required with multiple materials")
-            if mix:
-                raise ValueError("mixing requires an explicit material_map")
-            lin = lambda table: xp.full(grid.shape, float(table[0]), dtype=dtype)
-            harm = lin
-        else:
-            mmap = xp.asarray(np.asarray(material_map))
-            if mmap.shape != grid.shape:
-                raise ValueError(f"material_map shape {mmap.shape} != grid shape {grid.shape}")
-            if int(mmap.min()) < 0 or int(mmap.max()) >= len(mats):
-                raise ValueError("material_map indexes outside the materials list")
-            if mix:
-                mm2 = xp.asarray(np.asarray(mix_material))
-                w = xp.asarray(np.asarray(mix_weight), dtype=dtype)
-                if mm2.shape != grid.shape or w.shape != grid.shape:
-                    raise ValueError("mix_material/mix_weight shape must match grid")
-                if int(mm2.max()) >= len(mats):
-                    raise ValueError("mix_material indexes outside the materials list")
-                active_mix = mm2 >= 0
-                mm2c = xp.where(active_mix, mm2, 0)
-
-            def blend(table, combine):
-                dev = xp.asarray(table, dtype=dtype)
-                base = dev[mmap]
-                if mix:
-                    base = xp.where(active_mix, combine(base, dev[mm2c], w), base)
-                return base
-
-            lin = lambda table: blend(table, lambda b, o, wt: (1.0 - wt) * b + wt * o)
-            harm = lambda table: blend(table, lambda b, o, wt: 1.0 / ((1.0 - wt) / b + wt / o))
+        blend = MaterialBlend(xp, grid.shape, material_map, len(mats),
+                              dtype=dtype, mix_material=mix_material,
+                              mix_weight=mix_weight)
+        self.blend = blend
+        lin, harm = blend.linear, blend.harmonic
 
         # Per-cell lookup of an arbitrary per-material table (linear blend on
         # mixed cells) -- also used by the transient solver to map per-material
-        # kinetics data (1/v, beta) onto the grid.
+        # kinetics data (1/v, beta) onto the grid, and by the thermal solver to
+        # map conductivities onto the same cells under the same rules.
         self.map_table = lin
 
         def per_group(attr, lookup=None):
@@ -184,18 +194,7 @@ class Fields:
         # spectrum (it multiplies a zero source).
         if mix:
             prod = np.array([np.sum(m.nu_sigma_f) for m in mats])
-            pdev = xp.asarray(prod, dtype=dtype)
-            wb = (1.0 - w) * pdev[mmap]
-            wo = w * pdev[mm2c]
-            den = wb + wo
-            blendable = active_mix & (den > 0)
-            safe_den = xp.where(den > 0, den, 1.0)
-
-            def fission_weighted(table):
-                dev = xp.asarray(table, dtype=dtype)
-                base = dev[mmap]
-                merged = (wb * base + wo * dev[mm2c]) / safe_den
-                return xp.where(blendable, merged, base)
+            fission_weighted = lambda table: blend.fission_weighted(table, prod)
         else:
             fission_weighted = lin
         # Per-cell lookup of a per-material quantity that rides on the fission
@@ -206,6 +205,10 @@ class Fields:
 
         chi_t = np.array([m.chi for m in mats])  # (M, G)
         self.chi = [fission_weighted(chi_t[:, g]) for g in range(G)]
+        # sigma_a is kept alongside removal (= sigma_a + out-scatter) because a
+        # temperature feedback adds to ABSORPTION: scaling removal instead
+        # would silently scale the out-scatter with it.
+        self.sigma_a = per_group("sigma_a")
         self.removal = per_group("removal")
         self.diffusion = per_group("diffusion", lookup=harm)
         self.sigma_t = per_group("sigma_t")
@@ -213,6 +216,9 @@ class Fields:
         sig_s = np.array([m.sigma_s for m in mats])  # (M, G, G)
         self.sigma_s = [[lin(sig_s[:, gf, gt]) if np.any(sig_s[:, gf, gt]) else None
                          for gt in range(G)] for gf in range(G)]
+
+        if xs_update is not None:
+            xs_update(self)
 
     def fission_source(self, phi_by_group):
         """Sum_g nuSigma_f,g * phi_g over an iterable of per-group fluxes."""
@@ -271,7 +277,7 @@ class _PowerIterationSolver:
                  active=None, mask_bc=BC_VACUUM, precond_degree: int = 0,
                  mix_material=None, mix_weight=None, linear_solver="cg",
                  symmetric_operator: bool = True, hybrid_mask=None,
-                 hybrid_confine: bool = False):
+                 hybrid_confine: bool = False, xs_update=None):
         self.grid = grid
         self.xp = xp = get_backend(device)
         self.device = device_name(xp)
@@ -296,8 +302,14 @@ class _PowerIterationSolver:
                 "symmetric_operator=False builds the non-symmetric divergence-"
                 "form cylindrical stencil; use linear_solver='gmres' or 'bicgstab'")
 
+        # xs_update runs inside Fields, i.e. BEFORE _build_operators and before
+        # the fissile check -- so the operators and the "is this a k-eigenvalue
+        # problem at all" test both see the post-feedback data. Every solver
+        # that subclasses this one (Tri*, SP3, SPN, SDPN) only overrides
+        # _build_operators, so they inherit the hook unchanged.
         f = Fields(xp, grid, materials, material_map, self.dtype,
-                   mix_material=mix_material, mix_weight=mix_weight)
+                   mix_material=mix_material, mix_weight=mix_weight,
+                   xs_update=xs_update)
         if not f.fissile:
             raise ValueError("no fissile material: k-eigenvalue problem is undefined")
         self.fields = f
@@ -332,6 +344,39 @@ class _PowerIterationSolver:
         raise NotImplementedError
 
     # -----------------------------------------------------------------------
+    def _make_group_batch(self, state, adjoint, prod):
+        r"""Stacked group data for the batched source assembly, or None.
+
+        The per-group Python loops in ``solve`` cost O(G^2) kernel launches per
+        outer -- two per (g, g') in-scatter pair plus O(G) for the fission
+        source -- which for the 11-group HP-MR library is a few hundred small
+        launches per outer, independent of grid size. Stacking the scattering
+        matrix into (G, G, \*grid) and the scalar fluxes into (G, \*grid) lets
+        one kernel walk a whole row, taking that to O(G).
+
+        Returned only on GPU (the launch cost is the whole point; on CPU the
+        sparse loop is strictly better because it skips absent couplings rather
+        than multiplying by materialized zeros) and only when the stack is worth
+        its memory: G >= 3, and the (G, G, \*grid) array must fit comfortably in
+        free device memory. ``S[g][gf]`` is the in-scatter coupling g' -> g with
+        the diagonal zeroed, matching the ``gf != g`` skip it replaces.
+        """
+        xp, G = self.xp, self.n_groups
+        if not kernels.use_fused(xp, "groups") or G < 3:
+            return None
+        phi0 = self._phi(state[0])
+        nbytes = G * G * phi0.size * phi0.dtype.itemsize
+        try:
+            free = xp.cuda.Device().mem_info[0]
+        except Exception:
+            free = 0
+        if free and nbytes > free // 8:
+            return None                       # not worth the footprint
+        S = scatter_stack(xp, self.sigma_s, G, adjoint, phi0.shape, phi0.dtype)
+        W = xp.stack([prod[g] for g in range(G)])
+        phi = xp.stack([self._phi(state[g]) for g in range(G)])
+        return {"S": S, "W": W, "phi": phi}
+
     def _fission_source(self, state, weight):
         """Sum_g weight[g] * phi0_g -- the field that drives the outer loop.
 
@@ -348,7 +393,8 @@ class _PowerIterationSolver:
     def solve(self, tol_k: float = 1e-7, tol_source: float = 1e-6,
               max_outer: int = 2000, inner_rtol_floor: float = 1e-10,
               k_guess: float = 1.0, verbose: bool = False,
-              adjoint: bool = False, anderson_depth: int = 8) -> Result:
+              adjoint: bool = False, anderson_depth: int = 8,
+              state0=None) -> Result:
         """Run power iteration until |dk| < tol_k and the relative L2 change of
         the normalized fission source < tol_source.
 
@@ -384,8 +430,24 @@ class _PowerIterationSolver:
         prod = self.chi if adjoint else self.nu_sigma_f
         emit = self.nu_sigma_f if adjoint else self.chi
 
-        state = self._initial_state()
-        fsrc = self._fission_source(state, prod)
+        # state0 warm-starts the power iteration from a previous solve's group
+        # state -- the payoff in an outer coupling loop, where each iteration
+        # perturbs the cross sections only slightly and a flat start throws
+        # away a converged flux shape. It is a starting point only: the
+        # converged eigenpair is unchanged, and passing None (the default) is
+        # the cold start every existing caller gets.
+        state = self._initial_state() if state0 is None else [
+            self.xp.asarray(s, dtype=self.dtype).copy() for s in state0]
+        batch = self._make_group_batch(state, adjoint, prod)
+
+        def fission_source():
+            """Sum_g prod[g] * phi0_g, batched into one kernel when available."""
+            if batch is None:
+                return self._fission_source(state, prod)
+            out = xp.zeros_like(batch["phi"][0])
+            return kernels.group_accumulate(xp, out, batch["W"], batch["phi"])
+
+        fsrc = fission_source()
         total = xp.sum(fsrc)
         if float(total) <= 0:
             raise RuntimeError("initial fission source is zero")
@@ -406,21 +468,30 @@ class _PowerIterationSolver:
 
             for g in range(G):
                 q0 = (emit[g] / k) * fsrc
-                for gf in range(G):
-                    # forward: in-scatter g'->g uses sigma_s[g'][g];
-                    # adjoint transposes to sigma_s[g][g'].
-                    s = self.sigma_s[g][gf] if adjoint else self.sigma_s[gf][g]
-                    if gf != g and s is not None:
-                        q0 += s * self._phi(state[gf])
+                if batch is not None:
+                    # One kernel for the whole in-scatter row. batch["phi"] is
+                    # kept current group by group below, so this reads the
+                    # updated flux for g' < g and the previous one for g' > g --
+                    # the same Gauss-Seidel sweep the Python loop performed.
+                    kernels.group_accumulate(xp, q0, batch["S"][g], batch["phi"])
+                else:
+                    for gf in range(G):
+                        # forward: in-scatter g'->g uses sigma_s[g'][g];
+                        # adjoint transposes to sigma_s[g][g'].
+                        s = self.sigma_s[g][gf] if adjoint else self.sigma_s[gf][g]
+                        if gf != g and s is not None:
+                            q0 += s * self._phi(state[gf])
                 if self._src_weight is not None:
                     q0 = q0 * self._src_weight
                 state[g], n_it = self._linsolve(
                     self.ops[g].apply, self._rhs(g, q0), state[g],
                     self.ops[g].inv_diag, xp, rtol=rtol,
                     precond=self.preconds[g])
+                if batch is not None:
+                    batch["phi"][g] = self._phi(state[g])
                 inner_total += n_it
 
-            fsrc_new = self._fission_source(state, prod)
+            fsrc_new = fission_source()
             total_new = xp.sum(fsrc_new)
             k_new = k * float(total_new / total)
 
@@ -432,6 +503,8 @@ class _PowerIterationSolver:
             scale = self.grid.n_cells / total_new
             for g in range(G):
                 state[g] *= scale
+            if batch is not None:
+                batch["phi"] *= scale         # phi0 is linear in the state
             g_fsrc = fsrc_new * scale                     # raw power iterate, mean 1
             k = k_new
 

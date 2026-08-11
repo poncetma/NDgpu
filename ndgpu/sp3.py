@@ -158,8 +158,22 @@ class SP3GroupOperator:
         self.inv_diag = xp.stack([self.moment1.inv_diag, self.moment2.inv_diag / 5.0])
 
     def apply(self, u):
-        """Return the block operator applied to u = (Phi1, phi2)."""
+        """Return the block operator applied to u = (Phi1, phi2).
+
+        Each moment's leakage is written straight into its row of the output
+        (no per-moment temporary) whenever the spatial operator supports it,
+        and the 2x2 coupling is one pass over both rows -- so on GPU the whole
+        block is three kernels rather than the thirty-odd the plain expression
+        costs. Operators without ``supports_out`` (the triangular and mesh
+        stencils) take the allocating path; the arithmetic is identical.
+        """
+        from . import kernels
+
         out = self.xp.empty_like(u)
-        out[0] = self.moment1.apply(u[0]) - self.coupling * u[1]
-        out[1] = 5.0 * self.moment2.apply(u[1]) - self.coupling * u[0]
-        return out
+        if getattr(self.moment1, "supports_out", False):
+            self.moment1.apply(u[0], out=out[0])
+            self.moment2.apply(u[1], out=out[1])
+        else:
+            out[0] = self.moment1.apply(u[0])
+            out[1] = self.moment2.apply(u[1])
+        return kernels.sp3_couple(self.xp, out, u, self.coupling)

@@ -25,6 +25,10 @@ without a checkout).
 | `test_transient_point_kinetics.py` | transient stack vs the exact point-kinetics ODE |
 | `test_linalg_krylov.py` | GMRES/BiCGStab options: match CG on SPD systems through every solver entry point; solve a convection-dominated non-symmetric system where CG provably diverges; the non-symmetric divergence-form cylindrical stencil (`symmetric_operator=False`) equals the SPD-weighted one |
 | `test_femffusion_io.py` | .xsec/XML readers vs the files' exact contents |
+| `test_conduction.py` | conduction vs the exact sinked-slab `cosh` solution (2nd order, Dirichlet and Robin, Cartesian and tri-prism); the discrete energy balance as an exact identity |
+| `test_power_density.py` | power normalizes to the rated watts; independent of the eigenvalue flux's arbitrary scale; kappa- vs nu-weighting; mixing |
+| `test_feedback.py` | temperature feedback: negative sign, linearity in the coefficient, Doppler/expansion separability, and a zeroed feedback bit-identical to no hook |
+| `test_coupling.py` | the coupled fixed point: exact limits (zero feedback, zero power), contraction, conservation, accelerator-independence |
 
 ## `validation/` — does it reproduce *published reactor problems*?
 
@@ -42,6 +46,7 @@ there is a single source of truth for every published number.
 | `test_twigl_langenbuch.py` | TWIGL 2D, Langenbuch/LMW 3D kinetics | published power histories |
 | `test_anl7416_8a1.py` | ANL-7416 Problem 8-A1 (r-z kinetics) | book k's + Exhibit A power trace |
 | `test_hpmr.py` | HP-MR microreactor 2D/3D | behavioural (placeholder XS): symmetry, drum worth, mesh stability |
+| `test_coupled_precice.py` | HP-MR neutronics/thermal coupled through preCICE | the internal `CoupledSolver` — exact mapping, lockstep iterates, shared fixed point. Skips without `pyprecice`; run it in the env that has it (see `docs/coupling.md`) |
 
 Related directories: `ndgpu/benchmarks/` holds the benchmark *problem
 builders + reference constants* (importable library code);

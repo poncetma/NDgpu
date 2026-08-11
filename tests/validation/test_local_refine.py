@@ -70,6 +70,10 @@ def test_local_refine_gives_negative_drum_worth():
         r = UnstructuredDiffusionSolver(mesh, mats, cm, alpha).solve(tol_k=1e-7)
         assert r.converged
         return r.k_eff
-    k_out, k_in = k(0.0), k(180.0)
+    # Convention (hpmr._drum_geometry): 0 = the B4C arc faces the core centre
+    # (inserted), 180 = outward (withdrawn). Verified geometrically -- at 0 deg
+    # the absorber cells sit ~11 cm core-side of their drum centre, at 180 deg
+    # ~12 cm outward.
+    k_in, k_out = k(0.0), k(180.0)
     assert k_out > k_in                             # arcs toward core remove reactivity
-    assert (1 / k_in - 1 / k_out) * 1e5 > 500
+    assert (1 / k_in - 1 / k_out) * 1e5 > 500       # worth, positive by insertion

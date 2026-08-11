@@ -20,3 +20,10 @@ results/
 
 # Claude Code scratch worktrees
 .claude/worktrees/
+
+# preCICE run artifacts (examples/precice/run.sh writes these into its workdir)
+examples/precice/run/
+precice-run/
+precice-profiling/
+precice-*-iterations.log
+precice-*-convergence.log

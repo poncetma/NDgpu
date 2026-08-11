@@ -45,6 +45,23 @@ def test_unperturbed_transient_stays_steady():
     assert np.allclose(res.power, 1.0, atol=1e-5), res.power
 
 
+def test_rejects_a_horizon_that_is_not_an_integer_number_of_steps():
+    """Constant-step solvers must not silently report a different end time."""
+    solver = TransientSolver(GRID, lambda t: ([BASE], None), KIN, device="cpu")
+    with pytest.raises(ValueError, match="integer multiple"):
+        solver.solve(t_end=1.0, dt=0.06)
+
+
+def test_default_step_acceleration_matches_the_documented_configuration():
+    """Pin the public defaults used by existing transient input decks."""
+    prob = absorption_step_problem(0.001)
+    default = TransientSolver(GRID, prob, KIN, device="cpu").solve(
+        t_end=0.02, dt=0.002).power
+    explicit = TransientSolver(GRID, prob, KIN, device="cpu").solve(
+        t_end=0.02, dt=0.002, anderson_depth=5, rebalance=False).power
+    np.testing.assert_allclose(default, explicit, rtol=0, atol=1e-12)
+
+
 def test_matches_point_kinetics_for_uniform_perturbation():
     from scipy.integrate import solve_ivp
 

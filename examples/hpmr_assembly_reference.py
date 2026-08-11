@@ -67,7 +67,7 @@ print(f"  S_N k_inf = {r.k_eff:.6f}  ({r.outer_iterations} outers, "
       f"{time.perf_counter() - t0:.0f} s)")
 
 # --- 2. form function + the flux-weighted homogenized assembly material -------
-flux = np.asarray(r.flux)
+flux = r.flux_numpy                    # device -> host for postprocessing
 power, form = pin_powers(p, flux)
 _, flux_form = pin_fluxes(p, flux)
 fuel = np.array([k == "fuel" for k in p.pin_kind])

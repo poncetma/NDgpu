@@ -1,5 +1,10 @@
 # The NDgpu Model API
 
+> New to NDgpu? Start with the [user guide](user_guide.md). It explains the
+> supported modeling scope and follows one reactor through geometry, steady
+> neutronics, SPH hand-off, kinetics, thermal feedback, GPU coupling, results,
+> and validation. This page is the detailed builder reference.
+
 The `Model` family is a high-level front end for defining and running a reactor.
 The low-level solver classes (`DiffusionEigenSolver`, `SP3EigenSolver`, the
 triangular and unstructured solvers) are fully general but ask you to build a
@@ -14,7 +19,7 @@ Three builders share one report type (`ReactorResult`):
 |---|---|---|
 | [`Model`](#model--structured-cartesian) | structured Cartesian, 1-D / 2-D / 3-D | diffusion, SP3, adjoint, **transient** |
 | [`MeshModel`](#meshmodel--unstructured) | arbitrary unstructured mesh (Gmsh or assembled), 2-D / 3-D | diffusion |
-| [`HexLattice`](#hexlattice--triangular) | hexagonal assembly lattice on the triangular solver | diffusion, SP3 |
+| [`HexLattice` → `TriReactor`](#hexlattice--trireactor) | hexagonal/prismatic cores on the triangular solver | diffusion/SPN/SDPN, adjoint, transient, thermal coupling |
 
 Materials are ordinary `ndgpu.Material` objects throughout, so defining cross
 sections is unchanged — only the grid/array bookkeeping is removed.
@@ -218,24 +223,93 @@ non-uniform meshes. `MeshModel` is diffusion-only (there is no SP3 mesh solver).
 
 ---
 
-## `HexLattice` — triangular
+## `HexLattice` → `TriReactor`
 
-A hexagonal lattice of assemblies solved on the body-fitted triangular solver
-(the HP-MR geometry family). Place assemblies at axial hex coordinates `(R, C)`:
+`HexLattice` is the geometry builder; `build()` rasterizes it once and returns a
+reusable `TriReactor`. This split matters for reactor design: the same validated
+mesh and material ordering can be used for diffusion/SPN/SDPN, kinetics,
+SPH-corrected material replacement, thermal coupling, and GPU coupled
+transients. `HexLattice.run()` remains a backward-compatible steady shorthand.
+
+Sites use axial hex coordinates `(R, C)`. Complete disks and rings do not need
+to be listed manually:
 
 ```python
-lat = ndgpu.HexLattice(pitch=20.0, refine=4).set_boundary("vacuum")
-lat.set_site((0, 0), fuel)
-for rc in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, -1), (-1, 1)]:
-    lat.set_site(rc, reflector)
+core = (
+    ndgpu.HexLattice(pitch=20.0, refine=4)
+    .set_disk(3, reflector)                 # background, overwritten below
+    .set_disk(2, fuel)
+    .set_boundary("vacuum")                 # radial core edge
+    .extrude(height=200.0, nz=20, boundary="vacuum")
+    .add_axial_region(axial_reflector, z=(0, 20), replace=fuel)
+    .add_axial_region(axial_reflector, z=(180, 200), replace=fuel)
+    .set_kinetics(velocities=[1e7, 3e5], beta=[0.0065], decay=[0.08])
+    .build(name="new prismatic reactor")
+)
 
-diffusion = lat.run(method="diffusion")
-transport = lat.run(method="sp3")          # SP3 captures the transport correction
+diffusion = core.steady(method="diffusion", device="gpu")
+transport = core.steady(method="sp3", device="gpu")
+kinetics = core.transient(t_end=1.0, dt=0.02, device="gpu")
 ```
 
-`refine` sets `6·refine²` triangles per hex. `method` is `"diffusion"` or
-`"sp3"`, and `adjoint=True` is available. A void placeholder fills the lattice
-padding automatically; the report counts only the active triangles.
+`refine` sets `6·refine²` triangles per hex. `steady(method=...)` accepts
+`diffusion`, `sp1/3/5/7`, or `sdp1/2/3`; `adjoint=True` is available. Inactive
+raster padding is generated and excluded from reports automatically.
+
+The compiled object exposes `grid`, `materials`, `material_map`, `active`,
+`mix_material`, and `mix_weight` for advanced uses. `TriReactor(...)` can also
+wrap any compatible `TriGrid` and maps, so the API is not restricted to
+geometries made by `HexLattice`.
+
+### SPH-corrected constants
+
+SPH generation remains an explicit reference/coarse calculation, but applying
+the resulting constants no longer requires rebuilding geometry:
+
+```python
+sph_model = core.with_materials(sph_result.corrected_materials,
+                                name="SPH-corrected core")
+sph_solution = sph_model.steady(device="gpu")
+```
+
+The replacement list preserves material count/order. Geometry, volume mixing,
+kinetics, and configured thermal data are retained.
+
+### Thermal coupling
+
+Thermal data and analytic feedback can be keyed by material names instead of
+internal integer indices. Inactive padding is filled automatically:
+
+```python
+core.configure_thermal(
+    {
+        "fuel": ndgpu.ThermalMaterial(0.25, sink_coeff=0.015,
+                                      sink_temperature=650, heat_capacity=2.5),
+        "reflector": ndgpu.ThermalMaterial(0.35, heat_capacity=2.0),
+        "axial reflector": ndgpu.ThermalMaterial(0.32, heat_capacity=2.1),
+    },
+    total_power=2.0e6,
+    feedback={
+        "fuel": ndgpu.FeedbackSpec(reference_temperature=800,
+                                    doppler=[2e-4, 0.0]),
+    },
+    thermal_mask_bc=0.01,
+    ambient_temperature=400,
+)
+
+hot = core.coupled_steady(device="gpu")
+run = core.coupled_transient(t_end=10, dt=0.05, dt_thermal=0.5,
+                             device="gpu", profile=True)
+```
+
+`total_power` is the power in the modeled domain. For a full 3-D core this is
+the core rating; for a 2-D slice it is the slice power for the modeled
+thickness. Missing feedback entries mean zero feedback. An existing
+`ThermalFeedback` or tabulated feedback object may be passed instead.
+
+For moving controls, prebuild a small set of same-shaped `TriReactor` frames and
+pass `state_at(t)` returning a cached frame. `problem_at=` remains available for
+the raw four-array callback used by low-level code.
 
 ### Control drums
 
@@ -248,12 +322,12 @@ thinner than a triangle, and varies continuously with rotation):
 lat.set_drum((0, 3), body=beryllium, absorber=b4c,
              inner_radius=12.25, outer_radius=13.25,   # the annular arc, cm from the hex centre
              arc_deg=90,                                # angular span of the arc
-             angle_deg=180)                             # 0 = arc outward (withdrawn), 180 = toward core
+             angle_deg=180)                             # 0 = toward core, 180 = outward
 ```
 
-`angle_deg` is measured from the outward radial direction, so sweeping it from 0
-to 180 for every drum traces the **drum-worth curve**. Any number of drums may be
-placed and rotated independently. `run(..., samples=8)` controls the arc
+`angle_deg=0` points the arc inward (inserted) and 180 points it outward
+(withdrawn), so sweeping 0→180 traces the **drum-worth curve**. Any number of
+drums may be placed and rotated independently. `build(samples=8)` controls arc
 sub-sampling resolution. The report's neutron balance accounts for the mixed
 absorber. This reproduces `ndgpu.benchmarks.build_hpmr2d`'s polar drum model
 exactly; see `examples/hpmr_hexlattice.py`, which builds the full HP-MR
@@ -325,10 +399,13 @@ references.
 
 ## Reference
 
-- The builders and `ReactorResult` live in `ndgpu/model.py`.
-- For capabilities the Model family does not wrap (SPH homogenization, the raw
-  transient `problem_at` with moving geometry, custom preconditioners), use the
-  solver classes directly — see the other `examples/`.
+- The builders, `TriReactor`, and `ReactorResult` live in `ndgpu/model.py`.
+- SPH *generation* and unusual solver formulations still use the low-level
+  solver functions. Their corrected material list returns to the public API via
+  `TriReactor.with_materials(...)`; custom preconditioners enter through
+  `steady(solver_kwargs=...)` or the transient solver controls.
+- `examples/custom_tri_reactor.py` is a complete non-benchmark 3-D design,
+  including named thermal data and a coupled transient.
 - TWIGL: R. A. Hageman & J. B. Yasinsky, "Comparison of alternating-direction
   time-differencing methods … ", *Nucl. Sci. Eng.* (1969); cross sections here
   match the FEMFFUSION `2D_TWIGL` example.

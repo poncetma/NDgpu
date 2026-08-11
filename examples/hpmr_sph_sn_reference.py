@@ -29,6 +29,8 @@ import time
 
 import numpy as np
 
+from ndgpu import asnumpy
+
 from ndgpu import (TriDiffusionEigenSolver, TriSDP1EigenSolver,
                    TriSDP2EigenSolver, TriSP3EigenSolver,
                    flux_weighted_homogenize, region_average, sph_correct)
@@ -65,7 +67,7 @@ def reference(name, p, common):
             mix_material=p.mix_material, mix_weight=p.mix_weight,
             n_polar=n_polar, n_azi=n_azi, bc="vacuum",
             scheme="scb").solve(**TIGHT_SN)
-        return r.k_eff, np.asarray(r.flux), r.converged
+        return r.k_eff, asnumpy(r.flux), r.converged
     r = MOMENT_FAMILIES[name](p.grid, p.materials, p.material_map,
                               **common).solve(**TIGHT)
     return r.k_eff, r.flux_numpy, r.converged

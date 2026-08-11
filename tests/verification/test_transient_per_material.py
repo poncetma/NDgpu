@@ -93,6 +93,44 @@ def test_equilibrium_with_mix_arrays():
     assert np.allclose(res.power, 1.0, atol=1e-6), res.power
 
 
+def test_per_material_kinetics_follow_a_moving_material_map():
+    """A map change must remap 1/v and beta, not just the cross sections.
+
+    The two materials have identical diffusion data, so before the fix the
+    moving-map result was bit-identical to the static one: only the stale
+    kinetic fields could distinguish the cases.
+    """
+    grid = Grid(shape=(8, 1, 1), size=(80.0, 1.0, 1.0))
+    base = Material(diffusion=[1.3], sigma_a=[0.03], nu_sigma_f=[0.04])
+    pert = Material(diffusion=[1.3], sigma_a=[0.029], nu_sigma_f=[0.04])
+    mats0, mats1 = [base, base], [pert, pert]
+    mmap0 = np.zeros(grid.shape, dtype=np.int64)
+    mmap1 = mmap0.copy()
+    mmap1[:2] = 1
+    kin = Kinetics(velocities=[[1.0e7], [1.0e5]],
+                   beta=[[0.0065], [0.0065]], decay=[0.08])
+
+    static = lambda t: (mats0, mmap0) if t <= 0.1 else (mats1, mmap0)
+    moving = lambda t: (mats0, mmap0) if t <= 0.1 else (mats1, mmap1)
+    kw = dict(t_end=0.2, dt=0.02)
+    p_static = TransientSolver(grid, static, kin, device="cpu").solve(**kw).power
+    p_moving = TransientSolver(grid, moving, kin, device="cpu").solve(**kw).power
+    assert abs(p_moving[-1] - p_static[-1]) > 1e-6
+
+
+def test_per_material_kinetics_accept_static_blend_from_problem_at():
+    """A four-element, but static, problem specification is valid input."""
+    mats, mmap, _ = _two_region()
+    mix_material = np.full(GRID.shape, -1, dtype=np.int64)
+    mix_weight = np.zeros(GRID.shape)
+    kin = Kinetics(velocities=np.tile(V, (2, 1)), beta=np.tile(BETA, (2, 1)),
+                   decay=LAM)
+    res = TransientSolver(
+        GRID, lambda _t: (mats, mmap, mix_material, mix_weight), kin,
+        device="cpu").solve(t_end=0.1, dt=0.02)
+    assert np.allclose(res.power, 1.0, atol=1e-6)
+
+
 def test_sdpn_solvers_reject_per_material_kinetics():
     _, _, problem_at = _two_region()
     kin = Kinetics(velocities=np.tile(V, (2, 1)), beta=np.tile(BETA, (2, 1)),

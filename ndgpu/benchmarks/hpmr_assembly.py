@@ -60,6 +60,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ..backend import asnumpy
+from ..power import power_density
 from ..tri import TriGrid
 from .hpmr import PITCH
 
@@ -369,30 +371,17 @@ def pin_powers(problem, flux, materials=None):
     to a homogenized full-core solution.
     """
     mats = problem.materials if materials is None else materials
-    flux = np.asarray(flux)
-    G = flux.shape[0]
-    # POWER is kappa*Sigma_f * phi, not nu*Sigma_f * phi. Both vanish outside
-    # the fuel, so either puts power only where it belongs -- but nu varies by
-    # group (here kappaSigma_f/nuSigma_f spans 1.12x across the 11 groups), so
-    # nu-weighting tilts the distribution by the local spectrum. Fall back to
-    # nu_sigma_f only if the library carried no kappaFission.
-    key = ("kappa_fission" if any(getattr(m, "kappa_fission", None) is not None
-                                  for m in mats) else "nu_sigma_f")
+    # POWER is kappa*Sigma_f * phi, not nu*Sigma_f * phi -- see
+    # ndgpu.power.fission_energy_xs. Summing over groups before the scatter is
+    # identical to scattering group by group, and cheaper.
     dV = problem.grid.cell_volume
-    mmap = problem.material_map
+    dens = power_density(flux, mats, problem.material_map)
     pidx = problem.pin_index
     n_pins = len(problem.pin_kind)
     power = np.zeros(n_pins)
-    for g in range(G):
-        def _xs(m):
-            v = getattr(m, key, None)
-            if v is None:
-                v = m.nu_sigma_f
-            return np.atleast_1d(v)[g]
-        nsf = np.array([_xs(m) for m in mats])[mmap]
-        contrib = (nsf * flux[g] * dV).reshape(-1)
-        np.add.at(power, pidx.reshape(-1)[pidx.reshape(-1) >= 0],
-                  contrib[pidx.reshape(-1) >= 0])
+    contrib = (dens * dV).reshape(-1)
+    flat = pidx.reshape(-1)
+    np.add.at(power, flat[flat >= 0], contrib[flat >= 0])
     fuel = np.array([k == "fuel" for k in problem.pin_kind])
     scale = power[fuel].mean()
     return power, (power / scale if scale > 0 else power)
@@ -409,7 +398,7 @@ def pin_fluxes(problem, flux):
     flux peak in different places (thermal in the moderator pins, fast in the
     compacts).
     """
-    flux = np.asarray(flux)
+    flux = asnumpy(flux)
     G = flux.shape[0]
     dV = problem.grid.cell_volume
     pidx = problem.pin_index.reshape(-1)

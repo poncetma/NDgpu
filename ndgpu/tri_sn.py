@@ -54,6 +54,7 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import LinearOperator, factorized, gmres
 
+from . import kernels
 from .backend import asnumpy, get_backend
 from .materials import Material
 from .sn import SNResult, _anderson, _cmfd_power, quadrature_2d, quadrature_3d
@@ -113,7 +114,8 @@ class TriSNTransportSolver:
                  engine: str | None = None, device: str = "cpu",
                  lu_cache: str = "all",
                  dsa_rtol: float = 1e-4, dsa_maxiter: int = 100,
-                 cmfd_solver: str = "lu", sigma_t_shift=None):
+                 cmfd_solver: str = "lu", sigma_t_shift=None,
+                 graphs: bool = True):
         if len(grid.shape) not in (3, 4) or grid.shape[2] != 2:
             raise ValueError("tri-S_N grid shape must be (nr, nc, 2) or "
                              "(nr, nc, 2, nz) for extruded prisms")
@@ -150,6 +152,12 @@ class TriSNTransportSolver:
         self.acceleration = acceleration
         self.outer_acceleration = outer_acceleration
         self.max_inner = max_inner
+        # CUDA graph capture of the level sweep. On by default: replay is never
+        # slower than launching the same kernels individually, and it is a large
+        # win on small grids. Exposed so the claim is measurable rather than
+        # assumed -- and note that what capture *forbids* used to cost more than
+        # it saved on large problems (see _run_levels).
+        self.graphs = bool(graphs)
         self.dsa_rtol = dsa_rtol            # device DSA solve: loose tol + capped
         self.dsa_maxiter = dsa_maxiter      # iters (a preconditioner, not exact)
         self.cmfd_solver = cmfd_solver      # CMFD solve: "lu" or "mg" (O(N), 3D)
@@ -553,6 +561,7 @@ class TriSNTransportSolver:
         self._graphs = {}
         self.graphs_active = None
         self._graph_error = None
+        self._fused_reduce = kernels.use_fused(xp, "block")   # latched, see _run_levels
         self._act_flat_dev = xp.asarray(act_flat)
         if self.scheme == "scb":
             self._setup_levels_scb_tables_3d(mm, cc, spans)
@@ -571,8 +580,9 @@ class TriSNTransportSolver:
                                  xp.asarray(coef[p])))
         self._bufs = dict(
             psi=xp.zeros(M * N), rhs=xp.zeros(N),
-            phiM=xp.zeros(N), psiw=xp.zeros((M, N)),
+            phiM=xp.zeros(N), psiw=self._reduce_buf((M, N)),
             wcol=xp.asarray(self.w[:, None]),
+            wvec=xp.asarray(self.w),
             work=[(xp.zeros((n, NIN)), xp.zeros(n), xp.zeros(n))
                   for n in (b - a for a, b in spans)])
 
@@ -616,10 +626,13 @@ class TriSNTransportSolver:
         self._bufs = dict(
             psi=xp.zeros(M * K * 3), rhs=xp.zeros(K),
             IF=xp.zeros((M * K, 3)),
-            mk=xp.zeros((M, K)), mk_w=xp.zeros((M, K)), phk=xp.zeros(K),
+            mk=xp.zeros((M, K)), phk=xp.zeros(K),
+            mk_w=self._reduce_buf((M, K)),
             w3col=xp.asarray(self.w[:, None] / 3.0),
+            w3vec=xp.asarray(self.w / 3.0),
             work=[(xp.zeros((n, 3, 4)), xp.zeros((n, 3)), xp.zeros(n),
-                   xp.zeros((n, 3)), xp.zeros((n, 3, 3)), xp.zeros((n, 3)))
+                   xp.zeros((n, 3)), self._reduce_buf((n, 3, 3)),
+                   xp.zeros((n, 3)))
                   for n in (b - a for a, b in spans)])
         self._ac_dev = xp.asarray(ac)
         self._bufs["phiN"] = xp.zeros(N)
@@ -725,6 +738,9 @@ class TriSNTransportSolver:
         self._graphs = {}
         self.graphs_active = None                # None until a GPU sweep runs
         self._graph_error = None                 # reason capture fell back, if any
+        # Latched once: the captured graph records whichever formulation was in
+        # force, so this must not flip between capture and replay.
+        self._fused_reduce = kernels.use_fused(self.xp, "block")
         self._act_flat_dev = xp.asarray(self._act_flat)   # device-resident masks
         if scb:
             d = self._scb
@@ -757,10 +773,13 @@ class TriSNTransportSolver:
             self._bufs = dict(
                 psi=xp.zeros(M * K * 3), rhs=xp.zeros(K),
                 IF=xp.zeros((M * K, 3)),
-                mk=xp.zeros((M, K)), mk_w=xp.zeros((M, K)), phk=xp.zeros(K),
+                mk=xp.zeros((M, K)), phk=xp.zeros(K),
+                mk_w=self._reduce_buf((M, K)),
                 w3col=xp.asarray(self.w[:, None] / 3.0),
+                w3vec=xp.asarray(self.w / 3.0),
                 work=[(xp.zeros((n, 3, 2)), xp.zeros((n, 3)), xp.zeros(n),
-                       xp.zeros((n, 3)), xp.zeros((n, 3, 3)), xp.zeros((n, 3)))
+                       xp.zeros((n, 3)), self._reduce_buf((n, 3, 3)),
+                       xp.zeros((n, 3)))
                       for n in (b - a for a, b in spans)])
             self._ac_dev = xp.asarray(ac)
             self._bufs["phiN"] = xp.zeros(N)          # full-N device phi scatter
@@ -779,8 +798,9 @@ class TriSNTransportSolver:
                                      xp.asarray(coef[p])))
             self._bufs = dict(
                 psi=xp.zeros(M * N), rhs=xp.zeros(N),
-                phiM=xp.zeros(N), psiw=xp.zeros((M, N)),
+                phiM=xp.zeros(N), psiw=self._reduce_buf((M, N)),
                 wcol=xp.asarray(self.w[:, None]),
+                wvec=xp.asarray(self.w),
                 work=[(xp.zeros((n, 3)), xp.zeros(n), xp.zeros(n))
                       for n in (b - a for a, b in spans)])
 
@@ -825,11 +845,43 @@ class TriSNTransportSolver:
         self._lv_group[g] = out
         return out
 
+    def _reduce_buf(self, shape):
+        """Scratch for the broadcast-multiply form of a weighted contraction --
+        or a zero-size stand-in when the fused kernels make it unnecessary.
+
+        Worth the branch because these are the *largest* buffers in the sweep:
+        the step scheme's ``psiw`` is (M, N), the size of the angular flux
+        itself, and the SCB per-level ``bm`` blocks total three times it. They
+        exist only to hold the intermediate of a contraction that is now a
+        single kernel, so on the fused path they are pure footprint -- and
+        footprint is what limits the large 3D cases this is all aimed at.
+        """
+        return self.xp.zeros(0) if self._fused_reduce else self.xp.zeros(shape)
+
     def _run_levels(self, g, iface):
         """The level loop proper: a fixed sequence of allocation-free out=
         kernels on the persistent buffers (recordable into a CUDA graph).
         Inputs are read from bufs['rhs'] (+ bufs['IF']); outputs land in
-        bufs['psi'] and the phi reduction buffer."""
+        bufs['psi'] and the phi reduction buffer.
+
+        Three of these steps are weighted contractions -- the two flux
+        reductions and the per-cell 3x3 corner matvec. The natural spelling is
+        a matmul, but cuBLAS cannot be recorded into a CUDA graph, so they used
+        to be written as broadcast-multiply into a full-size temporary followed
+        by a reduction: capturable, but ~3x the memory traffic of the
+        contraction it computes, on every level of every sweep. Since memory
+        traffic is what dominates *large* problems and launch overhead is what
+        capture saves on *small* ones, that traded the large-case path away for
+        the small-case one.
+
+        With ``_fused_reduce`` each of the three is instead a single
+        hand-written kernel (:mod:`ndgpu.kernels`): one pass, no temporary, and
+        still capturable -- so the penalty is removed rather than traded. The
+        broadcast form is kept as the fallback when the fused kernels are off,
+        because it is allocation-free and therefore capture-safe, which the
+        generic NumPy-style fallbacks inside ``ndgpu.kernels`` are not.
+        ``_fused_reduce`` is latched once at setup: it must not change between
+        capturing a graph and replaying it."""
         xp = self.xp
         bufs = self._bufs
         tab = self._lv_tables(g)
@@ -846,11 +898,14 @@ class TriSNTransportSolver:
                 xp.add(red, rg, out=red)
                 xp.divide(red, den, out=red)
                 xp.put(psi, pidx, red)
-            # phi_n = sum_m w_m psi[m, n]: an elementwise weight + a reduction
-            # (NOT matmul -- cuBLAS calls cannot be captured into a CUDA graph).
-            xp.multiply(psi.reshape(self.M, self.N), bufs["wcol"],
-                        out=bufs["psiw"])
-            xp.sum(bufs["psiw"], axis=0, out=bufs["phiM"])
+            # phi_n = sum_m w_m psi[m, n].
+            if self._fused_reduce:
+                kernels.moment_gather(xp, psi.reshape(self.M, self.N),
+                                      bufs["wvec"], out=bufs["phiM"])
+            else:
+                xp.multiply(psi.reshape(self.M, self.N), bufs["wcol"],
+                            out=bufs["psiw"])
+                xp.sum(bufs["psiw"], axis=0, out=bufs["phiM"])
             return
         base = bufs["rhs"]
         IF = bufs["IF"]
@@ -864,16 +919,21 @@ class TriSNTransportSolver:
             if iface:
                 xp.take(IF, pidx, axis=0, out=ifl)
                 xp.add(b2, ifl, out=b2)
-            # p3 = Binv @ b2, batched 3x3 matvec written as broadcast-multiply +
-            # reduction so the captured loop calls no cuBLAS.
-            xp.multiply(Binv, b2[:, None, :], out=bm)
-            xp.sum(bm, axis=2, out=p3)
+            # p3 = Binv @ b2, a batch of 3x3 matvecs.
+            if self._fused_reduce:
+                kernels.batched_matvec(xp, p3, Binv, b2)
+            else:
+                xp.multiply(Binv, b2[:, None, :], out=bm)
+                xp.sum(bm, axis=2, out=p3)
             xp.put(psi, sidx, p3)
         K = self._scb["K"]
         xp.sum(psi.reshape(self.M, K, 3), axis=2, out=bufs["mk"])
-        # phi_k = sum_m (w_m/3) mk[m, k]: weight + reduction, no cuBLAS.
-        xp.multiply(bufs["mk"], bufs["w3col"], out=bufs["mk_w"])
-        xp.sum(bufs["mk_w"], axis=0, out=bufs["phk"])
+        # phi_k = sum_m (w_m/3) mk[m, k].
+        if self._fused_reduce:
+            kernels.moment_gather(xp, bufs["mk"], bufs["w3vec"], out=bufs["phk"])
+        else:
+            xp.multiply(bufs["mk"], bufs["w3col"], out=bufs["mk_w"])
+            xp.sum(bufs["mk_w"], axis=0, out=bufs["phk"])
 
     def _levels_exec(self, g, iface):
         """Execute the level loop -- directly on numpy; on cupy, captured once
@@ -882,7 +942,7 @@ class TriSNTransportSolver:
         sweep; only the input buffers' contents change). Any capture failure
         falls back permanently to the plain loop."""
         xp = self.xp
-        if xp is np:
+        if xp is np or not self.graphs:
             self._run_levels(g, iface)
             return
         key = (g, iface)
@@ -950,14 +1010,21 @@ class TriSNTransportSolver:
         chk = max(1, min(maxit, 25))
 
         def _solve(b):
+            # Accept and return whichever side of the bus the caller is on. The
+            # hybrid solvers (hybrid_tri_sn, hybrid_sn) are host-side and reach
+            # in for this solver's DSA factor as a preconditioner, so a device
+            # solve handed a host residual is a real call pattern -- and it used
+            # to fail deep inside pcg on `b - apply_A(x)` mixing backends.
+            host = isinstance(b, np.ndarray)
+            bd = xp.asarray(b) if host else b
             if symmetric:
-                x, _ = pcg(lambda x: Ad @ x, b, xp.zeros_like(b), inv_diag, xp,
+                x, _ = pcg(lambda v: Ad @ v, bd, xp.zeros_like(bd), inv_diag, xp,
                            rtol=rtol, maxiter=maxit, check_every=chk,
                            raise_on_fail=False)
             else:
-                x, _ = bicgstab(lambda x: Ad @ x, b, xp.zeros_like(b), inv_diag,
+                x, _ = bicgstab(lambda v: Ad @ v, bd, xp.zeros_like(bd), inv_diag,
                                 xp, rtol=rtol, maxiter=maxit)
-            return x
+            return asnumpy(x) if host else x
         return _solve
 
     def _sweep_dev(self, g, src_dev):
@@ -2077,9 +2144,20 @@ class TriSNTransportSolver:
         where the 3D LU factorisation blows up. On the GPU the multigrid
         hierarchy (built once on the host by pyamg) is moved to the device and
         the V-cycle + BiCGStab run there, so -- with the device-resident
-        _cmfd_power -- the CMFD solves never leave the GPU."""
+        _cmfd_power -- the CMFD solves never leave the GPU.
+
+        The default LU is a *host* solver, but ``_cmfd_power`` runs on the
+        solver's backend, so on GPU it hands the LU device arrays. Bridging the
+        bus is therefore this function's job, not the caller's: the returned
+        callable takes and returns backend arrays either way. The round trip is
+        inherent to choosing a host factorization -- use cmfd_solver="mg" to
+        keep the CMFD solve on the device."""
         if getattr(self, "cmfd_solver", "lu") != "mg":
-            return factorized(A.tocsc())
+            solve = factorized(A.tocsc())
+            if self.xp is np:
+                return solve
+            xp = self.xp
+            return lambda b: xp.asarray(solve(asnumpy(b)))
         try:
             import pyamg
         except ImportError as e:                             # optional dependency

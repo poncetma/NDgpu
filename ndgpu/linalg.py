@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from . import kernels
+
 
 def neumann_preconditioner(apply_A, inv_diag, degree):
     """Truncated Neumann-series (polynomial) preconditioner.
@@ -39,10 +41,12 @@ def neumann_preconditioner(apply_A, inv_diag, degree):
     if degree == 0:
         return lambda r: inv_diag * r
 
+    xp = kernels.module_of(inv_diag)
+
     def apply(r):
         z = inv_diag * r
         for _ in range(degree):
-            z += inv_diag * (r - apply_A(z))
+            kernels.neumann_step(xp, z, r, apply_A(z), inv_diag)
         return z
 
     return apply
@@ -69,7 +73,14 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
 
     Returns (x, n_iterations).
     """
-    dot = lambda u, v: xp.sum(u * v)
+    # The vector updates and reductions go through ndgpu.kernels, which fuses
+    # each of them into one CUDA kernel on GPU (and is the plain expression on
+    # CPU). That matters here more than anywhere else: a CG iteration is three
+    # reductions and three vector updates over arrays that fit in cache, so
+    # written as separate array expressions it is almost entirely kernel-launch
+    # overhead. The coefficients deliberately stay 0-d *device* scalars -- only
+    # the convergence test (every `check_every` iterations) touches the host.
+    dot = lambda u, v: kernels.dot(xp, u, v)
     M = precond if precond is not None else (lambda r: inv_diag * r)
 
     x = x0.copy()
@@ -84,13 +95,12 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
     for it in range(1, maxiter + 1):
         Ap = apply_A(p)
         alpha = rz / dot(p, Ap)
-        x += alpha * p
-        r -= alpha * Ap
+        kernels.cg_update(xp, x, r, p, Ap, alpha)
         if it % check_every == 0 and float(dot(r, r)) <= stop2:
             return x, it
         z = M(r)
         rz_new = dot(r, z)
-        p = z + (rz_new / rz) * p
+        kernels.cg_direction(xp, p, z, rz_new / rz)
         rz = rz_new
     if raise_on_fail:
         raise RuntimeError(
@@ -101,7 +111,7 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
 
 
 def gmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
-          precond=None, restart=30):
+          precond=None, restart=30, raise_on_fail=True):
     """Solve A x = b with restarted, right-preconditioned GMRES(m).
 
     Same interface, warm start and stopping rule as :func:`pcg` (true
@@ -118,6 +128,11 @@ def gmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
     memory and O(j) dot products at Arnoldi step j -- use CG whenever SPD
     holds. `restart` trades memory/orthogonalization work against the
     convergence penalty of discarding the Krylov space each cycle.
+
+    raise_on_fail : if False, return the current iterate after ``maxiter``
+               instead of raising -- the same escape hatch :func:`pcg` has, for
+               call sites where a partial result is still useful (an inexact
+               within-group solve inside an outer iteration that revisits it).
 
     Returns (x, n_iterations) where an iteration is one operator apply.
     """
@@ -174,10 +189,12 @@ def gmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
         res = norm(r)
         if res <= stop:
             return x, it
-    raise RuntimeError(
-        f"GMRES failed to converge in {maxiter} iterations "
-        f"(residual {res:.3e}, target {stop:.3e})"
-    )
+    if raise_on_fail:
+        raise RuntimeError(
+            f"GMRES failed to converge in {maxiter} iterations "
+            f"(residual {res:.3e}, target {stop:.3e})"
+        )
+    return x, it
 
 
 def cocg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
@@ -201,7 +218,7 @@ def cocg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
 
     Returns (x, n_iterations).
     """
-    bdot = lambda u, v: xp.sum(u * v)                 # bilinear (unconjugated)
+    bdot = lambda u, v: kernels.dot(xp, u, v)         # bilinear (unconjugated)
     rnorm = lambda u: float(xp.sqrt(xp.sum((u.conj() * u).real)))
     M = precond if precond is not None else (lambda r: inv_diag * r)
 
@@ -220,13 +237,12 @@ def cocg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
         if pAp == 0:
             raise RuntimeError("COCG breakdown (p^T A p = 0)")
         alpha = rz / pAp
-        x += alpha * p
-        r -= alpha * Ap
+        kernels.cg_update(xp, x, r, p, Ap, alpha)
         if rnorm(r) <= stop:
             return x, it
         z = M(r)
         rz_new = bdot(r, z)
-        p = z + (rz_new / rz) * p
+        kernels.cg_direction(xp, p, z, rz_new / rz)
         rz = rz_new
     raise RuntimeError(
         f"COCG failed to converge in {maxiter} iterations "
@@ -395,6 +411,88 @@ def fgmres_c(apply_A, b, x0, xp, precond, rtol=1e-8, atol=0.0, maxiter=1000,
     raise RuntimeError(
         f"FGMRES failed to converge in {it} applies "
         f"(residual {res:.3e}, target {stop:.3e})")
+
+
+#: Drop the Anderson history when the residual grows by more than this factor.
+#: A fixed-point map whose evaluation is itself an iterative solve is not a
+#: stationary map -- warm starts and inner tolerances make G slightly different
+#: each time it is called -- so a history built across such a change can point
+#: the extrapolation the wrong way. Restarting costs a few plain iterations;
+#: not restarting can diverge. (Same constant, same reason, as the noise
+#: solver's Gauss-Seidel sweep.)
+ANDERSON_RESTART_GROWTH = 1.5
+
+
+def anderson_step(X, F, beta=1.0):
+    """One Anderson update from histories of iterates and residuals.
+
+    X : list of past iterates x_k (flat arrays). F : list of residuals
+    f_k = g(x_k) - x_k. Returns the next iterate: the least-squares mixture of
+    the history minimizing the combined residual, damped by ``beta``.
+
+    With a single point this is plain relaxed fixed-point ``x + beta*f`` --
+    which is what makes ``depth <= 1`` directly comparable to an external
+    coupling tool's constant-relaxation scheme.
+
+    This is the unconstrained Walker-Ni form. It is deliberately NOT the same
+    algorithm as ``solver._anderson_source`` / ``noise._anderson_complex``,
+    which use the Type-II normal equations with a Tikhonov floor and are tuned
+    for the fission-source fixed point; keeping both is intentional.
+    """
+    m = len(F)
+    fk = F[-1]
+    if m == 1:
+        return X[-1] + beta * fk
+    dF = np.column_stack([F[i + 1] - F[i] for i in range(m - 1)])   # (n, m-1)
+    dX = np.column_stack([X[i + 1] - X[i] for i in range(m - 1)])
+    gamma, *_ = np.linalg.lstsq(dF, fk, rcond=None)
+    return X[-1] + beta * fk - (dX + beta * dF) @ gamma
+
+
+class AndersonAccelerator:
+    """Stateful Anderson acceleration of a fixed-point map, with restart.
+
+    Feed it the current iterate and the map's output; it returns the next
+    iterate. ``depth <= 1`` degenerates to under-relaxed Picard
+    ``beta*g(x) + (1-beta)*x``, written in exactly that form so it matches an
+    external coupling tool's constant-relaxation arithmetic bit for bit.
+    """
+
+    def __init__(self, depth=5, beta=1.0):
+        self.depth = int(depth)
+        self.beta = float(beta)
+        self.reset()
+
+    def reset(self):
+        self._X, self._F, self._last = [], [], None
+
+    def step(self, x, gx):
+        x = np.asarray(x, dtype=float)
+        gx = np.asarray(gx, dtype=float)
+        shape = x.shape
+        xf, gf = x.reshape(-1), gx.reshape(-1)
+        if self.depth <= 1:
+            # The literal relaxation form, not the algebraically identical
+            # x + beta*(g - x): the two differ in the last bits, and those bits
+            # propagate through an inner Krylov solve's stopping decision.
+            return (self.beta * gf + (1.0 - self.beta) * xf).reshape(shape)
+
+        f = gf - xf
+        norm = float(np.linalg.norm(f))
+        if self._last is not None and norm > ANDERSON_RESTART_GROWTH * self._last:
+            self.reset()
+        self._last = norm
+
+        self._X.append(xf)
+        self._F.append(f)
+        if len(self._F) > self.depth:
+            self._X.pop(0)
+            self._F.pop(0)
+        try:
+            return anderson_step(self._X, self._F, self.beta).reshape(shape)
+        except np.linalg.LinAlgError:                       # pragma: no cover
+            self.reset()
+            return (xf + self.beta * f).reshape(shape)
 
 
 LINEAR_SOLVERS = {"cg": pcg, "cocg": cocg, "gmres": gmres, "bicgstab": bicgstab}

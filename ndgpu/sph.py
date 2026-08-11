@@ -35,6 +35,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .backend import asnumpy
+from .linalg import anderson_step as _anderson_step
 from .materials import Material
 
 
@@ -125,14 +127,15 @@ def flux_weighted_homogenize(flux, materials, material_map, region_map,
     tests/verification/test_sph.py); it is what lets the SPH factor solve, added
     next, recover the reference eigenvalue rather than just its flux shape.
     """
-    G = int(np.asarray(flux).shape[0])
+    flux = asnumpy(flux)          # device Result.flux -> host (see module note)
+    G = int(flux.shape[0])
     ncell = int(np.asarray(material_map).size)
     cells, n, V, matidx = _mixed_entries(material_map, region_map, cell_volume,
                                          ncell, mix_material, mix_weight,
                                          mix_region_map)
     tab = _cell_tables(materials, matidx)
     R = int(max(n.max(), np.asarray(region_map).max())) + 1
-    phi = np.asarray(flux).reshape(G, -1)[:, cells]   # (G, n_entries)
+    phi = flux.reshape(G, -1)[:, cells]               # (G, n_entries)
 
     region_flux = np.zeros((R, G))
     region_volume = np.zeros(R)
@@ -218,7 +221,7 @@ def region_average(flux, region_map, mix_material=None, mix_weight=None,
     solve's region fluxes are averaged over the *same* fractional volumes -- SPH
     compares these two directly, so an inconsistent split biases every factor.
     """
-    f = np.asarray(flux)
+    f = asnumpy(flux)
     G = f.shape[0]
     cells, n, V, _ = _mixed_entries(region_map, region_map, 1.0, f[0].size,
                                     mix_material, mix_weight, mix_region_map)
@@ -251,7 +254,12 @@ def _scale_material_get(mat, mu, nu):
         sigma_a=np.asarray(mat.sigma_a) * mu,
         nu_sigma_f=np.asarray(mat.nu_sigma_f) * mu,
         sigma_s=np.asarray(mat.sigma_s) * mu[:, None],
-        chi=np.asarray(mat.chi), total=np.asarray(mat.sigma_t) * mu)
+        chi=np.asarray(mat.chi), total=np.asarray(mat.sigma_t) * mu,
+        # kappa*Sigma_f is a macroscopic reaction-rate coefficient too. Losing
+        # it made an SPH-corrected model silently fall back to nu*Sigma_f for
+        # thermal coupling, changing the power shape by energy group.
+        kappa_fission=(None if mat.kappa_fission is None else
+                       np.asarray(mat.kappa_fission) * mu))
 
 
 def sph_get_correct(homogenized_materials, region_map, reference_region_flux,
@@ -390,7 +398,10 @@ def _scale_material(mat, mu, d_scaling=None):
         sigma_a=np.asarray(mat.sigma_a) * mu,
         nu_sigma_f=np.asarray(mat.nu_sigma_f) * mu,
         sigma_s=np.asarray(mat.sigma_s) * mu[:, None],
-        chi=np.asarray(mat.chi), total=np.asarray(mat.sigma_t) * mu)
+        chi=np.asarray(mat.chi), total=np.asarray(mat.sigma_t) * mu,
+        # Preserve the energy-release reaction rate for coupled power edits.
+        kappa_fission=(None if mat.kappa_fission is None else
+                       np.asarray(mat.kappa_fission) * mu))
 
 @dataclass
 class SphResult:
@@ -406,25 +417,6 @@ class SphResult:
     df: np.ndarray = None
     bcf: np.ndarray = None
     cost: float = float("nan")
-
-
-def _anderson_step(X, F, beta):
-    """One Anderson-acceleration update from a history of iterates and residuals.
-
-    X : list of past log-factor vectors x_k (flattened). F : list of residuals
-    f_k = g(x_k) - x_k. Returns the next iterate: the least-squares mixture of
-    the history that minimizes the combined residual, damped by beta. With a
-    single point this is plain relaxed fixed-point x + beta*f.
-    """
-    m = len(F)
-    fk = F[-1]
-    if m == 1:
-        return X[-1] + beta * fk
-    # least squares over residual differences (unconstrained form, Walker-Ni)
-    dF = np.column_stack([F[i + 1] - F[i] for i in range(m - 1)])   # (n, m-1)
-    dX = np.column_stack([X[i + 1] - X[i] for i in range(m - 1)])
-    gamma, *_ = np.linalg.lstsq(dF, fk, rcond=None)
-    return X[-1] + beta * fk - (dX + beta * dF) @ gamma
 
 
 # Strength of the linear pull back to mu = 1 from an infeasible trial point.
@@ -754,7 +746,7 @@ def sph_correct_monolithic(homogenized_materials, region_map,
     R = len(homogenized_materials)
     ref = np.asarray(reference_region_flux, dtype=float)
     live = (ref > ref.max() * 1e-12).reshape(-1)
-    flux0 = np.asarray(flux0, dtype=float)
+    flux0 = np.asarray(asnumpy(flux0), dtype=float)
     fshape = flux0.shape
     nflux = flux0.size
     scale = float(np.abs(flux0).max()) or 1.0

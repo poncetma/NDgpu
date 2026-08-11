@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from . import kernels
 from .stencil import (BC_REFLECTIVE, BC_VACUUM, BC_ZERO_FLUX, GroupOperator,
                       normalize_bc)
 
@@ -103,24 +104,43 @@ class CongruentSDPNOperator:
             if (i, i) in self._react:
                 diag[i] += self._react[(i, i)]
         self.inv_diag = 1.0 / diag
+        self._react_stack = None   # dense (M, M, *grid), built on first fused apply
+        self._proj_w = None
+
+    def _fused_tables(self, u):
+        """Device-side weight vectors and the dense reaction stack (GPU only).
+
+        Built on first fused apply, not in __init__, so the CPU path never
+        allocates the M x M dense form -- it keeps walking the sparse
+        ``_react`` dict instead.
+        """
+        if self._react_stack is None:
+            xp, M = self.xp, self.M
+            self._proj_w = [xp.asarray(w, dtype=u.dtype) for w, _ in self._proj]
+            self._react_stack = kernels.stack_pairs(
+                xp, self._react, M, u.shape[1:], u.dtype)
+        return self._proj_w, self._react_stack
 
     def apply(self, u):
-        """Return the symmetrized block applied to u of shape (M, *grid)."""
+        """Return the symmetrized block applied to u of shape (M, *grid).
+
+        Three kernels per projection (gather the M moments onto one field, one
+        stencil, scatter it back) plus one for the whole M x M reaction --
+        rather than the ~2M+13 that the per-moment expressions cost.
+        """
         xp = self.xp
-        M = self.M
         out = xp.zeros_like(u)
+        if kernels.use_fused(xp, "block"):
+            proj_w, react = self._fused_tables(u)
+            s = xp.empty(u.shape[1:], dtype=u.dtype)
+            for wd, (_, L) in zip(proj_w, self._proj):
+                kernels.moment_gather(xp, u, wd, out=s)
+                kernels.moment_scatter_add(xp, out, L.apply(s), wd)
+            return kernels.dense_react_add(xp, out, u, react, self._react)
         for w, L in self._proj:
-            s = None
-            for i in range(M):
-                if w[i] != 0.0:
-                    s = w[i] * u[i] if s is None else s + w[i] * u[i]
-            Ls = L.apply(s)
-            for i in range(M):
-                if w[i] != 0.0:
-                    out[i] += w[i] * Ls
-        for (i, j), f in self._react.items():
-            out[i] += f * u[j]
-        return out
+            kernels.moment_scatter_add(
+                xp, out, L.apply(kernels.moment_gather(xp, u, w)), w)
+        return kernels.dense_react_add(xp, out, u, None, self._react)
 
 
 # Simplified double-PN (SDPN) coefficient matrices c^(m), from Carreno,
@@ -585,16 +605,36 @@ class SDPNGroupOperator:
                 for i in range(M):
                     diag[i][sl] = diag[i][sl] + K[..., i, i]
         self.inv_diag = 1.0 / diag
+        self._stacked_coupling = None   # dense (M, M, *grid), on first fused apply
+
+    def _coupling_stack(self, u):
+        """Dense (M, M, *grid) off-diagonal coupling, built on first fused apply.
+
+        The diagonal stays zero: the (i, i) reaction lives inside the moment
+        operators. Lazy so the CPU path keeps using the sparse dict.
+        """
+        if self._stacked_coupling is None:
+            self._stacked_coupling = kernels.stack_pairs(
+                self.xp, self.coupling, self.M, u.shape[1:], u.dtype)
+        return self._stacked_coupling
 
     def apply(self, u):
-        """Return the SDPN block operator applied to u of shape (M, *grid)."""
+        """Return the SDPN block operator applied to u of shape (M, *grid).
+
+        Each moment's leakage is written straight into its row where the
+        spatial operator supports it, and the whole M x M off-diagonal reaction
+        is one pass -- M+1 kernels rather than M*(M+1) or so.
+        """
         xp = self.xp
         out = xp.empty_like(u)
+        into = getattr(self.moments[0], "supports_out", False)
         for i in range(self.M):
-            out[i] = self.moments[i].apply(u[i])
-            for j in range(self.M):
-                if i != j:
-                    out[i] = out[i] + self.coupling[(i, j)] * u[j]
+            if into:
+                self.moments[i].apply(u[i], out=out[i])
+            else:
+                out[i] = self.moments[i].apply(u[i])
+        stack = self._coupling_stack(u) if kernels.use_fused(xp, "block") else None
+        kernels.dense_react_add(xp, out, u, stack, self.coupling)
         if self.marshak is not None:
             # Coupled Marshak vacuum: row i += sum_j K_ij U_j on each vacuum-face
             # boundary layer (K = leakage-per-volume, reduces to the per-moment

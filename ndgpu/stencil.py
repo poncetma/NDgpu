@@ -6,9 +6,10 @@ exact for piecewise-constant D (so heterogeneous cores are handled correctly).
 
 The operator is deliberately matrix-free: instead of assembling a sparse
 matrix, we precompute one face-coupling array per axis plus the diagonal, and
-`apply()` is six shifted multiply-adds. On the GPU backend each of these is a
-fused elementwise CUDA kernel over contiguous memory -- this is both faster and
-lighter than sparse CSR SpMV, and it keeps the entire operator on-device.
+`apply()` is six shifted multiply-adds -- both faster and lighter than sparse
+CSR SpMV, and it keeps the entire operator on-device. On the GPU backend those
+six multiply-adds (13 kernel launches, 7 temporaries) collapse into a single
+hand-written CUDA kernel; see :mod:`ndgpu.kernels` and `apply` below.
 
 The resulting operator is symmetric positive definite as long as removal is
 positive somewhere (zero-flux BC) which is what lets us use CG. On
@@ -155,6 +156,10 @@ class GroupOperator:
                 Ignored on Cartesian grids (already symmetric either way).
     """
 
+    #: apply() accepts out=, so block operators can write straight into a row
+    #: of their state instead of allocating a temporary per moment.
+    supports_out = True
+
     def __init__(self, xp, grid, D, removal, bc=BC_ZERO_FLUX, active=None,
                  mask_bc=BC_VACUUM, symmetric=True):
         bc = normalize_bc(bc)
@@ -266,10 +271,68 @@ class GroupOperator:
             diag = diag * self.row_scale
         self.diag = diag
         self.inv_diag = 1.0 / diag  # Jacobi preconditioner
+        self._fused = {}            # dtype -> fused-kernel argument buffers
+        self._op_dtype = None       # promoted dtype of the stencil arrays
 
-    def apply(self, phi):
-        """Return A phi (allocates the output array)."""
-        out = self._stencil_diag * phi
+    # -- fused GPU path ----------------------------------------------------
+    # apply() below is 13 kernel launches and 7 full-size temporaries. On GPU
+    # that is the dominant cost of every diffusion/SP3/SPN/DSA/CMFD solve at
+    # the grid sizes this code runs, so it is collapsed into one launch by
+    # ndgpu.kernels.stencil7_apply. Correctness is unchanged: the fused kernel
+    # accumulates the six neighbours in the same order as the slice
+    # expressions, and the NumPy path is what runs whenever the backend is not
+    # CuPy or fusion is switched off (NDGPU_FUSED=0).
+
+    def _fusable(self, dtype):
+        """True if A phi has dtype `dtype`, i.e. the cached stencil arrays can
+        be cast to it losslessly. Refuses e.g. a real phi against the complex
+        removal the noise solver builds, where casting down would drop the
+        imaginary part -- there the generic path (which promotes) is correct.
+        """
+        if self._op_dtype is None:
+            self._op_dtype = np.result_type(
+                self._stencil_diag.dtype, self.wx.dtype, self.wy.dtype,
+                self.wz.dtype)
+        return np.result_type(self._op_dtype, dtype) == dtype
+
+    def _fused_arrays(self, dtype):
+        """Contiguous, common-dtype copies of the stencil arrays for the kernel.
+
+        Built once per dtype and cached. The cast matters for the noise solver,
+        where a complex removal makes the diagonal complex while the face
+        couplings stay real -- the kernel wants one type placeholder.
+        Zero-size coupling arrays (a grid one cell thick on some axis) become
+        1-element dummies so the kernel always has a valid pointer; the
+        corresponding branches are dead in that case.
+        """
+        buf = self._fused.get(dtype)
+        if buf is None:
+            xp = self.xp
+
+            def prep(a):
+                a = xp.ascontiguousarray(a, dtype=dtype)
+                return a if a.size else xp.zeros(1, dtype=dtype)
+
+            rs = None if self.row_scale is None else prep(
+                xp.broadcast_to(self.row_scale, self.shape))
+            buf = (prep(self._stencil_diag), prep(self.wx), prep(self.wy),
+                   prep(self.wz), rs)
+            self._fused[dtype] = buf
+        return buf
+
+    def apply(self, phi, out=None):
+        """Return A phi (allocating the output array unless ``out`` is given)."""
+        from . import kernels
+
+        if (kernels.use_fused(self.xp, "stencil") and phi.flags.c_contiguous
+                and self._fusable(phi.dtype)):
+            diag, wx, wy, wz, rs = self._fused_arrays(phi.dtype)
+            return kernels.stencil7_apply(self.xp, phi, diag, wx, wy, wz, rs,
+                                          out=out)
+        if out is None:
+            out = self._stencil_diag * phi
+        else:
+            self.xp.multiply(self._stencil_diag, phi, out=out)
         out[1:, :, :] -= self.wx * phi[:-1, :, :]
         out[:-1, :, :] -= self.wx * phi[1:, :, :]
         out[:, 1:, :] -= self.wy * phi[:, :-1, :]

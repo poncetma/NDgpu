@@ -16,6 +16,19 @@ from ndgpu import (DiffusionEigenSolver, Grid, Material, PWR_TWO_GROUP,
                    sph_correct)
 
 
+def test_sph_material_keeps_the_fission_energy_power_coefficient():
+    """An SPH model handed to thermal coupling must not change power weighting
+    from kappa*Sigma_f to the nu*Sigma_f fallback."""
+    from ndgpu.sph import _scale_material
+
+    mat = Material(name="fuel", diffusion=[1.2, 0.3], sigma_a=[0.01, 0.1],
+                   nu_sigma_f=[0.02, 0.2], kappa_fission=[0.015, 0.11])
+    mu = np.array([1.1, 0.8])
+    corrected = _scale_material(mat, mu)
+    np.testing.assert_allclose(corrected.kappa_fission,
+                               mat.kappa_fission * mu)
+
+
 def _reference():
     absorber = Material(name="poison", diffusion=[1.1, 0.5], sigma_a=[0.01, 0.20],
                         nu_sigma_f=[0, 0], sigma_s=[[0, 0.03], [0, 0]])

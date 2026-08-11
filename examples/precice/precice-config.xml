@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<precice-configuration>
+  <log enabled="1">
+    <sink filter="%Severity% > debug" />
+  </log>
+
+  <profiling mode="fundamental" synchronize="false" />
+
+  <!-- waveform-degree 0: this is a STEADY coupling. The single time window is
+       pseudo-time and its iterations are the Picard steps, so there is no
+       history within a window to interpolate. (A transient coupling would use
+       a higher degree; interpolating a fixed point that does not move only
+       costs work.) -->
+  <data:scalar name="Power" waveform-degree="0" />
+  <data:scalar name="Temperature" waveform-degree="0" />
+
+  <!-- Volume coupling: the meshes are point clouds of CELL CENTROIDS over the
+       whole core, not a surface. preCICE needs connectivity only for
+       projection-based mappings; nearest-neighbour wants coordinates alone. -->
+  <mesh name="Neutronics-Mesh" dimensions="2">
+    <use-data name="Power" />
+    <use-data name="Temperature" />
+  </mesh>
+
+  <mesh name="Thermal-Mesh" dimensions="2">
+    <use-data name="Power" />
+    <use-data name="Temperature" />
+  </mesh>
+
+  <participant name="Neutronics">
+    <provide-mesh name="Neutronics-Mesh" />
+    <write-data name="Power" mesh="Neutronics-Mesh" />
+    <read-data name="Temperature" mesh="Neutronics-Mesh" />
+  </participant>
+
+  <participant name="Thermal">
+    <receive-mesh name="Neutronics-Mesh" from="Neutronics" />
+    <provide-mesh name="Thermal-Mesh" />
+    <write-data name="Temperature" mesh="Thermal-Mesh" />
+    <read-data name="Power" mesh="Thermal-Mesh" />
+    <!-- Both participants define the SAME vertex set (ndgpu.coupling.
+         coupling_vertices on identically-built problems), so every vertex's
+         nearest neighbour is itself at distance zero: the mapping is the
+         identity permutation and the data crosses preCICE bit-exact.
+         constraint MUST be consistent - Power (W/cm^3) and Temperature (K) are
+         both intensive field values; "conservative" would sum contributions
+         at coincident vertices and silently corrupt them. -->
+    <mapping:nearest-neighbor direction="write" from="Thermal-Mesh"
+                              to="Neutronics-Mesh" constraint="consistent" />
+    <mapping:nearest-neighbor direction="read" from="Neutronics-Mesh"
+                              to="Thermal-Mesh" constraint="consistent" />
+  </participant>
+
+  <m2n:sockets acceptor="Neutronics" connector="Thermal" />
+
+  <coupling-scheme:serial-implicit>
+    <participants first="Neutronics" second="Thermal" />
+    <!-- ONE pseudo-time window. Steady coupling is many iterations inside a
+         single window, not many windows. -->
+    <max-time-windows value="1" />
+    <time-window-size value="1.0" />
+    <max-iterations value="200" />
+
+    <relative-convergence-measure data="Temperature" mesh="Neutronics-Mesh"
+                                  limit="1e-10" />
+    <relative-convergence-measure data="Power" mesh="Neutronics-Mesh"
+                                  limit="1e-10" />
+
+    <exchange data="Power" mesh="Neutronics-Mesh" from="Neutronics"
+              to="Thermal" substeps="false" />
+    <!-- Neutronics is `first`, so it reads Temperature at the top of the very
+         first iteration, before Thermal has run at all in this window. That
+         exchange therefore needs initial data, and Thermal is the participant
+         whose requires_initial_data() comes back true. Power needs none:
+         Neutronics writes it before Thermal reads it, within the iteration. -->
+    <exchange data="Temperature" mesh="Neutronics-Mesh" from="Thermal"
+              to="Neutronics" initialize="true" substeps="false" />
+
+    <!-- Constant relaxation, matching ndgpu's CoupledSolver(relaxation=omega)
+         expression for expression, so the two couplings produce the SAME
+         iterates and not merely the same fixed point. Swap in the IQN-ILS
+         block from README.md for production speed. -->
+    <acceleration:constant>
+      <relaxation value="0.5" />
+    </acceleration:constant>
+  </coupling-scheme:serial-implicit>
+</precice-configuration>

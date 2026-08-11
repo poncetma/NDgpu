@@ -16,11 +16,15 @@ from .hex import HexDiffusionEigenSolver, HexGrid, offset_to_axial
 from .materials import Kinetics, Material, ONE_GROUP_DEMO, PWR_TWO_GROUP
 from .mesh import (Mesh, MeshResult, UnstructuredDiffusionSolver, assemble_mesh,
                   assemble_mesh_3d, read_gmsh)
-from .model import (HexLattice, MeshModel, Model, ModelResult, ReactorResult,
-                   TransientModelResult)
+from .model import (FeedbackSpec, HexLattice, MeshModel, Model, ModelResult,
+                   ReactorResult, TransientModelResult, TriReactor, hex_disk,
+                   hex_ring)
 from .noise import (NoiseResult, NoiseSolver, NoiseSource,
                     zero_power_transfer_function)
 from .perturbation import first_order_reactivity
+from .power import fission_energy_xs, power_density
+from .feedback import ThermalFeedback
+from .thermal import ConductionSolver, ThermalMaterial, ThermalResult
 from .solver import (DiffusionEigenSolver, Result, SDP1EigenSolver,
                      SDP2EigenSolver, SDP3EigenSolver, SP1EigenSolver,
                      SP3EigenSolver, SP5EigenSolver, SP7EigenSolver)
@@ -46,6 +50,10 @@ __all__ = [
     "Model",
     "MeshModel",
     "HexLattice",
+    "TriReactor",
+    "FeedbackSpec",
+    "hex_ring",
+    "hex_disk",
     "ModelResult",
     "ReactorResult",
     "TransientModelResult",
@@ -96,6 +104,12 @@ __all__ = [
     "k_from_buckling",
     "k_infinite",
     "first_order_reactivity",
+    "power_density",
+    "fission_energy_xs",
+    "ConductionSolver",
+    "ThermalMaterial",
+    "ThermalResult",
+    "ThermalFeedback",
     "UnstructuredDiffusionSolver",
     "Mesh",
     "MeshResult",

@@ -1,8 +1,9 @@
 # NDgpu — GPU-native neutron diffusion & SP3 solver
 
-Steady-state multigroup **k-eigenvalue** reactor physics (criticality) on 3D
-structured grids, running natively on CUDA GPUs via CuPy, with a NumPy CPU
-fallback that shares 100% of the code path.
+GPU-native finite-volume reactor physics for structured Cartesian,
+triangular, and triangular-prism grids, with a NumPy CPU fallback that shares
+the same code path. NDgpu is aimed particularly at SPH-corrected full-core
+diffusion and fast neutronics/thermal transient coupling.
 
 ```python
 from ndgpu import DiffusionEigenSolver, Grid, PWR_TWO_GROUP
@@ -12,6 +13,17 @@ result = DiffusionEigenSolver(grid, PWR_TWO_GROUP, device="auto").solve()
 print(result)          # k_eff, iterations, time, device
 flux = result.flux     # (groups, nx, ny, nz), on the solve device
 ```
+
+## Main features
+
+| Area | Capability |
+|---|---|
+| Reactor models | Human-oriented `Model`, `MeshModel`, and `HexLattice` → `TriReactor` APIs |
+| Geometry | Cartesian 1-D/2-D/3-D, cylindrical r-z, unstructured meshes, and body-fitted 2-D/3-D tri-grids |
+| Neutronics | Multigroup diffusion, SP1/3/5/7, SDP1/2/3, adjoint, delayed-neutron transients, and advanced SN/noise interfaces |
+| Equivalence | SPH generation tools and direct corrected-material hand-off without rebuilding the reactor |
+| Coupling | Steady and transient heat conduction with Doppler/density feedback and cached moving-control states |
+| Performance | Matrix-free CPU/GPU execution, device-resident coupled fields, thermal subcycling, reusable operators, and profiling counters |
 
 ## Physics
 
@@ -73,6 +85,23 @@ pip install -e .                 # CPU (NumPy)
 pip install -e .[cuda12]        # + CuPy for CUDA 12.x GPUs
 ```
 
+## Documentation
+
+- **[User guide](docs/user_guide.md)** — choose an API, build a new reactor,
+  apply SPH constants, and run steady, transient, and coupled GPU calculations.
+- **[Model API reference](docs/model_api.md)** — builder details, result fields,
+  boundaries, control drums, and the validated TWIGL workflow.
+- **[Coupling guide](docs/coupling.md)** — in-process and external thermal-code
+  coupling interfaces and performance considerations.
+- **[Latest GPU Colab](notebooks/colab_coupled_transient_gpu_latest.ipynb)** —
+  executable coverage of the current tri-grid and coupled-transient features,
+  including an optional one-minute 3-D HP-MR workload.
+- **[Quasi-static acceleration plan](docs/quasistatic_acceleration_plan.md)** —
+  proposed amplitude/shape algorithm, GPU architecture, validation gates, and
+  performance targets for long coupled transients.
+- **[Examples](examples/)** — complete scripts from simple Cartesian problems
+  to the 3-D prismatic and HP-MR models.
+
 ## Quickstart
 
 The `Model` front end defines a reactor in centimetres, paints regions with your
@@ -127,16 +156,21 @@ geometry backends with the same report:
 |---|---|---|
 | `ndgpu.Model` | structured Cartesian (1/2/3-D), diffusion/SP3, adjoint | `bare_reactor.py`, `reflected_core.py`, `adjoint_importance.py` |
 | `ndgpu.MeshModel` | arbitrary unstructured mesh (Gmsh or assembled), 2/3-D | `unstructured_mesh.py` |
-| `ndgpu.HexLattice` | hexagonal assembly lattice on the triangular solver, diffusion/SP3 | `hex_lattice.py` |
+| `ndgpu.HexLattice.build()` → `TriReactor` | reusable 2-D/3-D triangular core; steady, transient and thermal coupling | `custom_tri_reactor.py`, `hex_lattice.py` |
 
 ```python
 # unstructured mesh: paint by tag, centroid box, or a predicate on the centroid
 ndgpu.MeshModel("core.msh").fill(reflector).assign(fuel, tag=1).set_boundary("vacuum").run()
 
-# hexagonal lattice on the body-fitted triangular solver
-(ndgpu.HexLattice(pitch=20, refine=4)
- .set_site((0, 0), fuel).set_site((1, 0), reflector)
- .set_boundary("vacuum").run(method="sp3"))
+# reusable hexagonal/prismatic reactor on the body-fitted triangular solver
+core = (ndgpu.HexLattice(pitch=20, refine=4)
+        .set_disk(3, reflector).set_disk(2, fuel)
+        .set_boundary("vacuum")
+        .extrude(height=200, nz=20, boundary="vacuum")
+        .set_kinetics(velocities=[1e7, 3e5], beta=[0.0065], decay=[0.08])
+        .build())
+core.steady(method="sp3", device="gpu")
+core.transient(t_end=1.0, dt=0.02, device="gpu")
 ```
 
 A `Model` also runs **transients**. It solves the steady state first (its
@@ -152,11 +186,15 @@ the result carries both the power history and the initial `.steady` solution:
 ```
 
 All builders return raw `k_eff`, `flux`, and balance fractions as plain values.
-For SPH or the lower-level knobs, use the solver classes directly.
+`TriReactor.with_materials(...)` accepts SPH-corrected material lists without
+rebuilding geometry, and `configure_thermal(...)` enables steady or transient
+GPU-resident neutronics/conduction coupling through the same model object.
 
-Full API reference and a literature-validated worked example (the TWIGL
-benchmark, static + transient) are in **[docs/model_api.md](docs/model_api.md)**;
-runnable as `examples/twigl_benchmark.py`.
+Start with the **[user guide](docs/user_guide.md)** for a complete new-design
+workflow. The detailed API reference and a literature-validated worked example
+(the TWIGL benchmark, static + transient) are in
+**[docs/model_api.md](docs/model_api.md)**; runnable as
+`examples/twigl_benchmark.py`.
 
 ## Repository map
 
@@ -167,7 +205,7 @@ runnable as `examples/twigl_benchmark.py`.
 | `tests/verification/` | exact-mathematics checks: analytic solutions, convergence order, invariants, reader transcription |
 | `tests/validation/` | published reactor problems solved end-to-end vs their references (which live with the builders above) |
 | `examples/` | runnable demos; `speed_benchmark.py` is the CPU-vs-GPU performance harness |
-| `docs/` | theory & benchmarks report |
+| `docs/` | user/API/coupling guides, theory, validation reports, and optimization notes |
 | `dev-refs/` | third-party reference inputs used to derive data; never imported |
 
 See `tests/README.md` for the verification/validation taxonomy.
@@ -482,6 +520,80 @@ matrix-free source iteration is slower on this near-critical, low-frequency case
 diffusion, ~210 ms SP3.) See `examples/noise_femffusion.py`,
 `tests/validation/test_noise_femffusion.py`, and
 `ndgpu.benchmarks.build_femffusion_1d_noise`.
+
+## Coupled neutronics / thermal (conduction + preCICE)
+
+`ConductionSolver` solves steady heat conduction with a volumetric heat-pipe
+sink on the *same* mesh as the neutronics:
+
+```
+-div(k grad T) + h (T - T_hp) = q'''
+```
+
+This is the operator the diffusion solver already builds — `-div(D grad .) +
+Sigma_r` with `D -> k` and `Sigma_r -> h` — so conduction inherits the
+harmonic-mean face coefficients, the `active` mask, the Robin boundary law, the
+triangular and extruded-prism meshes, and the matrix-free CPU/GPU Jacobi-CG
+solve with no new discretization. A heat-pipe microreactor has no coolant: the
+pipes draw power in proportion to the local solid-to-pipe temperature
+difference and carry it out of the core, which homogenizes to that `h` term in
+the fuel and is also what makes the problem well posed on an otherwise
+adiabatic core.
+
+Temperature comes back to the neutronics through `ThermalFeedback` — Doppler
+(`dSigma_a = c_D Sigma_a (sqrt(T) - sqrt(T_ref))`, **added to absorption**, not
+scaled onto removal, which would drag the out-scatter with it) plus an optional
+density term — injected by the new `xs_update=` hook on `Fields` and every
+eigen solver. Power comes the other way as `power_density(...)`, normalized to
+the rated thermal power so the absolute units of the library's `kappaFission`
+cancel out.
+
+```python
+from ndgpu.benchmarks.hpmr import build_hpmr2d
+from ndgpu.benchmarks.hpmr_thermal import build_hpmr_coupling, hpmr_endfb8_builtin
+from ndgpu.coupling import CoupledSolver
+
+p = build_hpmr2d(refine=4, drum_angle_deg=180.0, absorber="polar",
+                 materials=hpmr_endfb8_builtin())
+res = CoupledSolver(build_hpmr_coupling(p)).solve(tol=1e-8, anderson_depth=5)
+print(res.k_eff, res.peak_temperature)
+```
+
+`python examples/hpmr_coupled.py [refine] [drum_deg] [groups] [device] [nz]` runs
+the HP-MR at 2 MWt and reports the **temperature defect** — the reactivity lost
+between the cold core and the hot one, which an isothermal calculation cannot
+see. At refine 4 on the real 11-group ENDF/B-8 data the 2D core converges in
+4 coupling iterations (21 s): k 1.164887 cold → 1.154110 hot, a defect of
+−802 pcm, fuel at 786 / 799 / 829 K (min / mean / max), energy balance closing
+to 2e-13.
+
+Because the eigenvalue solve renormalizes its flux, the power *level* is
+imposed and feedback only redistributes it — so the fixed point is strongly
+contractive (~8e-3 per iteration) and converges in 4–6 Picard steps without
+acceleration.
+
+**The same two physics also run as separate processes under
+[preCICE](https://precice.org)** (`examples/precice/`), volume-coupled over the
+core's cell centroids. Both participants build their vertex list from one
+function on identically-constructed problems, so `nearest-neighbor` is the
+identity permutation and the exchange is bit-exact; and neither script contains
+any physics — both call the same `neutronics_step` / `thermal_step` the internal
+driver calls. That makes the cross-check a test of coupling machinery rather
+than of two copies of the same assumptions:
+
+| check | result |
+|---|---|
+| data crossing preCICE is the identity | bit-exact, every iteration |
+| **lockstep** vs the internal driver (constant relaxation 0.5 both sides) | `max\|Δk\| = 5.0e-13` across all 33 iterations, identical count |
+| same fixed point, IQN-ILS vs Anderson | same k to < 2e-8, **6 iterations vs 33** |
+
+The lockstep tier is the sharp one: two different iterations can share a fixed
+point, so agreeing only at convergence proves little — agreeing at *every* step
+localizes a discrepancy to where it appears.
+
+Theory, the exact boundary-source identity, the tolerance floor, and the
+install route (the system `libprecice` here is unusable — conda-forge instead)
+are in **[docs/coupling.md](docs/coupling.md)**.
 
 ## Benchmarks
 

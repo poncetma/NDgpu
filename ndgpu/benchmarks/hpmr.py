@@ -36,6 +36,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ..backend import asnumpy
 from ..hexraster import TriRaster, hex_site_xy, rasterize_hex_sites
 from ..materials import Kinetics, Material
 from ..tri import TriGrid
@@ -555,4 +556,73 @@ def build_hpmr3d(refine: int = 4, nz: int = 20, drum_angle_deg=0.0,
                        active=mmap > 0, mask_bc="vacuum",
                        bc=("reflective", "reflective", "vacuum"),
                        kinetics=HPMR_KINETICS, drum_angle_deg=np.array(angles),
-                       mix_material=mix_material, mix_weight=mix_weight)
+                       mix_material=mix_material, mix_weight=mix_weight,
+                       # The extrusion keeps the 2D raster's physical frame, so
+                       # anything given in core coordinates (pin positions,
+                       # coupling-mesh vertices) can be placed in 3D too.
+                       raster=p2d.raster)
+
+
+def hpmr_sn_homogenization(refine: int = 6, n_polar: int = 2, n_azi: int = 12,
+                           scheme: str = "scb", device: str = "auto",
+                           tol_k: float = 1e-7, tol_source: float = 1e-6,
+                           materials=None):
+    """Transport-weighted homogenization of the HP-MR assembly: one tri-S_N solve
+    of the pin-resolved geometry, collapsed two ways.
+
+    The assembly constants for :func:`build_hpmr2d` are normally taken from a
+    *diffusion* solve of the pin lattice. The pin cell is precisely where
+    diffusion is least trustworthy, and it shows: S_N gives k_inf = 1.177297
+    against diffusion's 1.186813 at refine 6, a ~950 pcm difference that the flux
+    shape carries into the homogenized cross sections too. This routes the
+    homogenization through a transport reference instead, for ~91 s of CPU.
+
+      ``assembly``       1 material, flux-weighted over the whole assembly. Feed
+                         to :func:`hpmr_materials_builtin` for a core built on
+                         transport-weighted constants.
+      ``pin_materials``  the same flux collapsed per *pin type* instead -- 4
+                         materials (graphite, fuel_compact, moderator_pin,
+                         heatpipe_pin), each clad sharing its pin's region so the
+                         homogenization performs the clad smearing. Diagnostic
+                         here, and the natural starting point for a per-pin SPH
+                         correction.
+
+    Note this is plain flux weighting, NOT SPH: reaction rates are exact only at
+    the reference flux, and a coarse solve has a different one. See
+    :func:`~ndgpu.sph.sph_correct` for the correction that closes that gap
+    (``method="jfnk"`` -- Picard runs away).
+
+    Returns a dict with keys: k_inf, pin_materials, assembly, region_flux,
+    region_volume, problem, flux.
+    """
+    from ..sph import flux_weighted_homogenize
+    from ..tri_sn import TriSNTransportSolver
+    from .hpmr_assembly import build_hpmr_assembly2d
+
+    asm = build_hpmr_assembly2d(refine=refine, materials=materials)
+    r = TriSNTransportSolver(
+        asm.grid, asm.materials, asm.material_map, bc="periodic", scheme=scheme,
+        device=device, n_polar=n_polar, n_azi=n_azi,
+        mix_material=asm.mix_material, mix_weight=asm.mix_weight,
+    ).solve(tol_k=tol_k, tol_source=tol_source)
+    if not r.converged:
+        raise RuntimeError(f"S_N assembly reference did not converge: {r}")
+    flux = asnumpy(r.flux)
+
+    # Pin types, not materials: each clad shares its pin's region, which is what
+    # turns the homogenization into the smearing we want.
+    #   0 graphite | 1 fuel | 2 moderator+clad | 3 heat pipe+wall
+    region_of = np.array([0, 1, 2, 2, 3, 3])
+    mm = np.asarray(asm.mix_material)
+    kw = dict(cell_volume=asm.grid.cell_volume, mix_material=asm.mix_material,
+              mix_weight=asm.mix_weight)
+    pins, rflux, rvol = flux_weighted_homogenize(
+        flux, asm.materials, asm.material_map, region_of[asm.material_map],
+        mix_region_map=region_of[np.clip(mm, 0, None)], **kw)
+    whole, _, _ = flux_weighted_homogenize(
+        flux, asm.materials, asm.material_map,
+        np.zeros(asm.material_map.shape, dtype=np.int64),
+        mix_region_map=np.zeros(mm.shape, dtype=np.int64), **kw)
+
+    return dict(k_inf=float(r.k_eff), pin_materials=pins, assembly=whole[0],
+                region_flux=rflux, region_volume=rvol, problem=asm, flux=flux)

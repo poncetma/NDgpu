@@ -86,6 +86,10 @@ class TriGroupOperator:
     handling as the Cartesian and hex operators.
     """
 
+    #: apply() accepts out=, so block operators can write straight into a row
+    #: of their state instead of allocating a temporary per moment.
+    supports_out = True
+
     def __init__(self, xp, grid: TriGrid, D, removal, bc=BC_VACUUM, active=None,
                  mask_bc=BC_VACUUM, df=None, bcf=None):
         bc = normalize_bc(bc)  # only the z faces read bc; in-plane uses mask_bc
@@ -274,6 +278,43 @@ class TriGroupOperator:
 
         self.diag = diag
         self.inv_diag = 1.0 / diag
+        self._fused = {}            # dtype -> fused-kernel argument buffers
+        self._op_dtype = None       # promoted dtype of the stencil arrays
+
+    def _fusable(self, dtype):
+        """True if A phi has dtype `dtype`, so the cached arrays can be cast to
+        it losslessly. Refuses a real phi against the complex removal the noise
+        solver builds, where casting down would drop the imaginary part."""
+        if self._op_dtype is None:
+            self._op_dtype = np.result_type(
+                self.diag.dtype, self.a_hyp.dtype, self.a_v.dtype,
+                self.a_h.dtype,
+                *([] if self.wz is None else [self.wz.dtype]))
+        return np.result_type(self._op_dtype, dtype) == dtype
+
+    def _fused_arrays(self, dtype):
+        """Contiguous, common-dtype copies of the coupling arrays for the kernel.
+
+        Zero-size families (a grid one cell wide, so there are no v or h faces)
+        become 1-element dummies: the kernel always needs a valid pointer, and
+        the branches that would read them are dead in that case.
+        """
+        buf = self._fused.get(dtype)
+        if buf is None:
+            xp = self.xp
+
+            def prep(a):
+                a = xp.ascontiguousarray(a, dtype=dtype)
+                return a if a.size else xp.zeros(1, dtype=dtype)
+
+            nz = self.shape[3] if len(self.shape) == 4 else 1
+            buf = (prep(self.diag), prep(self.a_hyp), prep(self.b_hyp),
+                   prep(self.a_v), prep(self.b_v), prep(self.a_h),
+                   prep(self.b_h),
+                   None if self.wz is None else prep(self.wz),
+                   self.shape[0], self.shape[1], nz)
+            self._fused[dtype] = buf
+        return buf
 
     def assemble(self):
         """Sparse CSR form of this operator.
@@ -334,8 +375,26 @@ class TriGroupOperator:
 
         return apply_prec
 
-    def apply(self, phi):
-        out = self.diag * phi
+    def apply(self, phi, out=None):
+        """Return A phi (allocating the output unless ``out`` is given).
+
+        The slice form below is ~15 kernel launches; on GPU it collapses into
+        one hand-written kernel (see :mod:`ndgpu.kernels`). The NumPy path is
+        what runs on CPU, when phi would have to be promoted, or with fusion
+        switched off.
+        """
+        from . import kernels
+
+        if (kernels.use_fused(self.xp, "stencil") and phi.flags.c_contiguous
+                and self._fusable(phi.dtype)):
+            dg, ah, bh, av, bv, ahh, bhh, wz, nx, ny, nz = \
+                self._fused_arrays(phi.dtype)
+            return kernels.tri_stencil_apply(self.xp, phi, dg, ah, bh, av, bv,
+                                             ahh, bhh, wz, nx, ny, nz, out=out)
+        if out is None:
+            out = self.diag * phi
+        else:
+            self.xp.multiply(self.diag, phi, out=out)
         out[:, :, 0] -= self.b_hyp * phi[:, :, 1]
         out[:, :, 1] -= self.a_hyp * phi[:, :, 0]
         out[1:, :, 0] -= self.b_v * phi[:-1, :, 1]

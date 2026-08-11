@@ -73,9 +73,15 @@ scatter Sigma_s,gg = Sigma_t - Sigma_a - Sigma_out, group transfer from
 material.sigma_s. So S_N, diffusion and SDPN all approximate the *same* physical
 problem and their k-eigenvalues are directly comparable.
 
-The wavefront sweep runs on numpy or cupy (``device=``); the DSA correction and
-GMRES stay host-side (scipy LU / Krylov) on the small scalar system. Vacuum and
-reflective boundaries are supported.
+The wavefront sweep, the DSA correction and the within-group GMRES all run on
+numpy or cupy (``device=``): on GPU the DSA operator is moved to the device once
+and solved with Jacobi-CG, and GMRES runs on grid-shaped device arrays, so a
+within-group solve stays on the GPU. (Both were host-side scipy until the DSA
+back-solve and the per-matvec ``asnumpy`` showed up as the dominant GPU cost.)
+The boundary incoming/outgoing edge fluxes are still host arrays -- they are
+small, ~M x max(nx, ny), and the reflective fixed point that consumes them is
+host-side; see the note on ``_sweep_wavefront``. Vacuum and reflective
+boundaries are supported.
 """
 
 from __future__ import annotations
@@ -86,9 +92,10 @@ from dataclasses import dataclass, field
 import numpy as np
 import scipy.sparse as sp
 from scipy.linalg import solve_banded
-from scipy.sparse.linalg import LinearOperator, factorized, gmres
+from scipy.sparse.linalg import factorized
 
 from .backend import asnumpy, get_backend
+from .linalg import gmres as gmres_dev
 from .grid import Grid
 from .materials import Material
 from .ldfe import mirror_maps
@@ -316,6 +323,17 @@ def _cmfd_power(facs, nsf, chi, scatter, phi0, k0, xp=np):
     return [asnumpy(p) for p in phi], k, True
 
 
+def _pair(xp, a, b):
+    """Read two 0-d device scalars back to the host in one transfer.
+
+    ``float(a); float(b)`` is two synchronizations; stacking them first is one.
+    Trivial on NumPy, worth having in a loop whose body is otherwise a sweep.
+    """
+    if xp is np:
+        return float(a), float(b)
+    return tuple(float(v) for v in asnumpy(xp.stack([a, b])))
+
+
 def _row_solve(q_ang, st_eff, c, binc, forward):
     """One row's 1D diamond-difference sweep along x (the 1D reference recurrence).
 
@@ -400,6 +418,15 @@ class SNTransportSolver:
     device        : "cpu" (default), "gpu"/"cuda", or "auto" -- array backend
                     for the wavefront sweep (numpy or cupy).
     max_inner     : cap on source iterations per within-group solve.
+    dsa_on_device : GPU only -- keep the DSA diffusion solve on the device
+                    (default). False restores the old host sparse-LU path, which
+                    copies the residual to the host and back on every source
+                    iteration; kept as the A/B lever for measuring the change.
+    dsa_rtol,
+    dsa_maxiter   : GPU only -- tolerance and iteration cap for the device DSA
+                    diffusion solve. Ignored on CPU, which uses an exact sparse
+                    LU. DSA accelerates the fixed point rather than defining
+                    it, so a loose solve costs outer iterations, not accuracy.
     """
 
     ACCELERATIONS = ("dsa", "dsa-gmres", "gmres", "si")
@@ -411,7 +438,8 @@ class SNTransportSolver:
                  require_fissile: bool = True, acceleration: str = "dsa",
                  outer_acceleration: str | None = None,
                  sweep: str = "wavefront", device: str = "cpu",
-                 max_inner: int = 800):
+                 max_inner: int = 800, dsa_on_device: bool = True,
+                 dsa_rtol: float = 1e-4, dsa_maxiter: int = 100):
         if grid.shape[2] != 1:
             raise ValueError("SNTransportSolver is 2D: grid must have nz == 1")
         # normalize_bc speaks the 6-face (3-axis) language of the 3D stencils;
@@ -450,6 +478,9 @@ class SNTransportSolver:
         self.outer_acceleration = outer_acceleration
         self.sweep_mode = sweep
         self.max_inner = max_inner
+        self.dsa_on_device = dsa_on_device  # False = old host-LU path (A/B knob)
+        self.dsa_rtol = dsa_rtol            # device DSA solve: loose tol + capped
+        self.dsa_maxiter = dsa_maxiter      # iters (an accelerator, not exact)
         self.xp = get_backend(device)
         if sweep == "rows" and self.xp is not np:
             raise ValueError("sweep='rows' is CPU-only; use sweep='wavefront'")
@@ -702,8 +733,55 @@ class SNTransportSolver:
                 "y0": np.zeros((self.M, self.nx)), "y1": np.zeros((self.M, self.nx))}
 
     # ---- diffusion synthetic acceleration ---------------------------------
+    def _make_diff_solver(self, A_host):
+        """``solve(b) -> x`` for an assembled diffusion operator, on this
+        solver's backend. NumPy: an exact sparse LU (``factorized``, cheap
+        reused back-solves). CuPy: the operator moves to the device once and is
+        solved with Jacobi-CG, so ``b`` and the result are *device* arrays and
+        the source iteration never leaves the GPU.
+
+        The host LU was the single largest defect in this file's GPU path: it
+        made every source iteration pay a device->host copy, a CPU sparse
+        back-solve and a host->device copy, which on a refined mesh costs far
+        more than the sweep it accelerates. DSA is an accelerator, not part of
+        the fixed point, so an inexact device solve changes only the outer rate
+        -- hence the loose tolerance, the iteration cap and the rare
+        convergence checks (each is a sync). Mirrors
+        ``tri_sn._make_diff_solver``, which already did this."""
+        if self.xp is np or not self.dsa_on_device:
+            return factorized(A_host.tocsc())
+        xp = self.xp
+        import cupyx.scipy.sparse as csp
+
+        from .linalg import pcg
+        Ad = csp.csr_matrix(A_host.tocsr())
+        inv_diag = 1.0 / Ad.diagonal()
+        rtol, maxit = self.dsa_rtol, self.dsa_maxiter
+        chk = max(1, min(maxit, 25))
+
+        def _solve(b):
+            # Bus-agnostic, for the same reason as tri_sn's: hybrid_sn is
+            # host-side and uses this solver's DSA as its preconditioner.
+            host = isinstance(b, np.ndarray)
+            bd = xp.asarray(b) if host else b
+            x, _ = pcg(lambda v: Ad @ v, bd, xp.zeros_like(bd), inv_diag, xp,
+                       rtol=rtol, maxiter=maxit, check_every=chk,
+                       raise_on_fail=False)
+            return asnumpy(x) if host else x
+        return _solve
+
+    def _apply_diff_solver(self, solve, r):
+        """Apply a ``_make_diff_solver`` callable to a grid-shaped residual,
+        keeping the data on whichever side of the bus it already lives."""
+        if self.xp is np:
+            return np.asarray(solve(np.asarray(r).ravel())).reshape(self.nx, self.ny)
+        if not self.dsa_on_device:          # host LU: round-trip, as it used to
+            d = solve(asnumpy(r).ravel())
+            return self.xp.asarray(d.reshape(self.nx, self.ny))
+        return solve(r.ravel()).reshape(self.nx, self.ny)
+
     def _dsa_factor(self, g):
-        """Sparse LU of the group-g DSA diffusion operator, built on first use.
+        """Solver for the group-g DSA diffusion operator, built on first use.
 
         D = 1/(3 Sigma_t), removal = Sigma_t - Sigma_s,gg, Marshak vacuum on
         every face: with the incoming boundary flux frozen, the within-group
@@ -714,14 +792,13 @@ class SNTransportSolver:
             A = diffusion_matrix(1.0 / (3.0 * st), np.maximum(st - ss, 0.0),
                                  self.hx, self.hy,
                                  ((BC_VACUUM, BC_VACUUM), (BC_VACUUM, BC_VACUUM)))
-            self._dsa_fac[g] = factorized(A)
+            self._dsa_fac[g] = self._make_diff_solver(A)
         return self._dsa_fac[g]
 
     def _dsa_apply(self, g, r):
         """Diffusion estimate of the scattering-iteration error from the
         scatter-weighted residual r = Sigma_s (phi^(l+1/2) - phi^l)."""
-        d = self._dsa_factor(g)(asnumpy(r).ravel())
-        return self.xp.asarray(d.reshape(self.nx, self.ny))
+        return self._apply_diff_solver(self._dsa_factor(g), r)
 
     # ---- CMFD outer acceleration ------------------------------------------
     def _cmfd_factor(self, g, p, Jx, Jy, shift=0.0):
@@ -846,8 +923,10 @@ class SNTransportSolver:
                 new = half + self._dsa_apply(g, ss_g * (half - phi))
             else:
                 new = half
-            d = float(xp.max(xp.abs(new - phi)))
-            scale = max(float(xp.max(xp.abs(new))), 1e-300)
+            # One host transfer per iteration, not two: both reductions are
+            # queued and read back together (each float() is a separate sync).
+            d, scale = _pair(xp, xp.max(xp.abs(new - phi)), xp.max(xp.abs(new)))
+            scale = max(scale, 1e-300)
             phi = new
             if d <= tol * scale:
                 break
@@ -865,31 +944,38 @@ class SNTransportSolver:
         """GMRES on the scalar within-group system (I - T) phi = b, T = one
         sweep of the scattering source, boundary incoming fluxes frozen.
         With ``precondition`` the DSA operator M = I + F^-1 Sigma_s is applied
-        as a left preconditioner."""
+        as a preconditioner.
+
+        Runs on ndgpu's own GMRES over grid-shaped backend arrays rather than
+        scipy's over host vectors: scipy forced ``asnumpy(...).ravel()`` on
+        every matvec, so each Arnoldi step round-tripped the flux across the
+        bus and the whole Krylov space lived on the host. ndgpu's GMRES
+        preconditions on the *right*, so the Arnoldi residual is the true
+        residual and the stopping rule is unchanged; the DSA preconditioner is
+        linear, which is what right preconditioning requires."""
         xp, nx, ny = self.xp, self.nx, self.ny
         q0 = xp.asarray(qext)
 
         def sweep_src(src):
             p, _ = self._sweep(src + q0, st_g, frozen)
-            return p
+            return xp.asarray(p)
 
-        b = asnumpy(sweep_src(xp.zeros((nx, ny)))).ravel()     # source-only response
+        b = sweep_src(xp.zeros((nx, ny)))                  # source-only response
 
         def op(x):
-            p = sweep_src(ss_g * xp.asarray(x.reshape(nx, ny)))
-            return x - (asnumpy(p).ravel() - b)
+            return x - (sweep_src(ss_g * x) - b)
 
-        n = nx * ny
-        A = LinearOperator((n, n), matvec=op, dtype=float)
-        M = None
         if precondition:
-            def prec(x):
-                r = ss_g * xp.asarray(x.reshape(nx, ny))
-                return x + asnumpy(self._dsa_apply(g, r)).ravel()
-            M = LinearOperator((n, n), matvec=prec, dtype=float)
-        phi_v, _ = gmres(A, b, x0=asnumpy(phi).ravel(), M=M,
-                         rtol=min(tol, 1e-4), atol=0.0, maxiter=400)
-        return xp.asarray(phi_v.reshape(nx, ny))
+            def prec(r):
+                return r + self._dsa_apply(g, ss_g * r)
+        else:
+            prec = lambda r: r
+        # Inexact is fine: the outer iteration revisits this group, so a capped
+        # solve costs outer rate, not correctness (cf. the same choice in DSA).
+        x, _ = gmres_dev(op, b, xp.asarray(phi), None, xp,
+                         rtol=min(tol, 1e-4), atol=0.0, maxiter=400,
+                         precond=prec, raise_on_fail=False)
+        return x
 
     def _scatter_solve(self, qext, ss_g, st_g, phi, frozen, tol, g):
         """Solve the within-group scattering fixed point with the configured
@@ -1032,7 +1118,7 @@ class SNTransportSolver:
         A = diffusion_matrix(1.0 / (3.0 * st), np.maximum(st - ss, 0.0),
                              self.hx, self.hy,
                              ((BC_VACUUM, BC_VACUUM), (BC_VACUUM, BC_VACUUM)))
-        return factorized(A)
+        return self._make_diff_solver(A)
 
     def _scatter_solve_transient(self, qext, ss_g, st_shift, inc, q_ang,
                                  dsa_fac, tol, phi0):
@@ -1056,14 +1142,12 @@ class SNTransportSolver:
                                                    inc, q_ang)
             half = xp.asarray(half)
             if accelerate:
-                r = ss_g * (half - phi)
-                corr = xp.asarray(
-                    dsa_fac(asnumpy(r).ravel()).reshape(self.nx, self.ny))
-                new = half + corr
+                new = half + self._apply_diff_solver(dsa_fac,
+                                                     ss_g * (half - phi))
             else:
                 new = half
-            d = float(xp.max(xp.abs(new - phi)))
-            scale = max(float(xp.max(xp.abs(new))), 1e-300)
+            d, scale = _pair(xp, xp.max(xp.abs(new - phi)), xp.max(xp.abs(new)))
+            scale = max(scale, 1e-300)
             phi = new
             if d <= tol * scale:
                 break

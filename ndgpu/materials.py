@@ -62,6 +62,11 @@ class Material:
             self.total = np.asarray(self.total, dtype=np.float64).reshape(G)
             if np.any(self.total <= 0):
                 raise ValueError("total cross sections must be positive")
+        if self.kappa_fission is not None:
+            self.kappa_fission = np.asarray(self.kappa_fission,
+                                            dtype=np.float64).reshape(G)
+            if np.any(self.kappa_fission < 0):
+                raise ValueError("kappa_fission must be non-negative")
 
     @property
     def sigma_t(self) -> np.ndarray:

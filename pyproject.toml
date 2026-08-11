@@ -11,15 +11,25 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Mario Poncet" }]
 keywords = ["neutron diffusion", "reactor physics", "GPU", "CUDA", "criticality", "k-eigenvalue"]
-dependencies = ["numpy>=1.24"]
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
 
 [project.optional-dependencies]
 cuda12 = ["cupy-cuda12x"]
 cuda11 = ["cupy-cuda11x"]
 test = ["pytest"]
+# External multiphysics coupling (examples/precice). Optional: the internal
+# CoupledSolver never touches preCICE. NOTE pyprecice is source-only on PyPI
+# and links against the system libprecice; install both from conda-forge if
+# that library is missing or ABI-incompatible -- see docs/coupling.md.
+precice = ["pyprecice>=3"]
 
 [tool.setuptools.packages.find]
 include = ["ndgpu*"]
+
+[tool.setuptools.package-data]
+# Vendored cross-section libraries: without this they are dropped when the
+# source zip is pip-installed (e.g. in Colab) and the HP-MR benchmarks fail.
+"ndgpu.benchmarks" = ["data/*.npz"]
 
 [tool.pytest.ini_options]
 markers = [
