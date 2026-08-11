@@ -75,12 +75,12 @@ class PointKineticsResult:
 
 @dataclass
 class QuasiStaticResult:
-    """Coupled fixed-shape or adiabatic quasi-static transient result.
+    """Coupled fixed-shape, adiabatic, or improved quasi-static result.
 
-    This is not yet an improved quasi-static (IQS) solve: shapes are either
-    frozen or replaced by periodic adiabatic eigen shapes. ``rho`` records the
-    reactivity projected from each current control and temperature operator,
-    while ``power`` is the independently marched amplitude ``P(t)/P(0)``.
+    ``rho`` records the reactivity projected from each current control and
+    temperature operator, while ``power`` is the independently marched
+    amplitude ``P(t)/P(0)``. IQS results additionally retain the accepted
+    spatial precursor field and predictor-disagreement counters.
     """
 
     times: np.ndarray
@@ -871,7 +871,7 @@ def _coupled_quasistatic(
                 elif shape_method == "iqs":
                     width = t - anchor_time
                     with profiler.region("iqs_shape_solve"):
-                        corrected, forward_flux, spatial_precursor_shape, predicted = \
+                        corrected, forward_flux, _corrected_precursors, predicted = \
                             time_dependent_corrector(
                                 anchor_spec, anchor_hook, spec, feedback_hook,
                                 width, anchor_flux, anchor_precursors,
@@ -881,7 +881,13 @@ def _coupled_quasistatic(
                         corrected.total_inner_iterations
                     counters["iqs_fixed_point_sweeps"] += sum(
                         corrected.step_iterations)
-                    spatial_precursors = amplitude * spatial_precursor_shape
+                    # The corrector's precursor field followed its independent
+                    # coarse amplitude prediction.  Preserve the inventory
+                    # accumulated with the accepted fine point-amplitude
+                    # history instead of replacing it with that different
+                    # history merely because the spatial shape was corrected.
+                    spatial_precursor_shape = spatial_precursors / amplitude
+                    precursors_follow_flux = False
                     shape_state = [forward_flux[g].copy()
                                    for g in range(shape_solver.n_groups)]
                     predicted_end = anchor_amplitude * predicted

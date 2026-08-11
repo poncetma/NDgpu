@@ -394,11 +394,12 @@ coupled.counters                 # steps, iterations, rebuilds, transfers
 ```
 
 `quasistatic_transient` defaults to time-dependent IQS treatment. It carries
-spatial precursor history through each macro shape solve, removes the
-corrector's amplitude component, maintains total-power continuity, and records
-shape/residual/fallback histories. `residual_tol` forces an early correction;
-`fallback_residual` advances an unsafe fine interval with the full diffusion
-equations. Use `shape_method="adiabatic"` to select instantaneous eigen shapes.
+the accepted fine-step spatial precursor history through each macro shape
+solve, removes the corrector's independent amplitude component, maintains
+total-power continuity, and records shape/residual/fallback histories.
+`residual_tol` forces an early correction; `fallback_residual` advances an
+unsafe fine interval with the full diffusion equations. Use
+`shape_method="adiabatic"` to select instantaneous eigen shapes.
 Thresholds are model- and mesh-dependent: establish them against a shorter
 full-diffusion reference before relying on them for a long production run.
 

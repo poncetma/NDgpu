@@ -396,10 +396,12 @@ to avoid redundant operator rebuilds.
 `fixed_shape_coupled_transient` performs no shape correction and is not an
 appropriate approximation for a large drum or rod movement.
 `quasistatic_coupled_transient` defaults to a time-dependent IQS macro
-corrector. It carries normalized spatial precursor fields, removes the
-corrector's global amplitude mode, projects them back into the effective
-amplitude system, and replaces the normalized device power shape. Set
-`shape_method="adiabatic"` for periodic eigen shapes instead.
+corrector. It removes the corrector's independent global amplitude mode and
+uses its time-dependent spatial flux shape, while retaining the spatial
+precursor inventory advanced by the accepted fine-step amplitude history.
+That inventory is projected back into the effective amplitude system after
+each correction. Set `shape_method="adiabatic"` for periodic eigen shapes
+instead.
 
 `residual_tol` measures the current loss/fission shape defect after projecting
 out the adjoint amplitude mode and forces an early correction.

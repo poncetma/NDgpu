@@ -316,10 +316,11 @@ pass `state_at(t)` returning a cached frame. `problem_at=` remains available for
 the raw four-array callback used by low-level code.
 
 `quasistatic_transient` uses those cached frames in a time-dependent IQS solve:
-the amplitude advances at `dt`, while spatial shape and precursor history are
-corrected at `shape_dt`. Adjoint-weighted residual thresholds can force an
-early correction or full-diffusion fine-interval fallback. Its result adds
-shape, residual, fallback, predictor-error, and iteration telemetry.
+the amplitude and spatial precursor inventory advance at `dt`, while the
+spatial flux shape is corrected at `shape_dt`. Adjoint-weighted residual
+thresholds can force an early correction or full-diffusion fine-interval
+fallback. Its result adds shape, residual, fallback, predictor-error, and
+iteration telemetry.
 `shape_method="adiabatic"` selects instantaneous eigen shapes instead.
 
 ### Control drums

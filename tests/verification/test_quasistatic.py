@@ -249,6 +249,43 @@ def test_adiabatic_quasistatic_tracks_reduced_hpmr_drum_ramp():
     assert iqs.counters["iqs_shape_solves"] == 5
 
 
+def test_iqs_keeps_accepted_precursor_history_across_shape_corrections():
+    """A coarse shape predictor must not replace the fine amplitude history."""
+    from ndgpu.benchmarks.hpmr import build_hpmr2d
+    from ndgpu.benchmarks.hpmr_thermal import (build_hpmr_coupling,
+                                               hpmr_drum_ramp)
+
+    problem = build_hpmr2d(
+        refine=2, drum_angle_deg=90.0, absorber="polar")
+    problem_at = hpmr_drum_ramp(
+        problem, angle_from=90.0, angle_to=95.0,
+        t_start=0.0, t_ramp=0.5, n_angles=6, refine=2)
+    options = dict(t_end=1.0, dt=0.05, dt_thermal=0.25,
+                   problem_at=problem_at)
+    full = coupled_transient(build_hpmr_coupling(problem), **options)
+    adiabatic = quasistatic_coupled_transient(
+        build_hpmr_coupling(problem), shape_dt=0.25, adjoint_every=2,
+        shape_method="adiabatic", **options)
+    iqs = quasistatic_coupled_transient(
+        build_hpmr_coupling(problem), shape_dt=0.25, adjoint_every=2,
+        shape_method="iqs", **options)
+    guarded = quasistatic_coupled_transient(
+        build_hpmr_coupling(problem), shape_dt=0.25, adjoint_every=2,
+        shape_method="iqs", residual_tol=1e-8, fallback_residual=1.0,
+        **options)
+
+    # The deliberately coarse independent predictor differs by several
+    # percent. Its spatial shape is useful, but adopting its precursor field
+    # used to leave the accepted point amplitude about 10% low after the ramp.
+    assert iqs.counters["iqs_max_amplitude_error_ppm"] > 10_000
+    assert abs(iqs.power[-1] / full.power[-1] - 1.0) < 1e-3
+    assert np.max(np.abs(guarded.power - full.power) / full.power) < 1e-2
+    assert (np.max(np.abs(guarded.power - full.power) / full.power)
+            < np.max(np.abs(adiabatic.power - full.power) / full.power))
+    assert guarded.counters["full_diffusion_fallbacks"] == 0
+    assert "residual" in guarded.shape_update_reasons
+
+
 def test_residual_trigger_falls_back_to_full_diffusion_interval():
     perturbed = Material(
         name="local absorber", diffusion=[D], sigma_a=[SA * 1.02],

@@ -229,6 +229,8 @@ def result_metrics(case, mode, label, result, wall, dynamic, reference,
         "max_shape_residual": float(residual.max()) if residual.size else 0.0,
         "residual_shape_updates": int(reasons["residual"]),
         "fallback_intervals": int(counters.get("full_diffusion_fallbacks", 0)),
+        "max_iqs_predictor_error": (
+            1e-6 * int(counters.get("iqs_max_amplitude_error_ppm", 0))),
         "neutron_inner_iterations": int(counters.get("neutron_inner_iterations", 0)),
         "iqs_inner_iterations": int(counters.get("iqs_inner_iterations", 0)),
     }
@@ -236,7 +238,8 @@ def result_metrics(case, mode, label, result, wall, dynamic, reference,
 
 def write_csv(path, rows):
     with path.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(
+            stream, fieldnames=list(rows[0]), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
 
