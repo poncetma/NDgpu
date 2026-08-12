@@ -124,6 +124,12 @@ def transient_bench(refine: int = 4, nz: int = 0, *, groups: str = "11",
                     sigma_a_scale: float = SIGMA_A_SCALE,
                     device: str = "auto", dtype=np.float64,
                     precond_degree: int = 0, check_every: int = 1,
+                    precond_dtype=None,
+                    graph_block: int = 0,
+                    reuse_krylov_workspaces: bool = True,
+                    step_solver: str = "fixed-point",
+                    multigroup_kwargs: dict | None = None,
+                    time_scheme: str = "backward-euler",
                     warmup: bool | None = None, verbose: bool = False) -> dict:
     """Time ``steps`` steps of the uncoupled transient; return counters.
 
@@ -145,15 +151,21 @@ def transient_bench(refine: int = 4, nz: int = 0, *, groups: str = "11",
         p.grid, problem_at, kin, bc=p.bc, active=p.active, mask_bc=p.mask_bc,
         mix_material=p.mix_material, mix_weight=p.mix_weight,
         group_operator=TriGroupOperator, eig_solver=TriDiffusionEigenSolver,
-        precond_degree=precond_degree, device=device, dtype=dtype)
+        precond_degree=precond_degree, precond_dtype=precond_dtype,
+        device=device, dtype=dtype)
 
     kwargs = dict(dt=dt, tol_step=tol_step, anderson_depth=anderson_depth,
                   rebalance=rebalance, max_sweeps=max_sweeps,
-                  scatter_subsweeps=subsweeps)
-    if check_every > 1:
+                  scatter_subsweeps=subsweeps,
+                  reuse_krylov_workspaces=reuse_krylov_workspaces,
+                  step_solver=step_solver, time_scheme=time_scheme)
+    if multigroup_kwargs is not None:
+        kwargs["multigroup_kwargs"] = dict(multigroup_kwargs)
+    if step_solver == "fixed-point" and (check_every > 1 or graph_block):
         # Passed only when exercised, so the default leg calls the solver
         # exactly as every other script in the repo does.
-        kwargs["linsolve_kwargs"] = dict(check_every=check_every)
+        kwargs["linsolve_kwargs"] = dict(
+            check_every=check_every, graph_block=graph_block)
 
     if warmup is None:
         # Default on GPU, off on CPU. A warm-up step here costs as much as a
@@ -189,7 +201,18 @@ def transient_bench(refine: int = 4, nz: int = 0, *, groups: str = "11",
                 k0=res.k0, power=float(res.power[-1]),
                 steady_s=res.steady.solve_seconds, device=res.device,
                 dtype=str(dtype), precond_degree=precond_degree,
-                check_every=check_every)
+                precond_dtype=(None if precond_dtype is None
+                               else str(np.dtype(precond_dtype))),
+                mixed_precision_fallbacks=res.mixed_precision_fallbacks,
+                cuda_graph_captures=res.cuda_graph_captures,
+                cuda_graph_replays=res.cuda_graph_replays,
+                cuda_graph_errors=res.cuda_graph_errors,
+                check_every=check_every,
+                graph_block=int(graph_block),
+                step_solver=str(step_solver),
+                time_scheme=res.time_scheme,
+                time_orders=list(res.time_orders),
+                reuse_krylov_workspaces=bool(reuse_krylov_workspaces))
 
 
 HEADER = (f"{'case':>12}  {'cells':>8}  {'dof':>9}  {'ms/step':>9}  "

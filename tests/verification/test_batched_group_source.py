@@ -155,3 +155,17 @@ def test_accumulate_adds_rather_than_overwrites(fields):
     # precision question, not a correctness one.
     np.testing.assert_allclose(got, seed + fields.fission_source(phi),
                                rtol=1e-14, atol=0)
+
+
+def test_accumulate_mixed_inputs_use_output_precision():
+    """Mirrors FP32 weights/flux accumulated into a promoted FP64 source."""
+    rng = np.random.default_rng(42)
+    weights = rng.random((4, 7, 5)).astype(np.float32)
+    flux = rng.random((4, 7, 5)).astype(np.float32)
+    seed = rng.random((7, 5)).astype(np.float64)
+    got = kernels.group_accumulate(np, seed.copy(), weights, flux)
+    expected = seed.copy()
+    for group in range(len(weights)):
+        expected += weights[group].astype(np.float64) * flux[group]
+    assert got.dtype == np.float64
+    np.testing.assert_allclose(got, expected, rtol=0, atol=0)

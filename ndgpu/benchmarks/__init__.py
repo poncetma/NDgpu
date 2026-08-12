@@ -8,6 +8,7 @@ from .hpmr import (HPMR_KINETICS, build_hpmr2d, build_hpmr3d,
                   hpmr_endfb8_materials, hpmr_transport_mask)
 from .iaea import build_iaea
 from .langenbuch import LANGENBUCH_KINETICS, build_langenbuch
+from .lra import LRA_KINETICS, build_lra2d, run_lra2d_cpu
 from .reflected_slab import (bare_k, build_reflected_slab, reflected_k,
                             CORE as SLAB_CORE, REFLECTOR as SLAB_REFLECTOR)
 from .twigl import TWIGL_KINETICS, build_twigl
@@ -17,9 +18,10 @@ __all__ = ["K_REFERENCE_2D", "build_anl8a1", "build_biblis", "build_c5g7_2d",
            "build_c5g7_td", "C5G7TD_CASES", "C5G7TD_DECAY", "C5G7TD_CHI_DELAYED",
            "build_hpmr2d",
            "build_hpmr3d", "hpmr_endfb8_materials", "hpmr_transport_mask",
-           "build_iaea", "build_langenbuch", "build_twigl", "build_vver440",
+           "build_iaea", "build_langenbuch", "build_lra2d", "run_lra2d_cpu",
+           "build_twigl", "build_vver440",
            "build_femffusion_1d_noise", "NoiseBenchmark",
            "build_reflected_slab", "reflected_k", "bare_k",
            "SLAB_CORE", "SLAB_REFLECTOR",
-           "ANL8A1_KINETICS", "HPMR_KINETICS", "LANGENBUCH_KINETICS", "TWIGL_KINETICS",
+           "ANL8A1_KINETICS", "HPMR_KINETICS", "LANGENBUCH_KINETICS", "LRA_KINETICS", "TWIGL_KINETICS",
            "VVER_KINETICS"]

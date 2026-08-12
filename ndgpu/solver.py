@@ -467,7 +467,10 @@ class _PowerIterationSolver:
             fsrc_in = fsrc                       # this iteration's input (for Anderson)
 
             for g in range(G):
-                q0 = (emit[g] / k) * fsrc
+                # Keep an FP32 solve genuinely FP32. Host kinetics/eigenvalue
+                # scalars may otherwise promote the seeded source before the
+                # fused group contraction sees it.
+                q0 = xp.asarray((emit[g] / k) * fsrc, dtype=self.dtype)
                 if batch is not None:
                     # One kernel for the whole in-scatter row. batch["phi"] is
                     # kept current group by group below, so this reads the

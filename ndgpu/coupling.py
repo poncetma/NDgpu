@@ -383,6 +383,8 @@ class CoupledTransientResult:
     seconds: float
     device: str
     steps: int
+    time_scheme: str = "backward-euler"
+    time_orders: list = field(default_factory=list)
     phase_seconds: dict = field(default_factory=dict)
     counters: dict = field(default_factory=dict)
 
@@ -395,6 +397,7 @@ class CoupledTransientResult:
 def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
                       dt_thermal=None, verbose=False, transient_kwargs=None,
                       solver_cls=None, precond_degree=1, check_every=4,
+                      precond_dtype=None,
                       thermal_rtol=1e-8, thermal_maxiter=20000,
                       thermal_check_every=4, thermal_precond_degree=0,
                       thermal_diagnostics_every=0, profile=False):
@@ -418,10 +421,12 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
     problem_at : as ``TransientSolver``'s, for the driving perturbation (a
                  drum rotation, a rod). Defaults to a stationary core, i.e. the
                  transient is driven by the feedback alone.
-    precond_degree, check_every : GPU-oriented defaults for the neutron
+    precond_degree, check_every, precond_dtype : GPU-oriented controls for the neutron
                  Neumann-PCG solves. Explicit values in
                  ``transient_kwargs['linsolve_kwargs']`` take precedence over
-                 ``check_every``.
+                 ``check_every``. ``precond_dtype="float32"`` retains FP64
+                 state/residual checks while evaluating only the polynomial
+                 preconditioner in FP32, with automatic FP64 fallback.
     thermal_rtol, thermal_maxiter, thermal_check_every,
     thermal_precond_degree : controls for the backward-Euler conduction solve.
                  The coupled tolerance is deliberately looser than the
@@ -597,6 +602,7 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
         group_operator=ctx.group_operator, eig_solver=ctx.solver_cls,
         device=ctx.device, dtype=ctx.dtype,
         precond_degree=precond_degree,
+        precond_dtype=precond_dtype,
         xs_update_at=xs_update_at, on_step=on_step,
         phase_context=(profiler.region if profile else None))
 
@@ -643,9 +649,10 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
     # same time-zero problem again. Callers can still override this explicitly
     # through transient_kwargs for a compatibility/convergence experiment.
     step_kwargs.setdefault("initial_steady", steady.neutronics)
-    lin_kw = dict(step_kwargs.get("linsolve_kwargs") or {})
-    lin_kw.setdefault("check_every", check_every)
-    step_kwargs["linsolve_kwargs"] = lin_kw
+    if str(step_kwargs.get("step_solver", "fixed-point")).lower() != "monolithic":
+        lin_kw = dict(step_kwargs.get("linsolve_kwargs") or {})
+        lin_kw.setdefault("check_every", check_every)
+        step_kwargs["linsolve_kwargs"] = lin_kw
     t0 = time.perf_counter()
     profiler.resume_neutronics()
     with (profiler.region("transient_total") if profile else nullcontext()):
@@ -662,7 +669,19 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
         res.steady.inner_iterations
     profiler.counters["initial_state_reuses"] = int(res.initial_state_reused)
     profiler.counters["neutron_inner_iterations"] = res.total_inner_iterations
+    profiler.counters["neutron_outer_iterations"] = sum(res.step_iterations)
+    profiler.counters["neutron_monolithic_steps"] = int(
+        res.step_method == "monolithic") * (len(res.times) - 1)
+    # Backward-compatible name. For a monolithic run these are FGMRES applies,
+    # not fission-source fixed-point sweeps; prefer neutron_outer_iterations.
     profiler.counters["neutron_fixed_point_sweeps"] = sum(res.step_iterations)
+    profiler.counters["mixed_precision_fallbacks"] = \
+        res.mixed_precision_fallbacks
+    profiler.counters["cuda_graph_captures"] = res.cuda_graph_captures
+    profiler.counters["cuda_graph_replays"] = res.cuda_graph_replays
+    profiler.counters["cuda_graph_errors"] = len(res.cuda_graph_errors)
+    profiler.counters["adjoint_coarse_setups"] = res.adjoint_coarse_setups
+    profiler.counters["neutron_bdf_max_order"] = max(res.time_orders, default=1)
     phase_seconds = profiler.seconds()
 
     return CoupledTransientResult(
@@ -672,6 +691,7 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
             [float(np.asarray(steady.temperature)[fuel].mean())] + state["mean"]),
         k0=res.k0, temperature=final_temperature, flux=res.flux, steady=steady,
         seconds=seconds, device=ctx.device, steps=len(res.times) - 1,
+        time_scheme=res.time_scheme, time_orders=list(res.time_orders),
         phase_seconds=phase_seconds, counters=dict(profiler.counters))
 
 

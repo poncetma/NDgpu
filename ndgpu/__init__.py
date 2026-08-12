@@ -30,10 +30,12 @@ from .quasistatic import (EffectiveKinetics, FixedShapeQuasiStaticResult,
                           fixed_shape_coupled_transient,
                           integrate_point_kinetics,
                           project_effective_kinetics,
+                          projected_adjoint_residual,
                           projected_shape_residual,
                           quasistatic_coupled_transient)
 from .feedback import ThermalFeedback
 from .thermal import ConductionSolver, ThermalMaterial, ThermalResult
+from .timescheme import BDF, BDF2, BDFStepController
 from .solver import (DiffusionEigenSolver, Result, SDP1EigenSolver,
                      SDP2EigenSolver, SDP3EigenSolver, SP1EigenSolver,
                      SP3EigenSolver, SP5EigenSolver, SP7EigenSolver)
@@ -91,6 +93,9 @@ __all__ = [
     "TransientSPNSolver",
     "TransientSNSolver",
     "TransientResult",
+    "BDF",
+    "BDF2",
+    "BDFStepController",
     "NoiseSolver",
     "NoiseSource",
     "NoiseResult",
@@ -120,6 +125,7 @@ __all__ = [
     "QuasiStaticResult",
     "PointKineticsResult",
     "project_effective_kinetics",
+    "projected_adjoint_residual",
     "projected_shape_residual",
     "equilibrium_precursors",
     "advance_point_kinetics",

@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-08-11T15:12:06+0200",
+  "timestamp": "2026-08-11T16:17:24+0200",
   "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.35",
   "processor": "x86_64",
   "python": "3.13.5",
@@ -9,9 +9,11 @@
   "guarded_iqs": {
     "residual_tol": 0.012,
     "fallback_residual": 0.02,
-    "predictor_tol": 0.02
+    "predictor_tol": 0.02,
+    "adjoint_every": 6,
+    "adjoint_residual_tol": 0.005
   },
-  "total_benchmark_seconds": 88.00902099907398,
+  "total_benchmark_seconds": 92.60896074899938,
   "cases": [
     {
       "name": "slow_symmetric",

@@ -1,9 +1,9 @@
 # 2D HP-MR quasi-static CPU benchmark
 
 Run on 11 August 2026 after the adjoint-weighted amplitude, conservative
-precursor-shape, and predictor-cadence corrections, using an
+precursor-shape, predictor-cadence, and adjoint-residual corrections, using an
 Intel Core i5-1145G7 (4 cores / 8 threads), Python 3.13.5, NumPy 2.1.3, and the
-CPU backend. The complete benchmark took 88.0 seconds.
+CPU backend. The complete benchmark took 92.6 seconds.
 
 ## Executive result
 
@@ -14,17 +14,20 @@ the corrector's independent coarse-amplitude inventory. Plain IQS consequently
 agrees closely with adiabatic QS in global power while resolving the final
 spatial shape 21–133x more accurately.
 
-Adiabatic QS remains the fastest approximation at 2.1–2.4x dynamic speedup.
-Plain IQS provides 1.3–2.1x and nearly the same maximum power-history error.
+Adiabatic QS remains the fastest approximation at 2.1–3.2x dynamic speedup.
+Plain IQS provides 1.5–2.6x and nearly the same maximum power-history error.
 Both have peak-power bias below 0.4%; their larger in-ramp errors occur between
 scheduled shape updates and are corrected at the next macro boundary.
 
 Guarded IQS combines a 0.012 soft residual threshold, a 0.020 hard fallback,
 and a 2% amplitude-predictor tolerance that halves subsequent shape intervals.
-It lowers maximum power error to 3.0%, 2.5%, and 1.3% for the slow, fast, and
-asymmetric cases. It remains about 1.3x faster for the symmetric ramps; the
-asymmetric run is 20% slower than full diffusion because it invokes one hard
-fallback. Fallback is a safety mechanism rather than a guaranteed acceleration.
+Adjoints have a six-correction maximum age and refresh early at a 0.005
+transposed-eigenproblem residual; hard fallback still forces refresh. The guard
+lowers maximum power error to 3.0%, 2.6%, and 2.0% for the slow, fast, and
+asymmetric cases. It is about 2.1x faster for the symmetric ramps; the
+asymmetric run is within 4% of full diffusion despite invoking one hard
+fallback. Fallback remains a safety mechanism rather than a guaranteed
+acceleration.
 
 ![Power and temperature histories](histories.png)
 
@@ -55,18 +58,18 @@ the common equilibrium calculation.
 
 | Case | Method | Dynamic time [s] | Speedup | Shape updates | Fallbacks |
 |---|---|---:|---:|---:|---:|
-| Slow | Full diffusion | 6.11 | 1.00x | 0 | 0 |
-|  | Adiabatic QS | 2.87 | 2.13x | 12 | 0 |
-|  | Time-dependent IQS | 3.75 | 1.63x | 12 | 0 |
-|  | Guarded IQS | 4.58 | 1.33x | 16 | 0 |
-| Fast | Full diffusion | 6.48 | 1.00x | 0 | 0 |
-|  | Adiabatic QS | 2.65 | 2.44x | 12 | 0 |
-|  | Time-dependent IQS | 3.05 | 2.13x | 12 | 0 |
-|  | Guarded IQS | 4.96 | 1.31x | 18 | 0 |
-| Asymmetric | Full diffusion | 12.72 | 1.00x | 0 | 0 |
-|  | Adiabatic QS | 6.08 | 2.09x | 12 | 0 |
-|  | Time-dependent IQS | 9.60 | 1.33x | 12 | 0 |
-|  | Guarded IQS | 15.24 | 0.83x | 18 | 1 |
+| Slow | Full diffusion | 9.13 | 1.00x | 0 | 0 |
+|  | Adiabatic QS | 3.70 | 2.47x | 12 | 0 |
+|  | Time-dependent IQS | 4.02 | 2.27x | 12 | 0 |
+|  | Guarded IQS | 4.23 | 2.16x | 16 | 0 |
+| Fast | Full diffusion | 8.52 | 1.00x | 0 | 0 |
+|  | Adiabatic QS | 2.69 | 3.17x | 12 | 0 |
+|  | Time-dependent IQS | 3.26 | 2.61x | 12 | 0 |
+|  | Guarded IQS | 4.15 | 2.05x | 18 | 0 |
+| Asymmetric | Full diffusion | 13.25 | 1.00x | 0 | 0 |
+|  | Adiabatic QS | 6.37 | 2.08x | 12 | 0 |
+|  | Time-dependent IQS | 9.11 | 1.45x | 12 | 0 |
+|  | Guarded IQS | 13.77 | 0.96x | 18 | 1 |
 
 The asymmetric full solve costs about twice the symmetric solve despite the
 same mesh and step count, because the tilted spatial source needs substantially
@@ -87,17 +90,23 @@ active cells.
 |  | Guarded IQS | 2.98% | -0.09% | 0.004 | 2.03e-5 |
 | Fast | Adiabatic QS | 11.51% | -0.17% | 0.006 | 5.14e-4 |
 |  | Time-dependent IQS | 11.53% | -0.18% | 0.006 | 6.85e-6 |
-|  | Guarded IQS | 2.46% | -0.03% | 0.001 | 4.48e-6 |
+|  | Guarded IQS | 2.62% | -0.02% | 0.001 | 6.25e-6 |
 | Asymmetric | Adiabatic QS | 5.10% | -0.32% | 0.011 | 4.93e-3 |
 |  | Time-dependent IQS | 5.18% | -0.30% | 0.011 | 3.70e-5 |
-|  | Guarded IQS | 1.26% | -0.03% | 0.001 | 6.75e-6 |
+|  | Guarded IQS | 1.97% | -0.03% | 0.001 | 6.75e-6 |
 
 Adiabatic QS and plain IQS peak agreement is much better than their maximum
 history error because they catch up at scheduled shape updates. IQS has the
 more faithful spatial state at those boundaries. The corrector's independent
 amplitude-predictor disagreement reaches 3.7%, 12.9%, and 5.7%, closely marking
 the cases with large between-update error. In guarded IQS the earlier updates
-reduce that disagreement to 4.0%, 2.5%, and 1.7%, respectively.
+reduce that disagreement to 4.0%, 2.7%, and 2.5%, respectively.
+
+The adjoint residual was evaluated 16–18 times for only milliseconds of total
+cost. It triggered three early refreshes in each symmetric case and four in the
+asymmetric case, while the six-update maximum age and hard fallback limited
+reuse. The guarded runs used 6, 7, and 9 total adjoint solves respectively,
+instead of the previous every-second-update policy's 9, 10, and 11.
 
 Temperature differences are small because these 3–12 s runs are much shorter
 than the approximately 268 s fuel thermal time constant. They validate the
@@ -107,8 +116,9 @@ coupling path but do not replace a minute-scale feedback benchmark.
 
 1. Calibrate residual and predictor thresholds on the one-minute 3-D 11-group
    case rather than treating these 2-D values as universal defaults.
-2. Reduce the cost of asymmetric fallback, which currently erases the CPU
-   acceleration, by replaying only the rejected region/interval where possible.
+2. Develop a cheaper adjoint solve or multi-mode importance update. Residual-
+   controlled reuse has brought the asymmetric guard near full-diffusion parity,
+   but adjoint and IQS solves still dominate its profile.
 3. Fuse the extra adjoint-weighted reductions on GPU and keep their scalar
    telemetry asynchronous where possible.
 4. Repeat macro-step convergence sweeps on GPU. `iqs_substeps` now traverses

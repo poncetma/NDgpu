@@ -109,6 +109,9 @@ class QuasiStaticResult:
     shape_k_eff: np.ndarray = field(default_factory=lambda: np.empty(0))
     residual_times: np.ndarray = field(default_factory=lambda: np.empty(0))
     shape_residual: np.ndarray = field(default_factory=lambda: np.empty(0))
+    adjoint_residual_times: np.ndarray = field(
+        default_factory=lambda: np.empty(0))
+    adjoint_residual: np.ndarray = field(default_factory=lambda: np.empty(0))
     fallback_times: np.ndarray = field(default_factory=lambda: np.empty(0))
     phase_seconds: dict = field(default_factory=dict)
     counters: dict = field(default_factory=dict)
@@ -142,14 +145,15 @@ def _source_weight(solver):
     return 1.0 if weight is None else weight
 
 
-def _loss_apply(solver, flux):
-    """Apply M = leakage + removal - in-scatter to a scalar flux shape."""
+def _loss_apply(solver, flux, *, adjoint=False):
+    """Apply the forward or energy-transposed loss operator to a flux shape."""
     weight = _source_weight(solver)
     out = []
     for g in range(solver.n_groups):
         value = solver.ops[g].apply(flux[g])
         for gf in range(solver.n_groups):
-            scatter = solver.sigma_s[gf][g]
+            scatter = (solver.sigma_s[g][gf] if adjoint
+                       else solver.sigma_s[gf][g])
             if gf != g and scatter is not None:
                 value = value - weight * scatter * flux[gf]
         out.append(value)
@@ -312,6 +316,47 @@ def projected_shape_residual(solver, forward, adjoint) -> float:
     reference_norm = float(reference_norm)
     if reference_norm <= 0.0:
         raise ValueError("shape has a non-positive operator norm")
+    return float(np.sqrt(float(residual_norm) / reference_norm))
+
+
+def projected_adjoint_residual(solver, forward, adjoint) -> float:
+    """Relative adjoint eigen-shape defect with its amplitude mode removed.
+
+    This is the transposed counterpart of :func:`projected_shape_residual`.
+    It measures whether a reused adjoint still satisfies the current operator,
+    without treating arbitrary adjoint normalization or eigenvalue change as a
+    shape error. The transpose follows the eigen solver's discrete convention:
+    within-group leakage/removal is self-adjoint, while scattering and fission
+    exchange their energy-group production/emission roles.
+    """
+    xp = solver.xp
+    groups = solver.n_groups
+    shape = tuple(solver.grid.shape)
+    phi = _flux_array(forward, "forward flux", groups, shape, xp, solver.dtype)
+    star = _flux_array(adjoint, "adjoint flux", groups, shape, xp, solver.dtype)
+    weight = _source_weight(solver)
+    loss = _loss_apply(solver, star, adjoint=True)
+    importance_source = solver.chi[0] * star[0]
+    for g in range(1, groups):
+        importance_source = importance_source + solver.chi[g] * star[g]
+    fission = [weight * solver.nu_sigma_f[g] * importance_source
+               for g in range(groups)]
+    loss_importance = sum(xp.sum(phi[g] * loss[g]) for g in range(groups))
+    fission_importance = sum(
+        xp.sum(phi[g] * fission[g]) for g in range(groups))
+    fission_importance = float(fission_importance)
+    if fission_importance <= 0.0:
+        raise ValueError("forward/adjoint shapes have non-positive importance")
+    alpha = float(loss_importance) / fission_importance
+    residual_norm = 0.0
+    reference_norm = 0.0
+    for g in range(groups):
+        residual = loss[g] - alpha * fission[g]
+        residual_norm = residual_norm + xp.sum(residual * residual)
+        reference_norm = reference_norm + xp.sum(loss[g] * loss[g])
+    reference_norm = float(reference_norm)
+    if reference_norm <= 0.0:
+        raise ValueError("adjoint shape has a non-positive operator norm")
     return float(np.sqrt(float(residual_norm) / reference_norm))
 
 
@@ -500,6 +545,7 @@ def _coupled_quasistatic(
         thermal_check_every=4, thermal_precond_degree=0,
         thermal_diagnostics_every=0, profile=False, shape_dt=None,
         adjoint_every=1, shape_on_final=True, shape_method="adiabatic",
+        adjoint_residual_tol=None,
         residual_tol=None, fallback_residual=None, iqs_kwargs=None,
         iqs_precond_degree=1, iqs_substeps=1,
         iqs_predictor_tol=None):
@@ -562,10 +608,13 @@ def _coupled_quasistatic(
     residual_tol = (None if residual_tol is None else float(residual_tol))
     fallback_residual = (None if fallback_residual is None
                          else float(fallback_residual))
+    adjoint_residual_tol = (None if adjoint_residual_tol is None
+                            else float(adjoint_residual_tol))
     iqs_predictor_tol = (None if iqs_predictor_tol is None
                          else float(iqs_predictor_tol))
     for name, value in (("residual_tol", residual_tol),
                         ("fallback_residual", fallback_residual),
+                        ("adjoint_residual_tol", adjoint_residual_tol),
                         ("iqs_predictor_tol", iqs_predictor_tol)):
         if value is not None and (not np.isfinite(value) or value <= 0.0):
             raise ValueError(f"{name} must be finite and positive")
@@ -794,6 +843,8 @@ def _coupled_quasistatic(
     shape_updates = 0
     residual_times = []
     residual_values = []
+    adjoint_residual_times = []
+    adjoint_residual_values = []
     fallback_times = []
     spatial_precursors = spatial_precursor_shape.copy()
     anchor_spec = spec0
@@ -1052,8 +1103,23 @@ def _coupled_quasistatic(
                                                  / precursor_scale)
                 shape_updates += 1
 
-                if (fallback_step
-                        or shape_updates % adjoint_every == 0):
+                adjoint_defect = None
+                if adjoint_residual_tol is not None and not fallback_step:
+                    with profiler.region("adjoint_residual"):
+                        adjoint_defect = projected_adjoint_residual(
+                            shape_solver, forward_flux, adjoint.flux)
+                    adjoint_residual_times.append(t)
+                    adjoint_residual_values.append(adjoint_defect)
+                    counters["adjoint_residual_evaluations"] += 1
+                    counters["max_adjoint_residual_ppm"] = max(
+                        counters["max_adjoint_residual_ppm"],
+                        int(round(1e6 * adjoint_defect)))
+                cadence_refresh = shape_updates % adjoint_every == 0
+                residual_refresh = (adjoint_defect is not None
+                                    and adjoint_defect >= adjoint_residual_tol)
+                if fallback_step or cadence_refresh or residual_refresh:
+                    if residual_refresh and not cadence_refresh:
+                        counters["adjoint_residual_refreshes"] += 1
                     with profiler.region("adjoint_shape_solve"):
                         adjoint = shape_solver.solve(
                             adjoint=True, state0=adjoint_state,
@@ -1192,7 +1258,10 @@ def _coupled_quasistatic(
                  "iqs_max_precursor_shape_change_ppm",
                  "iqs_corrector_substeps",
                  "iqs_predictor_interval_reductions",
-                 "iqs_predictor_interval_recoveries"):
+                 "iqs_predictor_interval_recoveries",
+                 "adjoint_residual_evaluations",
+                 "adjoint_residual_refreshes",
+                 "max_adjoint_residual_ppm"):
         counters[name] += 0
     phase_seconds = profiler.seconds()
     phase_seconds.pop("neutronics_solve", None)
@@ -1213,6 +1282,8 @@ def _coupled_quasistatic(
         shape_k_eff=np.asarray(shape_ks),
         residual_times=np.asarray(residual_times),
         shape_residual=np.asarray(residual_values),
+        adjoint_residual_times=np.asarray(adjoint_residual_times),
+        adjoint_residual=np.asarray(adjoint_residual_values),
         fallback_times=np.asarray(fallback_times),
         phase_seconds=phase_seconds, counters=dict(counters))
 
@@ -1226,7 +1297,8 @@ def fixed_shape_coupled_transient(ctx, t_end, dt, **kwargs):
     mode. Use :func:`quasistatic_coupled_transient` for control-drum motion.
     """
     forbidden = {"shape_dt", "adjoint_every", "shape_on_final", "shape_method",
-                 "residual_tol", "fallback_residual", "iqs_kwargs",
+                 "residual_tol", "fallback_residual", "adjoint_residual_tol",
+                 "iqs_kwargs",
                  "iqs_precond_degree", "iqs_substeps",
                  "iqs_predictor_tol"} & kwargs.keys()
     if forbidden:
@@ -1241,6 +1313,7 @@ def quasistatic_coupled_transient(ctx, t_end, dt, *, shape_dt=2.0,
                                   adjoint_every=1, shape_on_final=True,
                                   shape_method="iqs", residual_tol=None,
                                   fallback_residual=None,
+                                  adjoint_residual_tol=None,
                                   **kwargs):
     """Run an improved or adiabatic quasi-static coupled transient.
 
@@ -1249,8 +1322,11 @@ def quasistatic_coupled_transient(ctx, t_end, dt, *, shape_dt=2.0,
     time-dependent spatial shape and its precursor fields every ``shape_dt``.
     Physical fission power includes the old/new adjoint time-importance ratio,
     i.e. the integrated IQS shape-derivative term. ``'adiabatic'`` selects the
-    cheaper instantaneous eigen shape. The adjoint is refreshed every
-    ``adjoint_every`` corrections. ``iqs_substeps`` optionally resolves cached
+    cheaper instantaneous eigen shape. The adjoint is refreshed at least every
+    ``adjoint_every`` corrections. ``adjoint_residual_tol`` can refresh it
+    sooner when the reused importance shape no longer satisfies the current
+    transposed eigenproblem; hard fallback always refreshes it.
+    ``iqs_substeps`` optionally resolves cached
     control states inside each macro corrector instead of applying only the
     endpoint state. ``iqs_predictor_tol`` halves future shape intervals when
     the independent corrector power disagrees by more than that relative
@@ -1265,4 +1341,5 @@ def quasistatic_coupled_transient(ctx, t_end, dt, *, shape_dt=2.0,
         ctx, t_end, dt, shape_dt=shape_dt, adjoint_every=adjoint_every,
         shape_on_final=shape_on_final, shape_method=shape_method,
         residual_tol=residual_tol, fallback_residual=fallback_residual,
+        adjoint_residual_tol=adjoint_residual_tol,
         **kwargs)

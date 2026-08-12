@@ -424,13 +424,21 @@ tighten it — see the example).
 ## Transient (time-dependent) solver
 
 `TransientSolver` marches the multigroup diffusion equations in time with
-delayed-neutron precursors (backward Euler, precursors integrated
-analytically per step; the initial steady state is critically adjusted by
+delayed-neutron precursors (backward Euler by default, or opt-in BDF2--BDF6;
+precursors use the same analytic BDF history elimination as the flux; the
+initial steady state is critically adjusted by
 `1/k0` so a bare unperturbed core stays flat). Each step is a fixed-source
 multigroup problem with a positive diagonal shift — SPD and *better*
 conditioned than the eigenvalue solve, so the same matrix-free Jacobi-CG
 machinery applies; the fission/scatter coupling is closed by an
 Anderson-accelerated source iteration.
+
+For strongly upscattering diffusion cases, an experimental
+`step_solver="monolithic"` option instead solves the identical
+precursor-eliminated step as one matrix-free multigroup system with flexible
+GMRES and inexact energy-group sweeps. It is CPU-validated and has reduced an
+11-group HP-MR step by 2.5--3.3x, but remains opt-in pending 3-D GPU memory and
+throughput gates; the fixed-point method above stays the default.
 
 ```python
 from ndgpu import TransientSolver
@@ -440,7 +448,35 @@ prob = build_twigl(perturbation="step", cells_per_8cm=4)
 res = TransientSolver(prob.grid, prob.problem_at, prob.kinetics,
                       bc=prob.bc, device="auto").solve(t_end=0.5, dt=1e-3)
 print(res.power)   # P(t)/P(0)
+
+# Experimental direct multigroup step (diffusion only):
+direct = TransientSolver(prob.grid, prob.problem_at, prob.kinetics,
+                         bc=prob.bc, device="cpu").solve(
+                             t_end=0.5, dt=1e-3,
+                             step_solver="monolithic")
+
+# CPU-validated high-order path. An explicit sequence of widths enables
+# nonuniform BDF; restart at known discontinuities so history cannot span them.
+bdf = TransientSolver(prob.grid, prob.problem_at, prob.kinetics,
+                      bc=prob.bc, device="cpu").solve(
+                          t_end=0.5, dt=1e-3, time_scheme="bdf3",
+                          bdf_restart_times=[0.2])
+print(bdf.time_orders)
 ```
+
+BDF ramps from first order as history becomes available. Orders 3--6 are
+A(alpha)-stable rather than A-stable and remain opt-in. Explicit nonuniform
+step schedules and event-triggered history restart are implemented and tested.
+An experimental monolithic BDF2--BDF6 path also performs error-controlled
+width acceptance/rejection with full neutron-history rollback and telemetry;
+its error norm is flux-only and its order is not yet automatically selected,
+so explicit schedules remain the production default.
+The same nonuniform history now supplies a polynomial endpoint predictor for
+state-dependent feedback; on the LRA prompt-supercritical test this removes
+the catastrophic one-step Doppler lag without adding another spatial solve.
+For piecewise-constant drum frames, include every frame boundary in the step
+grid and `bdf_restart_times`—high polynomial order cannot recover control
+motion that the time grid never samples.
 
 Validated against two standard kinetics benchmarks from the
 [FEMFFUSION](https://github.com/Zonni/FEMFFUSION) repository, plus an exact
@@ -453,6 +489,7 @@ point-kinetics reference:
 | **2D TWIGL** ramp | P(0.1), P(0.5) vs literature 1.31, 2.11 | 1.308, 2.109 |
 | **3D Langenbuch (LMW)** rod-bank transient | peak power / time vs reference ≈1.6 @ ≈21 s | 1.61 @ 21 s |
 | **ANL-7416 Problem 8-A1** (2D r-z, 6 precursor families) | initial k vs book 0.86690/0.86705; Exhibit A power trace | k to 75 pcm (coarse) / ~40 pcm (refined); ramp phase < 3%, tail within the documented discretization band |
+| **LRA-2D** BWR rod withdrawal with adiabatic/Doppler feedback | original map/data audit; raw rods-in/out k and coupled peak history | rods-in +19 pcm; rods-out −377 pcm on 3.75 cm FV; fully implicit BDF reproduction in progress |
 
 (TWIGL at the converged `cells_per_8cm=4` mesh, `dt=1e-3`.)
 
@@ -465,6 +502,16 @@ worth by ~5%, as re-deriving that scheme shows — see
 `ndgpu/benchmarks/anl_bss8.py` for the analysis and for a cross-section
 erratum in the book), so the eigenvalue is validated tightly and the
 excursion tail within a quantified band.
+
+`ndgpu.benchmarks.build_lra2d` and `run_lra2d_cpu` expose the LRA-2D model and
+its physical power/temperature histories. The current checkpoint uses the
+monolithic multigroup step because group fixed-point iteration fails through
+the prompt-supercritical peak. The refined rods-in eigenvalue is within 19 pcm,
+but the raw rods-out value is 377 pcm low and the fully coupled transient does
+not yet meet the published reference envelope, so the detailed
+[CPU checkpoint](benchmark-results/lra2d-bdf-cpu/README.md) reports both the
+improvements and the remaining mismatch rather than presenting it as a
+validation result.
 
 ## Neutron noise (frequency domain)
 

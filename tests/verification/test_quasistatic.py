@@ -7,7 +7,8 @@ from ndgpu import (DiffusionEigenSolver, EffectiveKinetics, Grid, Kinetics,
                    Material, ThermalFeedback, ThermalMaterial, TransientSolver,
                    equilibrium_precursors, fixed_shape_coupled_transient,
                    integrate_point_kinetics, project_effective_kinetics,
-                   projected_shape_residual, quasistatic_coupled_transient)
+                   projected_adjoint_residual, projected_shape_residual,
+                   quasistatic_coupled_transient)
 from ndgpu.coupling import CoupledSolver, CouplingContext, coupled_transient
 from ndgpu.quasistatic import (_match_spatial_precursor_importance,
                                _project_spatial_precursors,
@@ -104,6 +105,21 @@ def test_projected_shape_residual_removes_only_the_amplitude_mode():
     current = DiffusionEigenSolver(
         GRID, [BASE, local], mmap, bc="reflective", device="cpu")
     residual = projected_shape_residual(current, forward, adjoint.flux)
+    assert residual > 1e-3
+
+
+def test_projected_adjoint_residual_removes_only_the_amplitude_mode():
+    ref, forward, adjoint = shapes()
+    assert projected_adjoint_residual(ref, forward, adjoint) < 2e-13
+    assert projected_adjoint_residual(
+        ref, 7.0 * forward.flux, 0.03 * adjoint.flux) < 2e-13
+    local = Material(name="local absorber", diffusion=[D],
+                     sigma_a=[SA * 1.02], nu_sigma_f=[NF])
+    mmap = np.zeros(GRID.shape, dtype=np.int32)
+    mmap[:2] = 1
+    current = DiffusionEigenSolver(
+        GRID, [BASE, local], mmap, bc="reflective", device="cpu")
+    residual = projected_adjoint_residual(current, forward, adjoint.flux)
     assert residual > 1e-3
 
 
@@ -334,6 +350,38 @@ def test_residual_trigger_falls_back_to_full_diffusion_interval():
     np.testing.assert_allclose(guarded.fallback_times, [0.002])
     np.testing.assert_allclose(guarded.power, full.power,
                                rtol=0, atol=2e-10)
+
+
+def test_adjoint_residual_refreshes_before_maximum_age():
+    perturbed = Material(
+        name="local absorber", diffusion=[D], sigma_a=[SA * 1.02],
+        nu_sigma_f=[NF])
+    base_map = np.zeros(GRID.shape, dtype=np.int32)
+    changed_map = base_map.copy()
+    changed_map[:2] = 1
+    base_state = ([BASE, BASE], base_map)
+    changed_state = ([BASE, perturbed], changed_map)
+
+    def problem_at(t):
+        return base_state if t <= 0.0 else changed_state
+
+    adaptive = quasistatic_coupled_transient(
+        localized_context(), t_end=0.004, dt=0.002,
+        dt_thermal=0.004, shape_dt=0.002, shape_method="adiabatic",
+        adjoint_every=100, adjoint_residual_tol=1e-6,
+        problem_at=problem_at)
+    assert adaptive.counters["adjoint_residual_evaluations"] == 2
+    assert adaptive.counters["adjoint_residual_refreshes"] >= 1
+    assert adaptive.counters["adjoint_eigen_solves"] >= 2
+    assert adaptive.counters["max_adjoint_residual_ppm"] > 1000
+    assert adaptive.adjoint_residual_times.shape == adaptive.adjoint_residual.shape
+
+
+def test_adjoint_residual_tolerance_must_be_positive():
+    with pytest.raises(ValueError, match="adjoint_residual_tol"):
+        quasistatic_coupled_transient(
+            localized_context(), t_end=0.002, dt=0.002,
+            shape_dt=0.002, adjoint_residual_tol=0.0)
 
 
 def test_iqs_time_dependent_shape_is_closer_than_instantaneous_eigen_shape():

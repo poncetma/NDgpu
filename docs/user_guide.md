@@ -406,6 +406,10 @@ unsafe fine interval with the full diffusion equations. `iqs_predictor_tol`
 halves future shape intervals when the coarse predictor disagrees with accepted
 power and restores them after the event settles. Use
 `shape_method="adiabatic"` to select instantaneous eigen shapes.
+For expensive adjoint solves, combine a larger `adjoint_every` with
+`adjoint_residual_tol`: the former limits maximum adjoint age and the latter
+refreshes early when the amplitude-free transposed-eigenproblem residual is too
+large. A hard full-diffusion fallback always refreshes the adjoint.
 Thresholds are model- and mesh-dependent: establish them against a shorter
 full-diffusion reference before relying on them for a long production run.
 
@@ -414,6 +418,106 @@ Useful performance controls are `precond_degree`, `check_every`,
 `thermal_diagnostics_every`. Start with the defaults. Profile a representative
 full-core case before tuning them; small meshes often run faster on the CPU
 because GPU launch overhead dominates.
+
+Diffusion transients also reuse one persistent PCG workspace per energy group
+by default, avoiding repeated solver-vector allocation. This does not change
+iterations or tolerances. `reuse_krylov_workspaces=False` exists for profiling
+and regression A/B runs; ordinary simulations should leave reuse enabled.
+
+An experimental CPU-validated direct multigroup step is also available for
+strongly upscattering diffusion problems:
+
+```python
+direct = core.transient(
+    t_end=1.0, dt=0.02, device="cpu",
+    step_solver="monolithic",
+    multigroup_kwargs={"scatter_sweeps": 3},
+)
+
+coupled_direct = core.coupled_transient(
+    t_end=10.0, dt=0.02, dt_thermal=0.2, device="cpu",
+    transient_kwargs={
+        "step_solver": "monolithic",
+        "multigroup_kwargs": {"scatter_sweeps": 3},
+    },
+)
+```
+
+This solves the same analytically precursor-eliminated implicit BDF step as one
+matrix-free block system using flexible GMRES. On 11-group 2-D HP-MR CPU
+gates it reduced a tightly converged step by 2.5--3.3x. The default remains
+`step_solver="fixed-point"`: the direct method still needs GPU memory and
+throughput validation, is diffusion-only, and should be compared with the
+default on a short representative interval before production use. Its
+`step_iterations` and coupled `neutron_outer_iterations` count FGMRES applies,
+not fission-source sweeps.
+
+The diffusion solver also supports constant- or explicitly nonuniform-step
+BDF1--BDF6 on both in-step solver paths:
+
+```python
+bdf = core.transient(
+    t_end=1.0, dt=0.01, device="cpu", time_scheme="bdf3",
+    step_solver="monolithic",
+    # A cached control frame changes abruptly at these step boundaries.
+    bdf_restart_times=[0.25, 0.50, 0.75],
+)
+
+# Nonuniform widths must be positive and sum exactly to t_end.
+event_aligned = core.transient(
+    t_end=0.10, dt=[0.01, 0.01, 0.005, 0.005, 0.02, 0.05],
+    time_scheme="bdf2",
+)
+print(event_aligned.time_orders)
+```
+
+BDF order ramps up as accepted history becomes available. A restart discards
+flux and precursor history before the indicated step and forces BDF1 there.
+Use it at discontinuous material/control frames and feedback-law corners.
+BDF3--6 are A(alpha)-stable, not A-stable, so they require a stability and
+time-step convergence comparison for the intended transient. Explicit step
+schedules remain the deterministic production path. An experimental adaptive
+width controller is available on monolithic BDF2--BDF6 diffusion transients:
+
+```python
+adaptive = core.transient(
+    t_end=3.0, dt=1e-4, time_scheme="bdf5",
+    step_solver="monolithic", bdf_restart_times=[2.0],
+    adaptive_bdf={"rtol": 1e-3, "min_dt": 1e-6, "max_dt": 0.1},
+)
+print(adaptive.step_widths, adaptive.local_errors,
+      adaptive.rejected_steps)
+```
+
+Rejected attempts roll back flux, precursor, and BDF history and do not invoke
+the accepted `on_step` hook. The controller currently measures the multigroup
+flux defect and retains the requested maximum order between event restarts;
+precursor/thermal contributions and automatic order selection remain under
+development. Do not treat `rtol` as equivalent to FEMCORE/LSODE tolerances or
+make this the default until it passes the documented LRA and HP-MR gates.
+`ndgpu.BDF.error_norm(...)` and `ndgpu.BDFStepController` remain public for
+benchmark and custom-driver development.
+
+For a long run, `multigroup_kwargs={"coarse_correction": True}` adds an
+adjoint-weighted rank-one amplitude correction. It reduces group work but first
+computes an adjoint eigenstate, so it is normally a loss on short histories. An
+advanced IQS/coupling driver that already has a compatible device-resident
+adjoint may pass it as `coarse_adjoint` to avoid that startup solve.
+
+CUDA-graph PCG is currently experimental. Set matching values through the
+low-level solve controls, for example
+`linsolve_kwargs={"check_every": 3, "graph_block": 3}`. Capture is used only
+for a compatible fused CuPy operator with at most 65,536 cells per group;
+otherwise the solve continues normally and records the reason in
+`result.cuda_graph_errors`. Successful runs report capture/replay counts.
+
+For an opt-in mixed-precision GPU experiment, pass
+`precond_dtype="float32"` with `precond_degree=1` or higher. Only the
+polynomial preconditioner uses FP32; physical state, true residuals, and
+stopping decisions remain FP64. Unsafe or failed mixed solves automatically
+retry with the native FP64 preconditioner, reported as
+`result.mixed_precision_fallbacks`. Keep this option disabled until it wins on
+the target GPU and problem size.
 
 ### Cached moving-control states
 

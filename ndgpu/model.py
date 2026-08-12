@@ -783,7 +783,7 @@ class TriReactor:
 
     def transient(self, t_end, dt, *, kinetics=None, materials_at=None,
                   state_at=None, device="auto", precond_degree=0,
-                  linear_solver="cg", **solve_kwargs):
+                  precond_dtype=None, linear_solver="cg", **solve_kwargs):
         """Run neutron kinetics, optionally changing materials or full states.
 
         ``materials_at(t)`` returns materials in this reactor's stable index
@@ -824,7 +824,8 @@ class TriReactor:
             mask_bc=self.mask_bc, mix_material=self.mix_material,
             mix_weight=self.mix_weight, group_operator=TriGroupOperator,
             eig_solver=TriDiffusionEigenSolver, precond_degree=precond_degree,
-            linear_solver=linear_solver, device=device)
+            precond_dtype=precond_dtype, linear_solver=linear_solver,
+            device=device)
         result = solver.solve(t_end=t_end, dt=dt, **solve_kwargs)
         result.reactor = self
         return result
@@ -977,6 +978,8 @@ class TriReactor:
         corrections or full-diffusion fallback intervals for rapid localized
         motion; ``iqs_predictor_tol`` adaptively shortens subsequent shape
         intervals after a large amplitude-predictor disagreement.
+        ``adjoint_residual_tol`` can refresh a reused importance shape before
+        its configured ``adjoint_every`` maximum age.
         """
         from .quasistatic import quasistatic_coupled_transient
 

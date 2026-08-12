@@ -1,5 +1,10 @@
 # Quasi-static transient acceleration plan
 
+The broader, benchmark-gated solver optimization roadmap is maintained in
+[`transient_performance_plan.md`](transient_performance_plan.md). This document
+retains the detailed derivation and implementation history of the quasi-static
+branch.
+
 ## Objective
 
 Accelerate slow, coupled full-core transients in which neutron population and
@@ -65,6 +70,11 @@ Phases 0-3, including the guarded time-dependent IQS core, are now executable:
   shape intervals after a large coarse-predictor disagreement and restores the
   maximum interval after the event settles. Optional `iqs_substeps` traverse
   the actual cached control path inside a macro corrector.
+- Reused adjoints can now be guarded by the amplitude-free residual of the
+  current transposed eigenproblem. `adjoint_every` remains a maximum age and a
+  hard full-diffusion fallback always refreshes the adjoint. On the calibrated
+  2-D HP-MR guard this residual costs milliseconds against seconds for an
+  adjoint eigen solve.
 - CPU regression gates cover exact homogeneous projection, normalization
   invariance, analytic absorption worth, stationary point kinetics, equality
   with the full spatial transient for a shape-preserving insertion, stationary

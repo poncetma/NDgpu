@@ -155,6 +155,8 @@ MODES = (
 RESIDUAL_TOL = 0.012
 FALLBACK_RESIDUAL = 0.020
 PREDICTOR_TOL = 0.020
+ADJOINT_EVERY = 6
+ADJOINT_RESIDUAL_TOL = 0.005
 
 
 def run_mode(problem, problem_at, case, mode):
@@ -171,7 +173,9 @@ def run_mode(problem, problem_at, case, mode):
         if mode == "guarded_iqs":
             options.update(residual_tol=RESIDUAL_TOL,
                            fallback_residual=FALLBACK_RESIDUAL,
-                           iqs_predictor_tol=PREDICTOR_TOL)
+                           iqs_predictor_tol=PREDICTOR_TOL,
+                           adjoint_every=ADJOINT_EVERY,
+                           adjoint_residual_tol=ADJOINT_RESIDUAL_TOL)
         result = quasistatic_coupled_transient(
             ctx, t_end=case.t_end, dt=case.dt,
             dt_thermal=case.dt_thermal, problem_at=problem_at,
@@ -245,6 +249,13 @@ def result_metrics(case, mode, label, result, wall, dynamic, reference,
             counters.get("iqs_predictor_interval_reductions", 0)),
         "predictor_interval_recoveries": int(
             counters.get("iqs_predictor_interval_recoveries", 0)),
+        "adjoint_residual_evaluations": int(
+            counters.get("adjoint_residual_evaluations", 0)),
+        "adjoint_residual_refreshes": int(
+            counters.get("adjoint_residual_refreshes", 0)),
+        "max_adjoint_residual": float(
+            np.max(getattr(result, "adjoint_residual", [0.0])))
+            if np.size(getattr(result, "adjoint_residual", [])) else 0.0,
         "max_iqs_predictor_error": (
             1e-6 * int(counters.get("iqs_max_amplitude_error_ppm", 0))),
         "neutron_inner_iterations": int(counters.get("neutron_inner_iterations", 0)),
@@ -400,7 +411,9 @@ def main():
         "groups": int(args.groups), "quick": args.quick,
         "guarded_iqs": {"residual_tol": RESIDUAL_TOL,
                         "fallback_residual": FALLBACK_RESIDUAL,
-                        "predictor_tol": PREDICTOR_TOL},
+                        "predictor_tol": PREDICTOR_TOL,
+                        "adjoint_every": ADJOINT_EVERY,
+                        "adjoint_residual_tol": ADJOINT_RESIDUAL_TOL},
         "total_benchmark_seconds": total_seconds,
         "cases": case_metadata,
     }

@@ -152,6 +152,40 @@ def test_coupled_transient_holds_the_steady_state():
     assert np.ptp(r.mean_temperature) < 1e-6
 
 
+def test_coupled_transient_accepts_monolithic_neutron_steps():
+    """Coupling must not inject fixed-point-only Krylov controls."""
+    from ndgpu.coupling import coupled_transient
+
+    p = _problem(refine=2)
+    ctx = _ctx(p)
+    fixed = coupled_transient(
+        ctx, t_end=0.1, dt=0.05, dt_thermal=0.1)
+    direct = coupled_transient(
+        ctx, t_end=0.1, dt=0.05, dt_thermal=0.1,
+        transient_kwargs={
+            "step_solver": "monolithic",
+            "multigroup_kwargs": {"rtol": 1e-9},
+        })
+    np.testing.assert_allclose(direct.power, fixed.power,
+                               rtol=2e-7, atol=2e-9)
+    np.testing.assert_allclose(direct.peak_temperature,
+                               fixed.peak_temperature, rtol=0, atol=2e-6)
+    assert direct.counters["neutron_monolithic_steps"] == 2
+    assert direct.counters["neutron_outer_iterations"] > 0
+
+
+def test_coupled_transient_forwards_bdf_controls_and_reports_order():
+    from ndgpu.coupling import coupled_transient
+
+    result = coupled_transient(
+        _ctx(_problem(refine=2)), t_end=0.15, dt=0.05, dt_thermal=0.15,
+        transient_kwargs={"time_scheme": "bdf3", "tol_step": 1e-8})
+    assert result.time_scheme == "bdf3"
+    assert result.time_orders == [1, 2, 3]
+    assert result.counters["neutron_bdf_max_order"] == 3
+    np.testing.assert_allclose(result.power, 1.0, rtol=0, atol=2e-8)
+
+
 def test_coupled_transient_matches_the_uncoupled_one_without_feedback():
     """With the feedback coefficients zeroed the coupling cannot act, so the
     power history must be the plain transient's, step for step."""

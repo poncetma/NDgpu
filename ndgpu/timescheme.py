@@ -16,11 +16,12 @@ Concretely, with (1/v) du/dt = F(u) = -A u + S:
 
   backward Euler (BDF1)   a0 = 1      Psi = u^n
   theta-method            a0 = 1/w    Psi^{n+1} = u + ((1-w)/w)(u - Psi^n)
-  BDF2                    a0 = 3/2    Psi = (4 u^n - u^{n-1})/3
+  BDFq                    a0 = a[q,0] Psi = H/a0, q = min(step, max_order)
 
-The BDF2 carried field follows from theta(3/2 u^{n+1} - 2u^n + 1/2 u^{n-1}) =
-F^{n+1}: the history term theta(2u^n - u^{n-1}/2) equals a0 theta Psi exactly
-when Psi = (4u^n - u^{n-1})/3.
+For example, BDF2 has ``a = (3/2, -2, 1/2)``.  Its history term is
+``H = 2 u^n - u^{n-1}/2``, hence ``Psi = H/a0 =
+(4 u^n - u^{n-1})/3``.  Higher orders use the same representation, so the
+spatial engines remain unaware of the time order.
 
 Precursors
 ----------
@@ -44,6 +45,10 @@ states), so it has no matching precursor treatment and is prompt-only.
 
 from __future__ import annotations
 
+from fractions import Fraction
+
+import numpy as np
+
 
 def _lin(xs, coeffs):
     """Linear combination of per-group array lists."""
@@ -54,6 +59,16 @@ def _lin(xs, coeffs):
             acc = acc + c * p
         out.append(acc)
     return out
+
+
+def _state_norm2(state):
+    """Squared Euclidean norm of an iterable of NumPy/device arrays."""
+    total = 0.0
+    for value in state:
+        # ndarray.sum() is implemented by both NumPy and CuPy and transfers
+        # only the resulting scalar when converted to float.
+        total += float((value * value).sum())
+    return total
 
 
 class TimeScheme:
@@ -73,6 +88,9 @@ class TimeScheme:
 
     def a0(self, step):
         return 1.0
+
+    def prepare_step(self, step, dt):
+        """Prepare a possibly variable-width step (one-step schemes: no-op)."""
 
     def carried(self, step):
         return list(self._u)
@@ -107,7 +125,7 @@ class TimeScheme:
 class ThetaMethod(TimeScheme):
     """theta-method with weight w on the end-of-step operator (w=1/2 is CN).
 
-    A-stable for w <= 1/2 but *not* L-stable at w = 1/2, so a prompt jump rings
+    A-stable for w >= 1/2 but *not* L-stable at w = 1/2, so a prompt jump rings
     rather than decays; opt-in, and prompt-only (no BDF-form precursors).
     """
 
@@ -168,50 +186,256 @@ class ThetaMethod(TimeScheme):
                 for c, l, b in zip(C_hist[0], lam, beta)]
 
 
-class BDF2(TimeScheme):
-    """Second-order backward differentiation. A-stable *and* L-stable.
+# Constant-step BDF coefficients, normalized so that
+#     sum_j a_j u^{n+1-j} = dt f(u^{n+1}).
+# Fractions keep the defining table exact; conversion to float happens only
+# when a coefficient is used with a numerical field.
+_BDF_COEFFICIENTS = {
+    1: (Fraction(1), Fraction(-1)),
+    2: (Fraction(3, 2), Fraction(-2), Fraction(1, 2)),
+    3: (Fraction(11, 6), Fraction(-3), Fraction(3, 2), Fraction(-1, 3)),
+    4: (Fraction(25, 12), Fraction(-4), Fraction(3),
+        Fraction(-4, 3), Fraction(1, 4)),
+    5: (Fraction(137, 60), Fraction(-5), Fraction(5),
+        Fraction(-10, 3), Fraction(5, 4), Fraction(-1, 5)),
+    6: (Fraction(49, 20), Fraction(-6), Fraction(15, 2),
+        Fraction(-20, 3), Fraction(15, 4), Fraction(-6, 5),
+        Fraction(1, 6)),
+}
 
-    Unlike Crank-Nicolson it damps the prompt mode (amplification -> 0 rather
-    than -> -1), which is why it is the right second-order default for stiff
-    reactor kinetics. Bootstrapped with one backward-Euler step, so the first
-    step is first-order accurate; take it small if that matters.
+
+class BDF(TimeScheme):
+    """Constant-step BDF with startup order ramping from one to ``max_order``.
+
+    Orders one and two are A-stable.  Orders three through six are only
+    A(alpha)-stable, with a shrinking stability wedge, so they remain opt-in
+    for reactor kinetics.  All orders are strongly damping on the negative
+    real axis, but rapid control motion can excite modes outside that wedge.
+
+    The first accepted step uses BDF1, the next BDF2, and so on until the
+    requested maximum order is reached.  This avoids inventing unavailable
+    pre-history and preserves an initially critical equilibrium exactly.
     """
 
-    name = "bdf2"
-    order = 2
+    is_bdf = True
 
-    def __init__(self):
+    def __init__(self, max_order=2):
         super().__init__()
-        self._prev = None          # u^{n-1}
+        max_order = int(max_order)
+        if max_order not in _BDF_COEFFICIENTS:
+            raise ValueError("BDF max_order must be between 1 and 6")
+        self.max_order = max_order
+        self.order = max_order
+        self.name = f"bdf{max_order}"
+        self._history_u = []       # [u^n, u^{n-1}, ...]
+        self._dt_history = []      # [dt_n, dt_{n-1}, ...], accepted widths
+        self._prepared = None
 
     def start(self, u0):
-        self._u = list(u0)
-        self._prev = None
+        self._history_u = [list(u0)]
+        self._dt_history = []
+        self._prepared = None
+        self._u = self._history_u[0]
         return list(u0)
 
+    def order_at(self, step):
+        # History availability, rather than the absolute step number, also
+        # makes an explicit discontinuity restart drop immediately to BDF1.
+        available = (len(self._history_u) if self._history_u
+                     else max(int(step), 1))
+        return min(max(int(step), 1), self.max_order, available)
+
+    def coefficients(self, step):
+        if self._prepared is not None and self._prepared[0] == int(step):
+            return self._prepared[2]
+        return tuple(float(a) for a in _BDF_COEFFICIENTS[self.order_at(step)])
+
+    def prepare_step(self, step, dt):
+        """Construct variable-step coefficients from accepted step widths.
+
+        With nodes measured backwards from the new time and scaled by the
+        proposed width, the coefficients satisfy
+        ``sum_j a_j x_j**m = delta[m, 1]`` through degree q.  This is the
+        non-uniform-grid BDF formula; equal widths reproduce the exact table.
+        """
+        step, dt = int(step), float(dt)
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError("BDF step width must be finite and positive")
+        q = self.order_at(step)
+        if len(self._dt_history) < q - 1:
+            raise ValueError("insufficient accepted step-width history")
+        nodes = [0.0]
+        distance = dt
+        for j in range(1, q + 1):
+            nodes.append(-distance / dt)
+            if j < q:
+                distance += self._dt_history[j - 1]
+        vandermonde = np.asarray(
+            [[x**m for x in nodes] for m in range(q + 1)], dtype=float)
+        rhs = np.zeros(q + 1)
+        rhs[1] = 1.0
+        coeffs = tuple(float(a) for a in np.linalg.solve(vandermonde, rhs))
+        self._prepared = (step, dt, coeffs)
+
     def a0(self, step):
-        # Keyed on the step index, NOT on whether history exists: the driver
-        # advances the carried flux field and the precursors at different
-        # points in the step, and a state-dependent a0 would report different
-        # values to the two (solving the flux at a0=1 while updating
-        # precursors at a0=3/2, which silently breaks the equilibrium).
-        return 1.0 if step <= 1 else 1.5
+        return self.coefficients(step)[0]
+
+    @staticmethod
+    def _combine_history(history, coeffs):
+        if len(history) < len(coeffs):
+            raise ValueError("insufficient BDF history for requested order")
+        return _lin(history[:len(coeffs)], coeffs)
 
     def carried(self, step):
-        if self._prev is None:                     # bootstrap: backward Euler
-            return list(self._u)
-        # a0 Psi = 2 u^n - u^{n-1}/2  with a0 = 3/2
-        return _lin([self._u, self._prev], [4.0 / 3.0, -1.0 / 3.0])
+        a = self.coefficients(step)
+        # H = sum_{j>=1} -a_j u^{n+1-j}; the engine expects Psi = H/a0.
+        return self._combine_history(
+            self._history_u, [-a_j / a[0] for a_j in a[1:]])
+
+    def predict(self, dt):
+        """Polynomially extrapolate accepted state history one step forward.
+
+        This is the multilevel BDF predictor used to initialize nonlinear
+        feedback iterations and estimate local error. Up to ``max_order + 1``
+        accepted states are retained, giving a degree-``max_order`` predictor
+        once startup is complete; earlier steps use every available state.
+        Actual nonuniform time nodes are respected. Startup with one state is
+        a constant predictor. No state is mutated, so a rejected/probed step
+        is free to call it repeatedly.
+        """
+        dt = float(dt)
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError("BDF prediction width must be finite and positive")
+        n_points = min(len(self._history_u), self.max_order + 1)
+        if n_points == 0:
+            raise RuntimeError("BDF predictor must be seeded with start()")
+        nodes = [0.0]
+        distance = 0.0
+        for j in range(1, n_points):
+            distance += self._dt_history[j - 1]
+            nodes.append(-distance)
+        target = dt
+        weights = []
+        for j, xj in enumerate(nodes):
+            w = 1.0
+            for m, xm in enumerate(nodes):
+                if m != j:
+                    w *= (target - xm) / (xj - xm)
+            weights.append(w)
+        return _lin(self._history_u[:n_points], weights)
+
+    @staticmethod
+    def error_norm(corrected, predicted, *, rtol, atol=0.0):
+        """Normalized predictor--corrector defect used for step acceptance.
+
+        This follows Eq. (44) of Cherezov et al.: the Euclidean norm of the
+        state correction divided by the norm of ``atol + rtol*corrected``.
+        Both arguments are iterables so multigroup fluxes, precursor families,
+        and thermal fields can be evaluated independently or concatenated.
+        A value no greater than one passes the local error test.
+        """
+        rtol, atol = float(rtol), float(atol)
+        if not np.isfinite(rtol) or rtol <= 0.0:
+            raise ValueError("BDF error rtol must be finite and positive")
+        if not np.isfinite(atol) or atol < 0.0:
+            raise ValueError("BDF error atol must be finite and non-negative")
+        corrected, predicted = list(corrected), list(predicted)
+        if len(corrected) != len(predicted) or not corrected:
+            raise ValueError("corrected and predicted states must have equal, "
+                             "non-zero lengths")
+        residual = [c - p for c, p in zip(corrected, predicted)]
+        scale = [atol + rtol * abs(c) for c in corrected]
+        denominator = _state_norm2(scale)
+        if denominator == 0.0:
+            return 0.0 if _state_norm2(residual) == 0.0 else np.inf
+        return float(np.sqrt(_state_norm2(residual) / denominator))
 
     def push(self, u_new):
-        self._prev = self._u
-        self._u = list(u_new)
+        self._history_u.insert(0, list(u_new))
+        # The BDFq recurrence needs q accepted states, while a degree-q LTE
+        # predictor needs q+1. Retain that one extra state solely for error
+        # estimation; coefficients/carried() still consume at most q.
+        del self._history_u[self.max_order + 1:]
+        if self._prepared is not None:
+            self._dt_history.insert(0, self._prepared[1])
+            del self._dt_history[self.max_order:]
+        self._u = self._history_u[0]
 
-    def _history(self, C_hist):
-        """H = C^n (bootstrap) or 2 C^n - C^{n-1}/2 (BDF2)."""
-        if len(C_hist) < 2 or C_hist[1] is None:
-            return list(C_hist[0])
-        return _lin([C_hist[0], C_hist[1]], [2.0, -0.5])
+    def _history(self, C_hist, step=None):
+        # Precursor callers know the step; legacy callers do not.  The number
+        # of populated entries identifies the same startup order in the latter
+        # case because histories are advanced exactly once per accepted step.
+        q = (min(len(C_hist), self.max_order) if step is None
+             else self.order_at(step))
+        a = (self.coefficients(step) if step is not None else
+             tuple(float(x) for x in _BDF_COEFFICIENTS[q]))
+        return self._combine_history(C_hist, [-a_j for a_j in a[1:]])
+
+    def precursor_decayed(self, step, C_hist, S_prev, beta, lam, dt):
+        a0 = self.a0(step)
+        H = self._history(C_hist, step)
+        return [(l / (a0 + l * dt)) * h for l, h in zip(lam, H)]
+
+    def precursor_update(self, step, C_hist, S_new, S_prev, beta, lam, dt):
+        a0 = self.a0(step)
+        H = self._history(C_hist, step)
+        return [(h + (dt * b) * S_new) / (a0 + l * dt)
+                for h, b, l in zip(H, beta, lam)]
+
+
+class BDF2(BDF):
+    """Backward-compatible spelling for the second-order BDF scheme."""
+
+    def __init__(self):
+        super().__init__(2)
+
+
+class BDFStepController:
+    """Bounded predictor--corrector step-width controller.
+
+    The accepted-step proposal is the order-``q`` form of Cherezov et al.
+    Eq. (45), with conservative growth/shrink limits. A failed error test uses
+    the paper's explicit factor-two reduction. Order selection is deliberately
+    not hidden in this class: the next integration phase will compare the
+    ``q-1``, ``q``, and ``q+1`` estimates before changing BDF history order.
+    """
+
+    def __init__(self, *, safety=1.25, floor=1e-6,
+                 min_factor=0.2, max_factor=5.0):
+        safety = float(safety)
+        floor = float(floor)
+        min_factor, max_factor = float(min_factor), float(max_factor)
+        if not np.isfinite(safety) or safety <= 1.0:
+            raise ValueError("BDF controller safety must be finite and > 1")
+        if not np.isfinite(floor) or floor < 0.0:
+            raise ValueError("BDF controller floor must be finite and >= 0")
+        if not (0.0 < min_factor <= 1.0 <= max_factor):
+            raise ValueError("BDF controller factors must bracket one")
+        self.safety = safety
+        self.floor = floor
+        self.min_factor = min_factor
+        self.max_factor = max_factor
+
+    def factor(self, error, order, *, accepted=True):
+        """Return the multiplicative proposal ``h_new / h``."""
+        error, order = float(error), int(order)
+        if order < 1 or order > 6:
+            raise ValueError("BDF controller order must be between 1 and 6")
+        if not np.isfinite(error) or error < 0.0:
+            if np.isinf(error) and error > 0.0:
+                return 0.5
+            raise ValueError("BDF controller error must be non-negative")
+        if not accepted or error > 1.0:
+            return 0.5
+        raw = 1.0 / (self.safety
+                     * (error + self.floor) ** (1.0 / (order + 1)))
+        return min(max(raw, self.min_factor), self.max_factor)
+
+    def propose(self, dt, error, order, *, accepted=True):
+        dt = float(dt)
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError("BDF controller step width must be positive")
+        return dt * self.factor(error, order, accepted=accepted)
 
 
 def make_time_scheme(time_scheme="backward-euler", time_weight=None):
@@ -224,9 +448,9 @@ def make_time_scheme(time_scheme="backward-euler", time_weight=None):
     name = str(time_scheme).lower()
     if name in ("backward-euler", "be", "bdf1"):
         return TimeScheme()
-    if name == "bdf2":
-        return BDF2()
+    if name.startswith("bdf") and name[3:].isdigit():
+        return BDF(int(name[3:]))
     if name in ("crank-nicolson", "cn"):
         return ThetaMethod(0.5)
     raise ValueError(f"unknown time_scheme {time_scheme!r} (backward-euler, "
-                     f"bdf2, crank-nicolson)")
+                     f"bdf2..bdf6, crank-nicolson)")

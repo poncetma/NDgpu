@@ -192,6 +192,27 @@ def test_cpu_fallbacks_match_the_expressions_they_replace():
     kernels.neumann_step(np, zf, r, az, inv_diag)
     np.testing.assert_allclose(zf, z + inv_diag * (r - az), rtol=1e-14)
 
+    residual_low = np.empty(n, dtype=np.float32)
+    z_low = np.empty(n, dtype=np.float32)
+    inv_low = inv_diag.astype(np.float32)
+    kernels.mixed_jacobi_start(
+        np, r, inv_low, residual_low, z_low)
+    np.testing.assert_array_equal(residual_low, r.astype(np.float32))
+    np.testing.assert_array_equal(z_low, inv_low * residual_low)
+
+    numerator = np.asarray(7.0)
+    denominator = np.asarray(4.0)
+    quotient = np.empty(())
+    kernels.scalar_divide(np, quotient, numerator, denominator)
+    assert quotient == 1.75
+    copied = np.empty(())
+    kernels.scalar_copy(np, copied, quotient)
+    assert copied == quotient
+
+    dot_out = np.empty(())
+    assert kernels.dot(np, x, r, out=dot_out) is dot_out
+    assert dot_out == np.sum(x * r)
+
     np.testing.assert_allclose(kernels.dot(np, x, r), np.sum(x * r), rtol=1e-14)
 
 

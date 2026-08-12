@@ -43,12 +43,16 @@ import numpy as np
 
 from .backend import asnumpy, device_name, get_backend, synchronize
 from .grid import Grid
-from .linalg import get_linear_solver, neumann_preconditioner
+from .linalg import (fgmres, get_linear_solver, mixed_precision_preconditioner,
+                     neumann_preconditioner, pcg, pcg_workspaces)
 from .materials import Kinetics
+from .multigroup import (EnergyGroupGaussSeidelPreconditioner,
+                         AdjointCoarseCorrectionPreconditioner,
+                         MultigroupStepOperator)
 from .sn import SNTransportSolver
 from .sp3 import SP3GroupOperator
 from .spn import SDPNGroupOperator, _SPN_C
-from .timescheme import make_time_scheme
+from .timescheme import BDF, BDFStepController, make_time_scheme
 from .stencil import BC_VACUUM, BC_ZERO_FLUX, GroupOperator
 from .solver import (DiffusionEigenSolver, Fields, Result, SDP1EigenSolver,
                      SDPNEigenSolver, scatter_stack)
@@ -105,6 +109,25 @@ def _n_steps(t_end: float, dt: float) -> int:
     return n_steps
 
 
+def _step_schedule(t_end: float, dt):
+    """Return target times and widths for scalar or explicit-step input."""
+    if np.ndim(dt) == 0:
+        width = float(dt)
+        count = _n_steps(t_end, width)
+        widths = np.full(count, width)
+        return np.arange(1, count + 1, dtype=float) * width, widths
+    widths = np.asarray(dt, dtype=float)
+    if widths.ndim != 1 or widths.size == 0:
+        raise ValueError("an explicit dt schedule must be a non-empty 1D sequence")
+    if (not np.all(np.isfinite(widths))) or np.any(widths <= 0.0):
+        raise ValueError("every explicit step width must be finite and positive")
+    times = np.cumsum(widths)
+    if not np.isfinite(t_end) or t_end < 0.0 or not np.isclose(
+            times[-1], t_end, rtol=1e-12, atol=1e-14 * max(1.0, t_end)):
+        raise ValueError("explicit step widths must sum to t_end")
+    return times, widths
+
+
 def _require_global_kinetics(kin: Kinetics, who: str):
     """Per-material kinetics (2D velocities/beta) and per-family chi_delayed
     are currently implemented only by the diffusion TransientSolver."""
@@ -151,12 +174,32 @@ class TransientResult:
     total_inner_iterations: int
     solve_seconds: float
     device: str
-    # Fixed-point (fission source) iterations per time step -- the transient's
-    # outer convergence telemetry, per the benchmark protocol.
+    # Outer iterations per time step: fission-source sweeps for the default
+    # method, FGMRES operator applications for a monolithic step.
     step_iterations: list = field(default_factory=list)
+    step_method: str = "fixed-point"
     # True when the caller supplied the compatible time-zero eigenpair instead
     # of asking this solve to repeat the initial critical calculation.
     initial_state_reused: bool = False
+    # Number of unsafe low-precision setups or failed mixed PCG attempts that
+    # automatically returned to the native FP64 preconditioner.
+    mixed_precision_fallbacks: int = 0
+    cuda_graph_captures: int = 0
+    cuda_graph_replays: int = 0
+    cuda_graph_errors: list = field(default_factory=list)
+    adjoint_coarse_setups: int = 0
+    time_scheme: str = "backward-euler"
+    time_orders: list = field(default_factory=list)
+    # Number of endpoint neutronics/feedback constituent solves performed for
+    # each accepted step. One means no nonlinear feedback repeat was needed.
+    feedback_iterations: list = field(default_factory=list)
+    # Accepted adaptive-step diagnostics. Empty for a fixed schedule.
+    step_widths: list = field(default_factory=list)
+    local_errors: list = field(default_factory=list)
+    rejected_steps: int = 0
+    rejected_errors: list = field(default_factory=list)
+    rejected_step_iterations: list = field(default_factory=list)
+    rejected_feedback_iterations: list = field(default_factory=list)
 
     @property
     def flux_numpy(self) -> np.ndarray:
@@ -197,6 +240,15 @@ class TransientSolver:
                  alongside: it receives the end-of-step flux and P(t)/P(0), and
                  whatever it computes there can be fed back through
                  ``xs_update_at`` on the next step (operator splitting).
+    feedback_iteration : optional callable ``(t, flux, power, iteration) ->
+                 bool`` for fully implicit endpoint feedback. It is called
+                 after a monolithic neutron solve; False asks the solver to
+                 call ``xs_update_at(t)`` again and repeat the SAME time step.
+                 The callback should update only provisional feedback state;
+                 ``on_step`` is the accepted-step commit hook. Flux, precursor,
+                 and BDF histories are committed only after True, providing
+                 rollback between constituent iterations and a clean seam for
+                 the adaptive-step error test.
     kinetics   : Kinetics (velocities, delayed families). Per-material tables
                  (2D velocities/beta, rows indexing the problem_at materials
                  list) and per-family chi_delayed (I, G) are supported: the
@@ -217,13 +269,16 @@ class TransientSolver:
                  active=None, mask_bc=BC_VACUUM,
                  group_operator=GroupOperator, eig_solver=DiffusionEigenSolver,
                  precond_degree: int = 0, linear_solver="cg",
+                 precond_dtype=None,
                  symmetric_operator: bool = True,
                  mix_material=None, mix_weight=None,
-                 xs_update_at=None, on_step=None, phase_context=None):
+                 xs_update_at=None, on_step=None, feedback_iteration=None,
+                 phase_context=None):
         self.grid = grid
         self.problem_at = problem_at
         self.xs_update_at = xs_update_at
         self.on_step = on_step
+        self.feedback_iteration = feedback_iteration
         # Optional driver instrumentation: callable(name) -> context manager.
         # Keeping it outside the numerical result avoids timing overhead unless
         # a coupled/benchmark driver explicitly opts in.
@@ -248,6 +303,48 @@ class TransientSolver:
         self.xp = get_backend(device)
         self.device = device_name(self.xp)
         self.dtype = np.dtype(dtype)
+        self.precond_dtype = (None if precond_dtype is None
+                              else np.dtype(precond_dtype))
+        if self.precond_dtype is not None:
+            if self._linsolve is not pcg:
+                raise ValueError("mixed preconditioning currently requires PCG")
+            if self.precond_dtype != np.dtype(np.float32):
+                raise ValueError("precond_dtype currently supports only float32")
+            if self.precond_dtype.itemsize >= self.dtype.itemsize:
+                raise ValueError(
+                    "precond_dtype must be a floating dtype narrower than dtype")
+
+    def _step_operators(self, fields, inv_vdt, groups):
+        """Build physical FP64 operators and optional FP32 preconditioners."""
+        xp = self.xp
+        ops = [self.group_operator(
+            xp, self.grid, fields.diffusion[g],
+            fields.removal[g] + inv_vdt[g], bc=self.bc,
+            active=self.active, mask_bc=self.mask_bc, **self._op_kwargs)
+            for g in range(groups)]
+        full = [neumann_preconditioner(
+            op.apply, op.inv_diag, self.precond_degree) for op in ops]
+        if self.precond_dtype is None:
+            return ops, full, None, 0
+
+        low_ops = [self.group_operator(
+            xp, self.grid,
+            xp.asarray(fields.diffusion[g], dtype=self.precond_dtype),
+            xp.asarray(fields.removal[g] + inv_vdt[g],
+                       dtype=self.precond_dtype),
+            bc=self.bc, active=self.active, mask_bc=self.mask_bc,
+            **self._op_kwargs)
+            for g in range(groups)]
+        safe = all(bool(xp.all(xp.isfinite(op.inv_diag)))
+                   and bool(xp.all(op.inv_diag > 0.0)) for op in low_ops)
+        if not safe:
+            # Coefficients outside the low dtype's range must never poison the
+            # FP64 recurrence. Retain the physical preconditioner instead.
+            return ops, full, None, 1
+        mixed = [mixed_precision_preconditioner(
+            op.apply, op.inv_diag, self.precond_degree, self.dtype)
+            for op in low_ops]
+        return ops, mixed, full, 0
 
     def _group_batch(self, fields, phi, G):
         r"""Stacked group data for the batched source assembly, or None.
@@ -309,8 +406,20 @@ class TransientSolver:
               initial_precursors=None,
               rebalance: bool = False,
               linsolve_kwargs: dict | None = None,
+              reuse_krylov_workspaces: bool = True,
+              step_solver: str = "fixed-point",
+              multigroup_kwargs: dict | None = None,
+              time_scheme: str = "backward-euler",
+              time_weight: float | None = None,
+              bdf_restart_times=None,
+              adaptive_bdf: dict | None = None,
+              max_feedback_iterations: int = 12,
               verbose: bool = False) -> TransientResult:
-        """March from the steady state at t=0 to t_end with fixed step dt.
+        """March from the steady state at t=0 to ``t_end``.
+
+        dt : one constant step width, or an explicit sequence of positive
+            widths summing to ``t_end``. A sequence activates nonuniform BDF
+            coefficients and supports event-aligned CPU studies.
 
         tol_step : stopping criterion on the RELATIVE CHANGE between successive
             fission-source iterates. **It is not an error bound, and on a
@@ -353,6 +462,50 @@ class TransientSolver:
             solve -- see ``examples/hpmr_transient_bench.py``. Costs at most
             ``check_every - 1`` extra iterations per solve, so keep it well
             below the typical iteration count.
+        reuse_krylov_workspaces : keep one persistent PCG vector workspace per
+            energy group. This removes repeated solver-vector allocation and
+            lets ndgpu operators write ``A p`` directly into stable storage,
+            which is required by the CUDA-graph path. It does not change the
+            equations, stopping rule, or iteration count. Disable it for an
+            allocationful A/B comparison. Non-CG solvers ignore this option.
+        step_solver : ``"fixed-point"`` (validated default) or
+            ``"monolithic"``. The latter forms the same precursor-eliminated
+            implicit BDF equations as one matrix-free multigroup system and
+            solves them with flexible GMRES, using inexact energy-group PCG
+            sweeps as a right preconditioner. It is currently diffusion-only
+            and opt-in while GPU scaling is measured.
+        multigroup_kwargs : expert controls for ``step_solver="monolithic"``:
+            ``scatter_sweeps`` (default 3), ``inner_rtol`` (1e-3),
+            ``inner_maxiter`` (300), ``precond_degree`` (the solver setting),
+            ``rtol`` (default ``0.1*tol_step``), ``restart`` (30), and
+            ``maxiter`` (300). ``coarse_correction=True`` computes one initial
+            adjoint and adds an adjoint-weighted rank-one amplitude correction;
+            this has startup cost and is intended for longer runs. Advanced
+            coupled/IQS drivers that already own a compatible adjoint may pass
+            it as ``coarse_adjoint`` and avoid the extra eigen solve. Lagged
+            fission is intentionally not exposed:
+            CPU HP-MR gates found that it reduced outer iterations but raised
+            total PCG work and wall time.
+        time_scheme : ``"backward-euler"`` (default), ``"bdf2"`` through
+            ``"bdf6"``, or ``"crank-nicolson"``. BDF ramps from order one as
+            history becomes available. Orders above two are opt-in because
+            they are A(alpha)-stable rather than A-stable.
+        time_weight : legacy theta-method weight; it cannot be combined with a
+            named BDF scheme.
+        bdf_restart_times : known material/control discontinuities, each at a
+            step end. Flux and precursor history is discarded before that
+            step, forcing BDF1 and then ramping again. Use this for abrupt drum
+            frames, rod events, and feedback-law corners.
+        adaptive_bdf : experimental BDF local-error controller. A dictionary
+            with ``rtol`` (required in production; default 1e-3), optional
+            ``atol``, ``min_dt``, ``max_dt``, ``safety``, ``min_factor``,
+            ``max_factor``, and ``max_rejections``. It uses ``dt`` as the
+            initial width, aligns steps to ``bdf_restart_times`` and ``t_end``,
+            and currently supports only scalar ``dt``, BDF2--BDF6, and the
+            monolithic diffusion step. Rejected attempts do not advance flux,
+            precursor, BDF, or ``on_step`` state. The first implementation
+            controls the multigroup flux defect; coupled thermal contribution
+            to the norm is a subsequent validation gate.
         scatter_subsweeps : Gauss-Seidel passes over the groups per fixed-point
             evaluation (fission source held fixed). With downscatter only, one
             ordered pass is exact, so extra passes are pointless; with
@@ -400,8 +553,121 @@ class TransientSolver:
         """
         xp, kin = self.xp, self.kinetics
         beta, lam = kin.beta, kin.decay
+        scheme = make_time_scheme(time_scheme, time_weight)
+        step_solver = str(step_solver).lower()
+        if step_solver not in ("fixed-point", "monolithic"):
+            raise ValueError("step_solver must be 'fixed-point' or 'monolithic'")
+        if step_solver == "monolithic" and not self.symmetric_operator:
+            raise ValueError("monolithic group preconditioning currently needs "
+                             "symmetric within-group diffusion operators")
+        if step_solver == "monolithic" and self.precond_dtype is not None:
+            raise ValueError("monolithic steps do not yet use precond_dtype; "
+                             "leave mixed preconditioning disabled")
+        if self.feedback_iteration is not None:
+            if step_solver != "monolithic":
+                raise ValueError("implicit feedback_iteration currently requires "
+                                 "step_solver='monolithic'")
+            if self.xs_update_at is None:
+                raise ValueError("feedback_iteration requires xs_update_at so "
+                                 "each constituent iterate can rebuild fields")
+            if int(max_feedback_iterations) < 1:
+                raise ValueError("max_feedback_iterations must be positive")
         lin_kw = dict(linsolve_kwargs or {})
-        n_steps = _n_steps(t_end, dt)
+        if "workspace" in lin_kw:
+            raise ValueError(
+                "linsolve_kwargs['workspace'] is managed per energy group; "
+                "use reuse_krylov_workspaces instead")
+        if step_solver == "monolithic" and lin_kw:
+            raise ValueError("linsolve_kwargs controls fixed-point group solves; "
+                             "use multigroup_kwargs with step_solver='monolithic'")
+        mg_kw = dict(multigroup_kwargs or {})
+        allowed_mg = {"scatter_sweeps", "inner_rtol", "inner_atol",
+                      "inner_maxiter", "precond_degree", "rtol", "atol",
+                      "restart", "maxiter", "coarse_correction",
+                      "coarse_adjoint"}
+        unknown_mg = sorted(set(mg_kw) - allowed_mg)
+        if unknown_mg:
+            raise ValueError(f"unknown multigroup_kwargs: {unknown_mg}")
+        adaptive_kw = None if adaptive_bdf is None else dict(adaptive_bdf)
+        adaptive = adaptive_kw is not None
+        if adaptive:
+            allowed_adaptive = {
+                "rtol", "atol", "min_dt", "max_dt", "safety", "floor",
+                "min_factor", "max_factor", "max_rejections",
+            }
+            unknown = sorted(set(adaptive_kw) - allowed_adaptive)
+            if unknown:
+                raise ValueError(f"unknown adaptive_bdf controls: {unknown}")
+            if np.ndim(dt) != 0:
+                raise ValueError("adaptive_bdf requires a scalar initial dt")
+            if step_solver != "monolithic":
+                raise ValueError("adaptive_bdf currently requires "
+                                 "step_solver='monolithic'")
+            if not isinstance(scheme, BDF) or scheme.max_order < 2:
+                raise ValueError("adaptive_bdf currently requires bdf2..bdf6")
+            initial_dt = float(dt)
+            if (not np.isfinite(t_end) or t_end < 0.0
+                    or not np.isfinite(initial_dt) or initial_dt <= 0.0):
+                raise ValueError("adaptive t_end/dt must be finite and positive")
+            adaptive_rtol = float(adaptive_kw.get("rtol", 1e-3))
+            adaptive_atol = float(adaptive_kw.get("atol", 0.0))
+            if not np.isfinite(adaptive_rtol) or adaptive_rtol <= 0.0:
+                raise ValueError("adaptive_bdf rtol must be finite and positive")
+            if not np.isfinite(adaptive_atol) or adaptive_atol < 0.0:
+                raise ValueError("adaptive_bdf atol must be finite and non-negative")
+            adaptive_min_dt = float(adaptive_kw.get(
+                "min_dt", max(1e-12, initial_dt * 1e-4)))
+            adaptive_max_dt = float(adaptive_kw.get(
+                "max_dt", max(initial_dt, t_end if t_end > 0.0 else initial_dt)))
+            if (not np.isfinite(adaptive_min_dt) or adaptive_min_dt <= 0.0
+                    or not np.isfinite(adaptive_max_dt)
+                    or adaptive_max_dt < adaptive_min_dt):
+                raise ValueError("adaptive_bdf min_dt/max_dt are invalid")
+            max_rejections = int(adaptive_kw.get("max_rejections", 20))
+            if max_rejections < 1:
+                raise ValueError("adaptive_bdf max_rejections must be positive")
+            controller = BDFStepController(
+                safety=adaptive_kw.get("safety", 1.25),
+                floor=adaptive_kw.get("floor", 1e-6),
+                min_factor=adaptive_kw.get("min_factor", 0.2),
+                max_factor=adaptive_kw.get("max_factor", 5.0),
+            )
+            # Dynamic stepping owns its target sequence. Fixed schedules keep
+            # the old arrays bit-for-bit so the validated path is unchanged.
+            target_times = np.empty(0)
+            step_widths = np.empty(0)
+            n_steps = 0
+            dt_step = min(initial_dt, adaptive_max_dt,
+                          t_end if t_end > 0.0 else initial_dt)
+        else:
+            target_times, step_widths = _step_schedule(t_end, dt)
+            n_steps = len(step_widths)
+            dt_step = (float(step_widths[0]) if n_steps else float(dt))
+        if np.ndim(dt) != 0 and not (
+                scheme.name == "backward-euler" or scheme.name.startswith("bdf")):
+            raise NotImplementedError(
+                "explicit nonuniform steps currently support BDF schemes only")
+        restart_steps = set()
+        restart_times = np.empty(0)
+        if bdf_restart_times is not None:
+            restart_times = np.asarray(bdf_restart_times, dtype=float)
+            if restart_times.ndim != 1 or not np.all(np.isfinite(restart_times)):
+                raise ValueError("bdf_restart_times must be a finite 1D sequence")
+            if adaptive:
+                if np.any(restart_times <= 0.0) or np.any(restart_times >= t_end):
+                    raise ValueError("adaptive BDF restart times must lie inside "
+                                     "(0, t_end)")
+                restart_times = np.unique(np.sort(restart_times))
+            else:
+                for event in restart_times:
+                    matches = np.flatnonzero(np.isclose(
+                        target_times, event, rtol=1e-12,
+                        atol=1e-14 * max(1.0, abs(event))))
+                    if matches.size != 1:
+                        raise ValueError(
+                            f"BDF restart time {event:g} must coincide with a step end")
+                    restart_steps.add(int(matches[0]) + 1)
+        scheme.prepare_step(1, dt_step)
         synchronize(xp)
         t0 = time.perf_counter()
 
@@ -457,6 +723,29 @@ class TransientSolver:
         if not steady.converged:
             raise RuntimeError(f"initial steady state did not converge: {steady}")
         k0 = steady.k_eff
+        coarse_adjoint = None
+        supplied_coarse_adjoint = mg_kw.get("coarse_adjoint")
+        use_coarse = (bool(mg_kw.get("coarse_correction", False))
+                      or supplied_coarse_adjoint is not None)
+        if step_solver == "monolithic" and supplied_coarse_adjoint is not None:
+            coarse_adjoint = xp.asarray(supplied_coarse_adjoint, dtype=self.dtype)
+            expected = (G,) + tuple(self.grid.shape)
+            if coarse_adjoint.shape != expected:
+                raise ValueError(
+                    f"coarse_adjoint shape {coarse_adjoint.shape} != {expected}")
+            if not bool(xp.all(xp.isfinite(coarse_adjoint))):
+                raise ValueError("coarse_adjoint must be finite")
+        elif step_solver == "monolithic" and use_coarse:
+            adjoint_phase = (nullcontext() if self.phase_context is None else
+                             self.phase_context("initial_adjoint_solve"))
+            with adjoint_phase:
+                adjoint_kw = dict(steady_kwargs or
+                                  {"tol_k": 1e-8, "tol_source": 1e-7})
+                adjoint_kw.pop("adjoint", None)
+                adjoint = eig.solve(adjoint=True, **adjoint_kw)
+            if not adjoint.converged:
+                raise RuntimeError("initial adjoint state did not converge")
+            coarse_adjoint = xp.asarray(adjoint.flux, dtype=self.dtype)
 
         # Cylindrical grids: the power integral is always the metric-weighted
         # sum (physics, independent of the operator form), while the source
@@ -470,8 +759,9 @@ class TransientSolver:
             return float(xp.sum(src if vol_w is None else src * vol_w))
 
         fields = eig.fields
+        scalar = self.dtype.type
 
-        def kinetic_fields(current_fields):
+        def kinetic_fields(current_fields, step_width):
             """Map kinetics through the current material/blend geometry."""
             if kin.beta.ndim == 2:
                 # beta rides on the fission source, like chi: a mixed
@@ -479,15 +769,18 @@ class TransientSolver:
                 mapped_beta = [current_fields.map_table_fission_weighted(kin.beta[:, i])
                                for i in range(kin.n_families)]
             else:
-                mapped_beta = [float(b) for b in kin.beta]
+                mapped_beta = [scalar(b) for b in kin.beta]
             if kin.velocities.ndim == 2:
                 mapped_inv_vdt = [current_fields.map_table(
-                    1.0 / (kin.velocities[:, g] * dt)) for g in range(G)]
+                    1.0 / (kin.velocities[:, g] * step_width)) for g in range(G)]
             else:
-                mapped_inv_vdt = [1.0 / (kin.velocities[g] * dt) for g in range(G)]
+                mapped_inv_vdt = [scalar(
+                    1.0 / (kin.velocities[g] * step_width)) for g in range(G)]
             return mapped_beta, mapped_inv_vdt
 
-        beta, inv_vdt = kinetic_fields(fields)
+        beta, inv_vdt_base = kinetic_fields(fields, dt_step)
+        a0 = scheme.a0(1)
+        inv_vdt = [a0 * theta for theta in inv_vdt_base]
 
         phi = [steady.flux[g].copy() for g in range(G)]
         # On GPU the group loops below collapse into one kernel per row; `phi`
@@ -520,7 +813,7 @@ class TransientSolver:
             phi[g] *= scale
         S = S * scale
         if initial_precursors is None:
-            C = [(beta[i] / lam[i]) * S
+            C = [scalar(beta[i] / lam[i]) * S
                  for i in range(kin.n_families)]  # equilibrium
         else:
             supplied = xp.asarray(initial_precursors, dtype=self.dtype)
@@ -534,6 +827,14 @@ class TransientSolver:
                 raise ValueError("initial_precursors must be non-negative")
             C = [supplied[i].copy() for i in range(kin.n_families)]
 
+        # Retain independent flux snapshots: the batched group path updates
+        # its stack in place, so views would overwrite the BDF history.
+        sch_phi = scheme
+        sch_phi.start([p.copy() for p in phi])
+        C_hist = [C]
+        S_prev = S
+        history_limit = int(getattr(scheme, "max_order", 1))
+
         chi_d2 = kin.chi_delayed if (kin.chi_delayed is not None
                                      and kin.chi_delayed.ndim == 2) else None
 
@@ -541,13 +842,13 @@ class TransientSolver:
         # *total* (steady) spectrum -- what C5G7-TD calls the cumulative
         # spectrum -- so the prompt spectrum never appears explicitly:
         # (1 - beta) chi_p,g = chi_g - sum_i beta_i chi_d,ig, and substituting
-        # the analytic backward-Euler precursor update into the flux equation
+        # the analytic BDF precursor update into the flux equation
         # weights the end-of-step fission source by
-        #     w_fis,g = chi_g - sum_i chi_d,ig beta_i / (1 + lam_i dt),
-        # which reduces to the familiar chi_g [(1 - beta) + omega] when
-        # chi_d = chi. In this form the unperturbed t=0 state is an exact
-        # equilibrium of the transient equations for *any* delayed spectrum.
-        bcoef = [beta[i] / (1.0 + lam[i] * dt) for i in range(kin.n_families)]
+        #     w_fis,g = chi_g - sum_i chi_d,ig bcoef_i.
+        # BDF1 has bcoef_i = beta_i/(1 + lam_i dt); higher orders use
+        # beta_i*a0/(a0 + lam_i dt). The unperturbed t=0 state remains an exact
+        # equilibrium for every order and delayed spectrum.
+        bcoef = scheme.precursor_bcoef(1, beta, lam, dt_step)
         bcoef_sum = sum(bcoef)
 
         def fission_weights():
@@ -585,11 +886,10 @@ class TransientSolver:
                        if acc is None else acc)
 
 
-        def delayed_source_by_group(C):
-            """Per-group delayed emission Sum_i chi_d,i,g lam_i C_i/(1+lam_i dt),
-            precomputed once per step (C is the start-of-step field)."""
-            decayed = [(lam[i] / (1.0 + lam[i] * dt)) * C[i]
-                       for i in range(kin.n_families)]
+        def delayed_source_by_group(step, step_width):
+            """Per-group delayed emission from the scheme's history."""
+            decayed = scheme.precursor_decayed(
+                step, C_hist, S_prev, beta, lam, step_width)
             if chi_d2 is not None:               # one spectrum per family
                 out = []
                 for g in range(G):
@@ -606,14 +906,16 @@ class TransientSolver:
                 return [float(kin.chi_delayed[g]) * dsrc for g in range(G)]
             return [fields.chi[g] * dsrc for g in range(G)]  # material spectrum
 
-        ops = [self.group_operator(xp, self.grid, fields.diffusion[g],
-                             fields.removal[g] + inv_vdt[g], bc=self.bc,
-                             active=self.active, mask_bc=self.mask_bc,
-                             **self._op_kwargs)
-               for g in range(G)]
-        preconds = [neumann_preconditioner(op.apply, op.inv_diag,
-                                           self.precond_degree) for op in ops]
+        ops, preconds, fallback_preconds, setup_fallbacks = \
+            self._step_operators(fields, inv_vdt, G)
+        workspaces = (pcg_workspaces(ops, phi)
+                      if (step_solver == "fixed-point"
+                          and reuse_krylov_workspaces and self._linsolve is pcg)
+                      else None)
         src_w = getattr(ops[0], "rhs_weight", None)
+        monolithic_block = None
+        monolithic_precond = None
+        coarse_setups = 0
         last = (mats, mmap, mix_m0, mix_w0)
         last_upd = upd0
 
@@ -628,44 +930,78 @@ class TransientSolver:
         power = [1.0]
         inner_total = 0
         step_its: list[int] = []
+        time_orders: list[int] = []
+        feedback_its: list[int] = []
+        accepted_widths: list[float] = []
+        local_errors: list[float] = []
+        rejected_errors: list[float] = []
+        rejected_step_its: list[int] = []
+        rejected_feedback_its: list[int] = []
+        rejection_streak = 0
+        next_adaptive_dt = dt_step
+        restarted_events: set[float] = set()
 
-        for n in range(1, n_steps + 1):
-            t = n * dt
+        n = 1
+        while ((times[-1] < t_end - 1e-14 * max(1.0, t_end))
+               if adaptive else n <= n_steps):
+            if adaptive:
+                t_start = float(times[-1])
+                # A discontinuity endpoint belongs to the old smooth segment;
+                # discard history before the first step leaving it.
+                for event in restart_times:
+                    if (event not in restarted_events
+                            and np.isclose(t_start, event, rtol=1e-12,
+                                           atol=1e-14 * max(1.0, abs(event)))):
+                        sch_phi.start([p.copy() for p in phi])
+                        C_hist = [C]
+                        S_prev = S
+                        restarted_events.add(float(event))
+                limit = float(t_end)
+                future_events = restart_times[restart_times > t_start + 1e-14]
+                if future_events.size:
+                    limit = min(limit, float(future_events[0]))
+                next_dt = min(next_adaptive_dt, adaptive_max_dt,
+                              limit - t_start)
+                if next_dt <= 0.0:
+                    raise RuntimeError("adaptive BDF produced a non-positive step")
+                t = t_start + next_dt
+            else:
+                t = float(target_times[n - 1])
+                next_dt = float(step_widths[n - 1])
+            dt_changed = next_dt != dt_step
+            dt_step = next_dt
+            if not adaptive and n in restart_steps:
+                sch_phi.start([p.copy() for p in phi])
+                C_hist = [C]
+                S_prev = S
+            scheme.prepare_step(n, dt_step)
+            predicted_phi = (scheme.predict(dt_step) if adaptive else None)
+            accepted_phi = ([p.copy() for p in phi] if adaptive else None)
+            accepted_source = S
+            time_order_n = int(getattr(
+                scheme, "order_at", lambda _n: scheme.order)(n))
             spec = self._unpack(self.problem_at(t))
             mats, mmap, mix_m, mix_w = spec
             upd = self.xs_update_at(t) if self.xs_update_at is not None else None
+            a0_n = scheme.a0(n)
+            order_changed = a0_n != a0
+            if order_changed:
+                a0 = a0_n
             # Rebuild on identity change of anything the fields depend on --
             # including the update itself, so a driver whose state has not moved
             # can hand back the SAME closure and skip the rebuild. That matters:
             # with a thermal step coarser than the neutronics step the
             # temperature (and hence the cross sections) is unchanged for most
             # steps, and rebuilding G operators for identical data is pure cost.
-            if upd is not last_upd or any(a is not b for a, b in zip(spec, last)):
+            fields_changed = (upd is not last_upd
+                              or any(a is not b for a, b in zip(spec, last)))
+            if fields_changed:
                 phase = (nullcontext() if self.phase_context is None else
                          self.phase_context("operator_rebuild"))
                 with phase:
                     fields = Fields(xp, self.grid, mats, mmap, self.dtype,
                                     mix_material=mix_m, mix_weight=mix_w,
                                     xs_update=upd)
-                    if kin.per_material:
-                        beta, inv_vdt = kinetic_fields(fields)
-                        bcoef = [beta[i] / (1.0 + lam[i] * dt)
-                                 for i in range(kin.n_families)]
-                        bcoef_sum = sum(bcoef)
-                    ops = [self.group_operator(xp, self.grid, fields.diffusion[g],
-                                         fields.removal[g] + inv_vdt[g], bc=self.bc,
-                                         active=self.active, mask_bc=self.mask_bc,
-                                         **self._op_kwargs)
-                           for g in range(G)]
-                    preconds = [neumann_preconditioner(op.apply, op.inv_diag,
-                                                       self.precond_degree)
-                                for op in ops]
-                    src_w = getattr(ops[0], "rhs_weight", None)
-                    w_fis = fission_weights()
-                    # Summed emission weight, for the rebalance's W(.) reduction.
-                    w_fis_sum = w_fis[0]
-                    for g in range(1, G):
-                        w_fis_sum = w_fis_sum + w_fis[g]
                     # Total out-scatter per group; summed over groups this equals
                     # the total in-scatter, which is what the rebalance needs.
                     out_scatter = []
@@ -686,9 +1022,181 @@ class TransientSolver:
                         batch.update(self._batch_fields(fields, G, batch["fsrc"]))
                     last, last_upd = spec, upd
 
-            phi_old = [p.copy() for p in phi]
+            # A BDF startup transition changes the time shift and precursor
+            # elimination even if the spatial material fields are unchanged.
+            if fields_changed or dt_changed:
+                beta, inv_vdt_base = kinetic_fields(fields, dt_step)
+            if fields_changed or order_changed or dt_changed:
+                inv_vdt = [a0 * theta for theta in inv_vdt_base]
+                (ops, preconds, fallback_preconds,
+                 setup_count) = self._step_operators(fields, inv_vdt, G)
+                setup_fallbacks += setup_count
+                src_w = getattr(ops[0], "rhs_weight", None)
+                monolithic_block = None
+                monolithic_precond = None
+                bcoef = scheme.precursor_bcoef(n, beta, lam, dt_step)
+                bcoef_sum = sum(bcoef)
+                w_fis = fission_weights()
+                w_fis_sum = w_fis[0]
+                for g in range(1, G):
+                    w_fis_sum = w_fis_sum + w_fis[g]
+
+            phi_old = sch_phi.carried(n)
             # Delayed emission from decayed precursors, constant within the step.
-            dsrc_g = delayed_source_by_group(C)
+            dsrc_g = delayed_source_by_group(n, dt_step)
+
+            if step_solver == "monolithic":
+                # The precursor substitution above makes the end-of-step
+                # equations linear. Rebuild this block only when its spatial
+                # operators/fields change; changing precursor history changes
+                # the fixed RHS, not the operator.
+                coupled_it = 0
+                outer_total = 0
+                while True:
+                    if monolithic_block is None:
+                        monolithic_block = MultigroupStepOperator(
+                            ops, fields.sigma_s, fields.nu_sigma_f, w_fis, k0,
+                            rhs_weight=src_w)
+                        monolithic_precond = EnergyGroupGaussSeidelPreconditioner(
+                            monolithic_block,
+                            scatter_sweeps=int(mg_kw.get("scatter_sweeps", 3)),
+                            include_fission=False,
+                            inner_rtol=float(mg_kw.get("inner_rtol", 1e-3)),
+                            inner_atol=float(mg_kw.get("inner_atol", 0.0)),
+                            inner_maxiter=int(mg_kw.get("inner_maxiter", 300)),
+                            precond_degree=int(mg_kw.get(
+                                "precond_degree", self.precond_degree)))
+                    fixed_rhs = monolithic_block.fixed_rhs(
+                        inv_vdt, phi_old, dsrc_g)
+                    phi_stack = (batch["phi"] if batch is not None
+                                 else xp.stack(phi))
+                    monolithic_precond.reset_stats()
+                    active_precond = monolithic_precond
+                    if coarse_adjoint is not None:
+                        # Recalibrate p to the latest accepted forward shape.
+                        active_precond = AdjointCoarseCorrectionPreconditioner(
+                            monolithic_block, monolithic_precond,
+                            phi_stack, coarse_adjoint)
+                        coarse_setups += 1
+                    solved, outer_it = fgmres(
+                        monolithic_block.apply, fixed_rhs, phi_stack,
+                        monolithic_block.inv_diag, xp,
+                        precond=active_precond,
+                        rtol=float(mg_kw.get(
+                            "rtol", max(0.1 * tol_step, 1e-12))),
+                        atol=float(mg_kw.get("atol", 0.0)),
+                        restart=int(mg_kw.get("restart", 30)),
+                        maxiter=int(mg_kw.get("maxiter", 300)))
+                    for g in range(G):
+                        phi[g][...] = solved[g]
+                    S = fission_source(phi) / k0
+                    inner_total += monolithic_precond.stats.inner_iterations
+                    outer_total += outer_it
+                    coupled_it += 1
+
+                    if self.feedback_iteration is None:
+                        break
+                    callback_phi = (batch["phi"] if batch is not None else phi)
+                    accepted = bool(self.feedback_iteration(
+                        t, callback_phi, total_power(S), coupled_it))
+                    if accepted:
+                        break
+                    if coupled_it >= int(max_feedback_iterations):
+                        raise RuntimeError(
+                            f"implicit feedback at t={t:g} s did not converge "
+                            f"in {max_feedback_iterations} iterations")
+
+                    # Roll back the neutron/precursor/BDF acceptance (none of
+                    # it has been pushed yet), rebuild at the callback's new
+                    # trial state, and solve this same endpoint again. The
+                    # current flux is retained only as a Krylov warm start.
+                    upd = self.xs_update_at(t)
+                    fields = Fields(
+                        xp, self.grid, mats, mmap, self.dtype,
+                        mix_material=mix_m, mix_weight=mix_w, xs_update=upd)
+                    if batch is not None:
+                        batch.update(self._batch_fields(fields, G, batch["fsrc"]))
+                    beta, inv_vdt_base = kinetic_fields(fields, dt_step)
+                    inv_vdt = [a0 * theta for theta in inv_vdt_base]
+                    (ops, preconds, fallback_preconds,
+                     setup_count) = self._step_operators(fields, inv_vdt, G)
+                    setup_fallbacks += setup_count
+                    src_w = getattr(ops[0], "rhs_weight", None)
+                    bcoef = scheme.precursor_bcoef(n, beta, lam, dt_step)
+                    bcoef_sum = sum(bcoef)
+                    w_fis = fission_weights()
+                    dsrc_g = delayed_source_by_group(n, dt_step)
+                    monolithic_block = None
+                    monolithic_precond = None
+                    last_upd = upd
+
+                C_trial = [xp.asarray(c, dtype=self.dtype) for c in
+                           scheme.precursor_update(
+                               n, C_hist, S, S_prev, beta, lam, dt_step)]
+                if adaptive:
+                    local_error = scheme.error_norm(
+                        phi, predicted_phi, rtol=adaptive_rtol,
+                        atol=adaptive_atol)
+                    if local_error > 1.0:
+                        rejected_errors.append(local_error)
+                        rejected_step_its.append(outer_total)
+                        rejected_feedback_its.append(coupled_it)
+                        rejection_streak += 1
+                        if rejection_streak > max_rejections:
+                            raise RuntimeError(
+                                f"adaptive BDF exceeded {max_rejections} "
+                                f"consecutive rejections at t={times[-1]:g} s")
+                        if dt_step <= adaptive_min_dt * (1.0 + 1e-12):
+                            raise RuntimeError(
+                                f"adaptive BDF error {local_error:.3e} exceeds "
+                                f"one at min_dt={adaptive_min_dt:g} s")
+                        # Restore the last accepted neutron state. Precursor,
+                        # BDF, and external on_step histories have not moved.
+                        for g in range(G):
+                            phi[g][...] = accepted_phi[g]
+                        S = accepted_source
+                        next_adaptive_dt = max(
+                            adaptive_min_dt,
+                            controller.propose(dt_step, local_error,
+                                               time_order_n, accepted=False))
+                        monolithic_block = None
+                        monolithic_precond = None
+                        if verbose:
+                            print(f"  reject t = {t:8.4f} s   "
+                                  f"h = {dt_step:.3e}   "
+                                  f"error = {local_error:.3e}")
+                        continue
+
+                    local_errors.append(local_error)
+                    accepted_widths.append(dt_step)
+                    next_adaptive_dt = min(
+                        adaptive_max_dt,
+                        max(adaptive_min_dt,
+                            controller.propose(dt_step, local_error,
+                                               time_order_n, accepted=True)))
+                    rejection_streak = 0
+                else:
+                    accepted_widths.append(dt_step)
+
+                C = C_trial
+                C_hist.insert(0, C)
+                del C_hist[history_limit:]
+                S_prev = S
+                sch_phi.push([p.copy() for p in phi])
+                step_its.append(outer_total)
+                feedback_its.append(coupled_it)
+                time_orders.append(time_order_n)
+                times.append(t)
+                power.append(total_power(S))
+                if self.on_step is not None:
+                    callback_phi = batch["phi"] if batch is not None else phi
+                    self.on_step(t, callback_phi, power[-1])
+                if verbose and (n % max(1, n_steps // 20) == 0 or n == n_steps):
+                    print(f"  t = {t:8.4f} s   P/P0 = {power[-1]:.5f}   "
+                          f"({outer_total} FGMRES applies, "
+                          f"{coupled_it} feedback iterations)")
+                n += 1
+                continue
 
             # Whole-core rebalance needs the step's FIXED source -- everything
             # on the right-hand side that does not scale with the flux. That is
@@ -725,7 +1233,9 @@ class TransientSolver:
                 rtol = min(1e-6, max(1e-3 * change, 1e-3 * tol_step, 1e-12))
                 for _ in range(n_sub):
                     for g in range(G):
-                        q = inv_vdt[g] * phi_old[g] + w_fis[g] * S + dsrc_g[g]
+                        q = xp.asarray(
+                            inv_vdt[g] * phi_old[g] + w_fis[g] * S + dsrc_g[g],
+                            dtype=self.dtype)
                         if batch is not None:
                             # One kernel for the whole in-scatter row. The flux
                             # stack is updated in place group by group below, so
@@ -740,11 +1250,21 @@ class TransientSolver:
                                     q += s * phi[gf]
                         if src_w is not None:
                             q = q * src_w
-                        sol, n_it = self._linsolve(ops[g].apply, q, phi[g],
-                                                   ops[g].inv_diag, xp,
-                                                   rtol=rtol,
-                                                   precond=preconds[g],
-                                                   **lin_kw)
+                        workspace_kw = ({} if workspaces is None else
+                                        {"workspace": workspaces[g]})
+                        safety_kw = ({} if fallback_preconds is None else {
+                            "fallback_precond": fallback_preconds[g],
+                            "residual_replace_every": 32,
+                        })
+                        # An expert override in linsolve_kwargs wins without
+                        # passing the same keyword twice.
+                        for name in tuple(safety_kw):
+                            if name in lin_kw:
+                                safety_kw.pop(name)
+                        sol, n_it = self._linsolve(
+                            ops[g].apply, q, phi[g], ops[g].inv_diag, xp,
+                            rtol=rtol, precond=preconds[g], **workspace_kw,
+                            **safety_kw, **lin_kw)
                         if batch is None:
                             phi[g] = sol
                         else:
@@ -822,10 +1342,18 @@ class TransientSolver:
                     f"time step at t={t:g} s did not converge "
                     f"({max_sweeps} sweeps, source change {change:.2e})")
 
-            for i in range(kin.n_families):
-                C[i] = (C[i] + (dt * beta[i]) * S) / (1.0 + lam[i] * dt)
+            C = [xp.asarray(c, dtype=self.dtype) for c in
+                 scheme.precursor_update(
+                     n, C_hist, S, S_prev, beta, lam, dt_step)]
+            accepted_widths.append(dt_step)
+            C_hist.insert(0, C)
+            del C_hist[history_limit:]
+            S_prev = S
+            sch_phi.push([p.copy() for p in phi])
 
             step_its.append(sweep)
+            feedback_its.append(1)
+            time_orders.append(time_order_n)
             times.append(t)
             power.append(total_power(S))
             # The seam an external physics marches through: it sees the
@@ -842,6 +1370,7 @@ class TransientSolver:
                 self.on_step(t, callback_phi, power[-1])
             if verbose and (n % max(1, n_steps // 20) == 0 or n == n_steps):
                 print(f"  t = {t:8.4f} s   P/P0 = {power[-1]:.5f}   ({sweep} sweeps)")
+            n += 1
 
         synchronize(xp)
         return TransientResult(
@@ -853,7 +1382,27 @@ class TransientSolver:
             precursors=xp.stack(C),
             total_inner_iterations=inner_total,
             step_iterations=step_its,
+            step_method=step_solver,
             initial_state_reused=initial_steady is not None,
+            mixed_precision_fallbacks=(setup_fallbacks + sum(
+                workspace.fallback_count for workspace in (workspaces or []))),
+            cuda_graph_captures=sum(
+                workspace.graph_captures for workspace in (workspaces or [])),
+            cuda_graph_replays=sum(
+                workspace.graph_replays for workspace in (workspaces or [])),
+            cuda_graph_errors=list(dict.fromkeys(
+                workspace.graph_error for workspace in (workspaces or [])
+                if workspace.graph_error)),
+            adjoint_coarse_setups=coarse_setups,
+            time_scheme=scheme.name,
+            time_orders=time_orders,
+            feedback_iterations=feedback_its,
+            step_widths=accepted_widths,
+            local_errors=local_errors,
+            rejected_steps=len(rejected_errors),
+            rejected_errors=rejected_errors,
+            rejected_step_iterations=rejected_step_its,
+            rejected_feedback_iterations=rejected_feedback_its,
             solve_seconds=time.perf_counter() - t0,
             device=self.device,
         )

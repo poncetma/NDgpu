@@ -13,7 +13,8 @@ import pytest
 
 from ndgpu import DiffusionEigenSolver, Grid, Material, TransientSolver
 from ndgpu.benchmarks import build_twigl
-from ndgpu.linalg import (bicgstab, get_linear_solver, gmres,
+from ndgpu.linalg import (PCGWorkspace, bicgstab, fgmres, get_linear_solver, gmres,
+                          mixed_precision_preconditioner,
                           neumann_preconditioner, pcg)
 from ndgpu.operator import GroupOperator
 
@@ -47,6 +48,139 @@ def test_matches_cg_on_spd_stencil(solver):
     x, it = solver(op.apply, b, np.zeros_like(b), op.inv_diag, np, rtol=1e-10)
     assert it_cg > 0 and it > 0
     assert np.linalg.norm(x - x_cg) <= 1e-8 * np.linalg.norm(x_cg)
+
+
+def test_pcg_workspace_preserves_iterations_and_reuses_operator_output():
+    op, b = _spd_stencil_system(n=9)
+    x0 = np.zeros_like(b)
+    reference, reference_it = pcg(
+        op.apply, b, x0, op.inv_diag, np, rtol=1e-11)
+
+    calls = {"out": 0}
+
+    def apply_out(value, out=None):
+        if out is not None:
+            calls["out"] += 1
+        return op.apply(value, out=out)
+
+    workspace = PCGWorkspace.like(x0, operator_out=True)
+    solved, iterations = pcg(
+        apply_out, b, x0, op.inv_diag, np, rtol=1e-11,
+        workspace=workspace)
+    assert solved is workspace.x
+    assert iterations == reference_it
+    assert calls["out"] == iterations + 1
+    np.testing.assert_array_equal(solved, reference)
+    np.testing.assert_array_equal(x0, np.zeros_like(x0))
+
+    # A nearby second right-hand side uses the exact same five work arrays.
+    identities = tuple(id(getattr(workspace, name))
+                       for name in ("x", "r", "z", "p", "ap"))
+    b2 = 1.001 * b
+    solved2, iterations2 = pcg(
+        apply_out, b2, solved, op.inv_diag, np, rtol=1e-11,
+        workspace=workspace)
+    assert solved2 is workspace.x
+    assert identities == tuple(id(getattr(workspace, name))
+                               for name in ("x", "r", "z", "p", "ap"))
+    assert iterations2 > 0
+    residual = np.linalg.norm(op.apply(solved2) - b2)
+    assert residual <= 1.1e-11 * np.linalg.norm(b2)
+
+
+def test_pcg_workspace_validates_shape_and_dtype():
+    workspace = PCGWorkspace.like(np.zeros((3, 4)))
+    with pytest.raises(ValueError, match="shape/dtype"):
+        pcg(lambda x: x, np.ones((4, 3)), np.zeros((4, 3)),
+            np.ones((4, 3)), np, workspace=workspace)
+
+
+def test_pcg_graph_block_must_match_residual_cadence():
+    op, b = _spd_stencil_system(n=5)
+    with pytest.raises(ValueError, match="must equal check_every"):
+        pcg(op.apply, b, np.zeros_like(b), op.inv_diag, np,
+            check_every=2, graph_block=3)
+
+
+def test_pcg_graph_request_falls_back_on_cpu_without_changing_answer():
+    op, b = _spd_stencil_system(n=6)
+    workspace = PCGWorkspace.like(b, operator_out=True)
+    reference, reference_it = pcg(
+        op.apply, b, np.zeros_like(b), op.inv_diag, np,
+        rtol=1e-10, check_every=2)
+    solved, iterations = pcg(
+        op.apply, b, np.zeros_like(b), op.inv_diag, np,
+        rtol=1e-10, check_every=2, graph_block=2,
+        workspace=workspace)
+    np.testing.assert_array_equal(solved, reference)
+    assert iterations == reference_it
+    assert workspace.graph_captures == workspace.graph_replays == 0
+    assert "capture needs CuPy" in workspace.graph_error
+
+
+def test_neumann_pcg_workspace_reuses_preconditioner_scratch():
+    op, b = _spd_stencil_system(n=8)
+    calls = {"out": 0}
+
+    def apply_out(value, out=None):
+        if out is not None:
+            calls["out"] += 1
+        return op.apply(value, out=out)
+
+    precond = neumann_preconditioner(apply_out, op.inv_diag, 2)
+    workspace = PCGWorkspace.like(b, operator_out=True)
+    solved, iterations = pcg(
+        apply_out, b, np.zeros_like(b), op.inv_diag, np, rtol=1e-10,
+        precond=precond, workspace=workspace)
+    # One initial A*x, one A*p per iteration, and two polynomial stencil
+    # applications per initial/iterated preconditioner evaluation all use the
+    # same scratch array.
+    assert calls["out"] == 1 + iterations + 2 * iterations
+    assert np.linalg.norm(op.apply(solved) - b) <= 1.1e-10 * np.linalg.norm(b)
+
+
+def test_fp32_preconditioner_keeps_fp64_true_residual_accuracy():
+    op, b = _spd_stencil_system(n=11)
+    low_grid = Grid(shape=b.shape, size=(60.0, 60.0, 60.0))
+    low = GroupOperator(
+        np, low_grid,
+        np.full(b.shape, 1.3, dtype=np.float32),
+        np.full(b.shape, 0.04, dtype=np.float32))
+    precond = mixed_precision_preconditioner(
+        low.apply, low.inv_diag, degree=2, outer_dtype=np.float64)
+    workspace = PCGWorkspace.like(b, operator_out=True, fallback=True)
+    solved, iterations = pcg(
+        op.apply, b, np.zeros_like(b), op.inv_diag, np, rtol=1e-11,
+        precond=precond, fallback_precond=neumann_preconditioner(
+            op.apply, op.inv_diag, 2),
+        residual_replace_every=8, workspace=workspace)
+    assert solved.dtype == np.float64
+    assert iterations > 0
+    assert workspace.fallback_count == 0
+    assert np.linalg.norm(op.apply(solved) - b) <= 1.1e-11 * np.linalg.norm(b)
+
+
+def test_mixed_preconditioner_failure_restarts_with_fp64():
+    op, b = _spd_stencil_system(n=7)
+
+    def broken(residual):
+        return np.full_like(residual, np.nan)
+
+    workspace = PCGWorkspace.like(b, operator_out=True, fallback=True)
+    solved, iterations = pcg(
+        op.apply, b, np.zeros_like(b), op.inv_diag, np, rtol=1e-10,
+        precond=broken,
+        fallback_precond=neumann_preconditioner(op.apply, op.inv_diag, 1),
+        workspace=workspace)
+    assert workspace.fallback_count == 1
+    assert iterations > 1
+    assert np.linalg.norm(op.apply(solved) - b) <= 1.1e-10 * np.linalg.norm(b)
+
+
+def test_mixed_preconditioner_requires_a_narrower_dtype():
+    with pytest.raises(ValueError, match="narrower"):
+        mixed_precision_preconditioner(
+            lambda x: x, np.ones(4, dtype=np.float64), 0, np.float64)
 
 
 @pytest.mark.parametrize("solver", NONSYM)
@@ -108,6 +242,28 @@ def test_gmres_restart_cycles():
                     rtol=1e-12, restart=5)
     assert np.linalg.norm(A @ x5 - b) <= 1e-11 * np.linalg.norm(b)
     assert it5 >= it_full   # discarding the Krylov space costs iterations
+
+
+def test_fgmres_accepts_a_variable_right_preconditioner():
+    A, b = _nonsymmetric_system(n=36)
+    inv_diag = 1.0 / np.diag(A)
+    calls = 0
+
+    def variable_preconditioner(r):
+        nonlocal calls
+        calls += 1
+        # Alternating strength makes this a variable map, for which ordinary
+        # GMRES's M(sum V*y) reconstruction is invalid but stored-Z FGMRES is
+        # mathematically well defined.
+        scale = 1.0 if calls % 2 else 0.75
+        return scale * inv_diag * r
+
+    x, iterations = fgmres(
+        lambda v: A @ v, b, np.zeros_like(b), inv_diag, np,
+        rtol=1e-12, restart=len(b), precond=variable_preconditioner)
+    assert iterations == calls > 0
+    assert np.linalg.norm(A @ x - b) <= 1e-11 * np.linalg.norm(b)
+    assert get_linear_solver("fgmres") is fgmres
 
 
 @pytest.mark.parametrize("solver", NONSYM)

@@ -345,12 +345,37 @@ r = coupled_transient(
 )
 ```
 
+The neutron integrator can use the same CPU-validated BDF path through
+`transient_kwargs`, while the thermal window remains backward Euler:
+
+```python
+r = coupled_transient(
+    ctx, t_end=60.0, dt=0.05, dt_thermal=0.5,
+    transient_kwargs={
+        "time_scheme": "bdf3",
+        "bdf_restart_times": [10.0, 20.0],  # abrupt cached control frames
+    },
+)
+```
+
+The coupled driver currently requires a constant neutron `dt` so thermal
+exchange windows stay deterministic. Nonuniform BDF schedules are available
+on `TransientSolver`; adaptive coupled rollback must restore both neutron and
+thermal state and is a later phase.
+
 Degree-1 Neumann-PCG and spaced residual checks reduce global synchronization
 in the repeated neutron solves. The thermal tolerance is set by the accuracy
 needed by feedback rather than by the `1e-12` balance-verification default.
 The exact thermal energy balance costs three steady or four transient global
 reductions, so production runs disable it or request it every N thermal steps
 with `thermal_diagnostics_every=N`.
+
+`precond_dtype="float32"` is an opt-in GPU control. It retains the FP64
+neutron state, physical operator, residual evaluation, and convergence test,
+while evaluating the degree-N polynomial preconditioner through a shadow FP32
+operator. Periodic true-residual replacement prevents an FP32 residual floor;
+unsafe setup or non-finite behavior automatically returns to FP64 and increments
+the `mixed_precision_fallbacks` profile/result counter.
 
 The power normalization integral remains a zero-dimensional device value. Peak
 and mean temperature are copied together only when temperature actually moves,
@@ -422,3 +447,11 @@ full spatial diffusion equations and its precursor history replaces the IQS
 state. Results record residual/fallback times, reasons, predictor disagreement,
 iterations, and phase timings. See
 [the quasi-static acceleration plan](quasistatic_acceleration_plan.md).
+
+Adjoint eigen solves can dominate guarded IQS even when shape correctors are
+inexpensive. `adjoint_every` is a hard maximum number of shape corrections for
+which an importance shape may be reused. Set `adjoint_residual_tol` to check the
+amplitude-free residual of the transposed eigenproblem at every correction and
+refresh sooner only when that residual is exceeded. Full-diffusion fallback
+always refreshes the adjoint regardless of either setting. Results expose
+`.adjoint_residual_times`, `.adjoint_residual`, and corresponding counters.

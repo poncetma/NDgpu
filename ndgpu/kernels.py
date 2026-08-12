@@ -290,15 +290,42 @@ def _dot_kernel():
 DOT_FUSED_MAX = 1 << 16
 
 
-def dot(xp, u, v):
+def dot(xp, u, v, out=None):
     """Bilinear (unconjugated) inner product as a 0-d device scalar.
 
     Unconjugated on purpose: real CG and complex-symmetric COCG both want this
     form, and no call site here needs the Hermitian one.
     """
     if use_fused(xp, "krylov") and u.size <= DOT_FUSED_MAX:
-        return _dot_kernel()(u, v)
-    return xp.sum(u * v)
+        return _dot_kernel()(u, v, out=out)
+    value = xp.sum(u * v)
+    if out is None:
+        return value
+    out[...] = value
+    return out
+
+
+def scalar_divide(xp, out, numerator, denominator):
+    """``out = numerator / denominator`` for persistent device scalars."""
+    if use_fused(xp, "krylov"):
+        _block_kernel(
+            "ndgpu_scalar_divide", "raw T num, raw T den", "T out",
+            "out = num[0] / den[0];")(
+                _scalar_arg(numerator), _scalar_arg(denominator), out)
+    else:
+        xp.divide(numerator, denominator, out=out)
+    return out
+
+
+def scalar_copy(xp, out, value):
+    """Copy one persistent device scalar without creating a temporary."""
+    if use_fused(xp, "krylov"):
+        _block_kernel(
+            "ndgpu_scalar_copy", "raw T value", "T out",
+            "out = value[0];")(_scalar_arg(value), out)
+    else:
+        xp.copyto(out, value)
+    return out
 
 
 # The updated vectors are declared as *output* parameters and modified in
@@ -364,6 +391,25 @@ def neumann_step(xp, z, r, az, inv_diag):
     else:
         z += inv_diag * (r - az)
     return z
+
+
+def mixed_jacobi_start(xp, residual, inv_diag, residual_low, z_low):
+    """Cast an outer residual and form the low-precision Jacobi correction.
+
+    A mixed preconditioner needs both ``r_low = (L) residual`` and
+    ``z_low = inv_diag_low * r_low``. Expressing those assignments separately
+    costs two GPU launches; this performs both in one pass and one launch.
+    """
+    if use_fused(xp, "krylov"):
+        _block_kernel(
+            "ndgpu_mixed_jacobi_start",
+            "T residual, L inv_diag", "L residual_low, L z_low",
+            "residual_low = (L)residual; z_low = inv_diag * residual_low;")(
+                residual, inv_diag, residual_low, z_low)
+    else:
+        residual_low[...] = residual
+        xp.multiply(inv_diag, residual_low, out=z_low)
+    return z_low
 
 
 # --------------------------------------------------------------------------
@@ -517,13 +563,16 @@ def group_accumulate(xp, out, W, P):
     """
     if not use_fused(xp, "groups"):
         for g in range(W.shape[0]):
-            out += W[g] * P[g]
+            # Match the fused kernel: accumulation and multiplication use the
+            # seeded output's precision even when inputs have narrower dtypes.
+            out += (W[g].astype(out.dtype, copy=False)
+                    * P[g].astype(out.dtype, copy=False))
         return out
     _block_kernel(
         "ndgpu_group_accumulate",
-        "raw T W, raw T P, int32 G, int32 N", "T out",
+        "raw W weights, raw P phi, int32 G, int32 N", "T out",
         "T v = out; for (int g = 0; g < G; ++g)"
-        " v += W[g * N + i] * P[g * N + i]; out = v;")(
+        " v += (T)weights[g * N + i] * (T)phi[g * N + i]; out = v;")(
             W, P, np.int32(W.shape[0]), np.int32(out.size), out)
     return out
 

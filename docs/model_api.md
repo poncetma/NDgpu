@@ -300,9 +300,14 @@ core.configure_thermal(
 hot = core.coupled_steady(device="gpu")
 run = core.coupled_transient(t_end=10, dt=0.05, dt_thermal=0.5,
                              device="gpu", profile=True)
+# Opt-in experiment: FP32 polynomial preconditioning inside FP64 PCG.
+mixed = core.coupled_transient(
+    t_end=10, dt=0.05, dt_thermal=0.5, device="gpu",
+    precond_degree=1, precond_dtype="float32", profile=True)
 qs = core.quasistatic_transient(
     t_end=60, dt=0.2, dt_thermal=1.0, shape_dt=2.0,
-    adjoint_every=5, residual_tol=2e-3, fallback_residual=1e-2,
+    adjoint_every=6, adjoint_residual_tol=5e-3,
+    residual_tol=2e-3, fallback_residual=1e-2,
     device="gpu", state_at=control_state, profile=True)
 ```
 
@@ -315,6 +320,10 @@ For moving controls, prebuild a small set of same-shaped `TriReactor` frames and
 pass `state_at(t)` returning a cached frame. `problem_at=` remains available for
 the raw four-array callback used by low-level code.
 
+Mixed preconditioning leaves the model state and convergence test in FP64; the
+result's `mixed_precision_fallbacks` reports any automatic return to the native
+FP64 preconditioner. Keep it opt-in until benchmarked on the target GPU.
+
 `quasistatic_transient` uses those cached frames in a time-dependent IQS solve:
 the adjoint-weighted population amplitude and spatial precursor inventory
 advance at `dt`, while the spatial flux shape is corrected at `shape_dt`.
@@ -323,6 +332,9 @@ old/new adjoint time-importance ratio and is one for a fixed shape.
 Adjoint-weighted residual thresholds can force an early correction or
 full-diffusion fine-interval fallback. Its result adds shape, residual,
 fallback, predictor-error, and iteration telemetry.
+`adjoint_residual_tol` independently checks whether a reused adjoint still
+satisfies the current transposed eigenproblem; it can trigger an early adjoint
+refresh while `adjoint_every` remains the hard maximum reuse age.
 Set `iqs_predictor_tol=0.02`, for example, to halve subsequent shape intervals
 after a predictor disagreement above 2%; the maximum interval is restored
 geometrically once the manoeuvre settles.
