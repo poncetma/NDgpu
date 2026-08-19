@@ -401,6 +401,7 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
         xp.copyto(p_buf, z)
         p = p_buf
     rz = dot(r, z)
+    tiny = np.finfo(b.dtype).tiny
 
     graph_active = bool(graph_block and _pcg_graph_capable(
         xp, workspace, precond, b.size))
@@ -508,7 +509,10 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
         else:
             xp.copyto(ap_buf, apply_A(p))
             Ap = ap_buf
-        alpha = rz / dot(p, Ap)
+        # A delayed convergence check can leave an exactly converged recurrence
+        # running for a few no-op iterations. Regularizing both denominators
+        # keeps that benign 0/0 case from poisoning the solution with NaNs.
+        alpha = rz / (dot(p, Ap) + tiny)
         kernels.cg_update(xp, x, r, p, Ap, alpha)
         replaced = (residual_replace_every > 0
                     and it % residual_replace_every == 0)
@@ -540,7 +544,7 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
             rz = dot(r, z)
             continue
         rz_new = dot(r, z)
-        kernels.cg_direction(xp, p, z, rz_new / rz)
+        kernels.cg_direction(xp, p, z, rz_new / (rz + tiny))
         rz = rz_new
     retried = retry_with_fallback(it)
     if retried is not None:

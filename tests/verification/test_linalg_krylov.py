@@ -102,6 +102,17 @@ def test_pcg_graph_block_must_match_residual_cadence():
             check_every=2, graph_block=3)
 
 
+def test_pcg_exact_convergence_before_delayed_check_stays_finite():
+    A = np.array([[2.0, -1.0], [-1.0, 2.0]])
+    b = np.array([1.0, 0.0])
+    solved, iterations = pcg(
+        lambda x: A @ x, b, np.zeros_like(b), 1.0 / np.diag(A), np,
+        rtol=1e-12, maxiter=25, check_every=25)
+    assert iterations == 25
+    assert np.all(np.isfinite(solved))
+    np.testing.assert_allclose(solved, np.linalg.solve(A, b), rtol=1e-12)
+
+
 def test_pcg_graph_request_falls_back_on_cpu_without_changing_answer():
     op, b = _spd_stencil_system(n=6)
     workspace = PCGWorkspace.like(b, operator_out=True)

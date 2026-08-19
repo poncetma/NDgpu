@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Stage the NDgpu checkout into shared scratch and submit the CPU smoke test
+# Stage the NDgpu checkout into shared scratch and submit the CPU benchmark
 # from there. This avoids running batch jobs directly from AFS.
 
 set -euo pipefail
@@ -17,4 +17,5 @@ rsync -a --delete \
     "$src_root/" "$stage_root/repo/"
 
 export NDGPU_REPO="$stage_root/repo"
+export NDGPU_PYTHON_BIN="${NDGPU_PYTHON_BIN:-/opt/psi/conda-envs/x86_64/ra-standard_py312/bin/python}"
 sbatch "$stage_root/repo/slurm/run_ndgpu_cpu.sh"

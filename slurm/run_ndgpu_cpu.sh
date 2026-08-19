@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Submit a single-node NDgpu smoke test to a CPU partition.
+# Submit the full NDgpu speed benchmark to a CPU partition.
 #
 # Usage:
 #   sbatch slurm/run_ndgpu_cpu.sh
@@ -10,10 +10,7 @@
 #   NDGPU_ARGS      Arguments for the example
 #
 # Default workload:
-#   examples/speed_benchmark.py 32
-#
-# This matches the GH smoke test, but requests a CPU-only node so we can
-# compare startup and execution behavior without GPU allocation.
+#   examples/speed_benchmark.py 32 64 96 128
 
 #SBATCH --job-name=ndgpu-cpu
 #SBATCH --cluster=merlin7
@@ -29,13 +26,15 @@
 
 set -euo pipefail
 
-if [[ -z "${PYTHON_BIN:-}" && -n "${MODULESHOME:-}" ]]; then
-    # Merlin's system Python is too old and usually lacks NumPy/SciPy.
-    module load "${NDGPU_PYTHON_MODULE:-Python/3.11.11}"
-fi
-
-python_bin="${PYTHON_BIN:-${NDGPU_PYTHON_BIN:-/opt/psi/conda-envs/x86_64/ra-standard_py312/bin/python}}"
+default_python="/opt/psi/conda-envs/x86_64/ra-standard_py312/bin/python"
+python_bin="${NDGPU_PYTHON_BIN:-$default_python}"
 if [[ ! -x "$python_bin" ]]; then
+    if [[ -n "${MODULESHOME:-}" ]]; then
+        module load "${NDGPU_PYTHON_MODULE:-Python/3.11.11}"
+    fi
+    python_bin="${PYTHON_BIN:-}"
+fi
+if [[ -z "$python_bin" || ! -x "$python_bin" ]]; then
     python_bin="$(command -v python3.11 || command -v python3.12 || command -v python3 || true)"
 fi
 
@@ -51,13 +50,13 @@ logfile="$logdir/ndgpu-cpu-${SLURM_JOB_ID:-manual}.log"
 touch "$logfile"
 exec >>"$logfile" 2>&1
 cd "$logdir"
-printf '=== NDgpu CPU smoke test started at %s on %s ===\n' "$(date -Is)" "$(hostname)"
+printf '=== NDgpu CPU speed benchmark started at %s on %s ===\n' "$(date -Is)" "$(hostname)"
 
 export PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
 example="${NDGPU_EXAMPLE:-$repo/examples/speed_benchmark.py}"
-args="${NDGPU_ARGS:-32}"
+args="${NDGPU_ARGS:-32 64 96 128}"
 
 printf 'job=%s host=%s cwd=%s\n' "${SLURM_JOB_ID:-manual}" "$(hostname)" "$PWD"
 printf 'example=%s\nargs=%s\n' "$example" "$args"

@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 from ndgpu import NoiseSolver, NoiseSource
+from ndgpu.backend import asnumpy
 from ndgpu.benchmarks import build_femffusion_1d_noise
 
 
@@ -41,10 +42,11 @@ def test_femffusion_1d_2group_noise(angular):
     # delta-phi scales with the static-flux normalization, which each code sets
     # independently; match it once (least squares on the group-1 static flux)
     # so the absolute complex noise can be compared directly.
-    phi1 = np.asarray(ns.flux0[0]).ravel()
+    phi1 = asnumpy(ns.flux0[0]).ravel()
     scale = np.dot(bench.static_flux_ref, phi1) / np.dot(phi1, phi1)
+    d_flux = res.d_flux_numpy()
     for g in range(2):
-        d = scale * np.asarray(res.d_flux[g]).ravel()
+        d = scale * d_flux[g].ravel()
         ref = bench.d_flux_ref[g]
         rel_l2 = np.linalg.norm(d - ref) / np.linalg.norm(ref)
         assert rel_l2 < 1e-2                        # FV vs FE, 60-cell mesh

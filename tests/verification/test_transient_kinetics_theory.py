@@ -64,10 +64,11 @@ def _insertion(angle_from=90.0, angle_to=94.0):
 
 def test_unperturbed_transient_is_exactly_stationary():
     """The sharpest invariant available: an unperturbed core started from its
-    own steady state must not move at all, to the last bit."""
+    own steady state must remain stationary to backend round-off."""
     p = _problem(90.0)
     r = _solver(p).solve(t_end=2.0, dt=0.05)
-    np.testing.assert_array_equal(r.power, np.ones_like(r.power))
+    atol = 5 * np.finfo(r.power.dtype).eps
+    np.testing.assert_allclose(r.power, np.ones_like(r.power), rtol=0, atol=atol)
 
 
 def test_prompt_jump_matches_theory():

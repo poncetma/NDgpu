@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from ndgpu import Grid
+from ndgpu.backend import asnumpy
 from ndgpu.thermal import ConductionSolver, ThermalMaterial
 from ndgpu.tri import TriGrid
 
@@ -193,11 +194,12 @@ def test_cylindrical_volumes_are_true_annuli():
                               ambient_temperature=400.0)
     dr, _, dz = grid.spacing
     rc = np.asarray(grid.cylindrical_metrics()[0])
-    np.testing.assert_allclose(np.asarray(solver.cell_volume),
+    cell_volume = asnumpy(solver.cell_volume)
+    np.testing.assert_allclose(cell_volume,
                                2.0 * np.pi * rc * dr * dz, rtol=1e-13)
     # And they sum to the cylinder: sum_i 2 pi r_i dr = pi R^2 exactly for
     # midpoint radii, times the full height.
-    total = float(np.sum(np.broadcast_to(np.asarray(solver.cell_volume),
+    total = float(np.sum(np.broadcast_to(cell_volume,
                                          grid.shape)))
     assert total == pytest.approx(np.pi * 30.0**2 * 20.0, rel=1e-12)
 

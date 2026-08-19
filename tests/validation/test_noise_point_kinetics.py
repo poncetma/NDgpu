@@ -15,6 +15,7 @@ import pytest
 
 from ndgpu import (Grid, Kinetics, Material, NoiseSolver, NoiseSource,
                    zero_power_transfer_function)
+from ndgpu.backend import asnumpy
 
 
 def _critical_one_group():
@@ -159,7 +160,7 @@ def test_localized_source_global_to_local_transition():
     damp = np.zeros(p.grid.shape, dtype=complex)
     damp[nx // 2, ny // 2, 0] = 5e-4
     src = NoiseSource(d_sigma_a=[np.zeros(p.grid.shape), damp])
-    phi0 = np.asarray(ns.flux0[1]).ravel()
+    phi0 = asnumpy(ns.flux0[1]).ravel()
 
     def shape_similarity(res):
         d = np.abs(np.asarray(res.d_flux_numpy()[1]).ravel())
