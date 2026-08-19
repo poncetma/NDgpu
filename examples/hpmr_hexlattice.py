@@ -17,15 +17,16 @@ Usage: python examples/hpmr_hexlattice.py [refine] [cpu|gpu|auto]
 import sys
 
 import ndgpu
-from ndgpu.benchmarks.hpmr import (_placeholder_materials, _FUEL_SITES, _BE_SITES,
-                                   _DRUM_SITES, PITCH, DRUM_ABSORBER_INNER,
+from ndgpu.benchmarks.hpmr import (hpmr_placeholder_materials,
+                                   HPMR_FUEL_SITES, HPMR_BE_SITES,
+                                   HPMR_DRUM_SITES, PITCH, DRUM_ABSORBER_INNER,
                                    DRUM_RADIUS, DRUM_ARC_HALF_DEG, CENTRAL, FUEL,
                                    BE_REFLECTOR, DRUM_BE, DRUM_ABSORBER)
 
 refine = int(sys.argv[1]) if len(sys.argv) > 1 else 4
 device = sys.argv[2] if len(sys.argv) > 2 else "auto"
 
-mats = _placeholder_materials()
+mats = hpmr_placeholder_materials()
 central, fuel, be = mats[CENTRAL], mats[FUEL], mats[BE_REFLECTOR]
 drum_body, b4c = mats[DRUM_BE], mats[DRUM_ABSORBER]
 
@@ -34,18 +35,18 @@ def hpmr(drum_angle_deg):
     """Build the HP-MR with every control drum rotated to the given angle."""
     lat = ndgpu.HexLattice(pitch=PITCH, refine=refine).set_boundary("vacuum")
     lat.set_site((0, 0), central)
-    for s in _FUEL_SITES:
+    for s in HPMR_FUEL_SITES:
         lat.set_site(s, fuel)
-    for s in _BE_SITES:
+    for s in HPMR_BE_SITES:
         lat.set_site(s, be)
-    for s in _DRUM_SITES:
+    for s in HPMR_DRUM_SITES:
         lat.set_drum(s, body=drum_body, absorber=b4c,
                      inner_radius=DRUM_ABSORBER_INNER, outer_radius=DRUM_RADIUS,
                      arc_deg=2 * DRUM_ARC_HALF_DEG, angle_deg=drum_angle_deg)
     return lat.run(device=device, tol_k=1e-9, tol_source=1e-8, samples=10)
 
 
-print(f"HP-MR via HexLattice, refine={refine}, {len(_DRUM_SITES)} control drums, on {device}\n")
+print(f"HP-MR via HexLattice, refine={refine}, {len(HPMR_DRUM_SITES)} control drums, on {device}\n")
 print(f"  {'drum angle':>10}  {'k_eff':>9}  {'reactivity vs inserted (0 deg) (pcm)':>36}")
 res0 = hpmr(0.0)
 k0 = res0.k_eff

@@ -27,7 +27,8 @@ import numpy as np
 
 from ndgpu import NoiseSolver
 from ndgpu.benchmarks.hpmr import (build_hpmr3d, PITCH, FUEL,
-                                   _FUEL_SITES, _BE_SITES, _DRUM_SITES)
+                                   HPMR_FUEL_SITES, HPMR_BE_SITES,
+                                   HPMR_DRUM_SITES)
 from ndgpu.hexraster import rasterize_hex_sites, hex_site_xy
 
 device = sys.argv[1] if len(sys.argv) > 1 else "cpu"
@@ -40,7 +41,8 @@ p = build_hpmr3d(refine=refine, nz=nz, absorber="polar", drum_angle_deg=180.0)
 mmap = np.asarray(p.material_map)
 nzt = mmap.shape[3]
 TOPLAYER = nzt - 1
-allsites = {(0, 0)} | set(_FUEL_SITES) | set(_BE_SITES) | set(_DRUM_SITES)
+allsites = ({(0, 0)} | set(HPMR_FUEL_SITES) | set(HPMR_BE_SITES)
+            | set(HPMR_DRUM_SITES))
 
 
 def id_map3d(sites, base):
@@ -51,9 +53,10 @@ def id_map3d(sites, base):
                      nzt, axis=3)
 
 
-asm = id_map3d(_FUEL_SITES, 1)
-N = len(_FUEL_SITES)
-fuel_r = np.hypot(*np.array([hex_site_xy(R, C, PITCH) for (R, C) in _FUEL_SITES]).T)
+asm = id_map3d(HPMR_FUEL_SITES, 1)
+N = len(HPMR_FUEL_SITES)
+fuel_r = np.hypot(*np.array([hex_site_xy(R, C, PITCH)
+                             for (R, C) in HPMR_FUEL_SITES]).T)
 radii = np.array(sorted(set(np.round(fuel_r, 0))))
 ring_of = np.array([int(np.argmin(np.abs(radii - r))) for r in fuel_r])
 n_rings = len(radii)
