@@ -431,14 +431,16 @@ strongly upscattering diffusion problems:
 direct = core.transient(
     t_end=1.0, dt=0.02, device="cpu",
     step_solver="monolithic",
-    multigroup_kwargs={"scatter_sweeps": 3},
+    multigroup_kwargs={"scatter_sweeps": 3, "energy_anderson": 1,
+                       "inner_rtol": 0.1},
 )
 
 coupled_direct = core.coupled_transient(
     t_end=10.0, dt=0.02, dt_thermal=0.2, device="cpu",
     transient_kwargs={
         "step_solver": "monolithic",
-        "multigroup_kwargs": {"scatter_sweeps": 3},
+        "multigroup_kwargs": {"scatter_sweeps": 3, "energy_anderson": 1,
+                              "inner_rtol": 0.1},
     },
 )
 ```
@@ -451,6 +453,17 @@ throughput validation, is diffusion-only, and should be compared with the
 default on a short representative interval before production use. Its
 `step_iterations` and coupled `neutron_outer_iterations` count FGMRES applies,
 not fission-source sweeps.
+
+`energy_anderson=1` applies a depth-one dynamic correction between the group
+subsweeps. On the 11-group 2-D HP-MR gate it reduced inner work by 17--21% and
+CPU solve time by 13--18% at the conservative `inner_rtol=1e-3`. Because
+FGMRES tests the true outer residual, an inexact `inner_rtol=0.1` is both safe
+and substantially faster on that CPU gate. The T4 result has the opposite
+ranking: tolerance-based Anderson is 1.53x slower than plain group PCG. For the
+current GPU experiment use four sweeps with `energy_anderson=1` and
+`inner_fixed_relaxations=1`; its reduction-free short gate is 1.47x faster
+than plain PCG. Keep both backend-specific configurations explicit until the
+full 3-D fixed-polynomial run and other reactor libraries are measured.
 
 The diffusion solver also supports constant- or explicitly nonuniform-step
 BDF1--BDF6 on both in-step solver paths:
@@ -477,26 +490,56 @@ Use it at discontinuous material/control frames and feedback-law corners.
 BDF3--6 are A(alpha)-stable, not A-stable, so they require a stability and
 time-step convergence comparison for the intended transient. Explicit step
 schedules remain the deterministic production path. An experimental adaptive
-width controller is available on monolithic BDF2--BDF6 diffusion transients:
+width/order controller is available on monolithic BDF1--BDF6 diffusion
+transients:
 
 ```python
 adaptive = core.transient(
     t_end=3.0, dt=1e-4, time_scheme="bdf5",
     step_solver="monolithic", bdf_restart_times=[2.0],
-    adaptive_bdf={"rtol": 1e-3, "min_dt": 1e-6, "max_dt": 0.1},
+    adaptive_bdf={"rtol": 1e-3, "min_dt": 1e-6, "max_dt": 0.1,
+                  "automatic_order": True,
+                  # Optional practical-tolerance optimization. Failed steps
+                  # still shrink by at least a factor of two.
+                  "rejection_strategy": "error",
+                  "reject_max_factor": 0.5},
 )
 print(adaptive.step_widths, adaptive.local_errors,
       adaptive.rejected_steps)
 ```
 
 Rejected attempts roll back flux, precursor, and BDF history and do not invoke
-the accepted `on_step` hook. The controller currently measures the multigroup
-flux defect and retains the requested maximum order between event restarts;
-precursor/thermal contributions and automatic order selection remain under
-development. Do not treat `rtol` as equivalent to FEMCORE/LSODE tolerances or
-make this the default until it passes the documented LRA and HP-MR gates.
+the accepted `on_step` hook. The controller measures flux and precursor
+defects; coupled drivers may append temperature or other external accepted
+state through `adaptive_error_state`. The LRA driver uses that seam for its
+fully implicit temperature. With `automatic_order=True`, full-state
+`q-1/q/q+1` predictor defects compete by proposed safe width; event restarts
+still force order one. The corrected LRA CPU gate shows a 5.18x matched-error
+speedup over adaptive backward Euler. Error-scaled rejection with a 0.5 cap
+reduced practical-tolerance LRA work by 5.6%; the default factor-two policy is
+retained for paper reproduction. Rejected-attempt time, width, and order are
+available in `rejected_times`, `rejected_step_widths`, and
+`rejected_time_orders`. Do not treat `rtol` as equivalent to
+FEMCORE/LSODE tolerances or make this the default until the HP-MR and GPU gates
+also pass.
 `ndgpu.BDF.error_norm(...)` and `ndgpu.BDFStepController` remain public for
 benchmark and custom-driver development.
+
+`coupled_transient` supports the same adaptive controls through
+`transient_kwargs`. Thermal exchange times are exact non-restarting adaptive
+endpoints, and unequal neutron-step powers are averaged by elapsed time rather
+than step count. The coupled HP-MR gate shows why method speedups must be
+matched by error: its mild drum motion stays almost entirely at BDF order one,
+so adaptive BDF and adaptive backward Euler have essentially the same cost.
+
+On GPU, the adaptive error estimator performs one two-scalar host transfer per
+complete multigroup/precursor norm; it does not synchronize once per field.
+BDF history extrapolation uses the `adaptive` fused-kernel family. Monolithic
+steps reuse bounded FGMRES basis/work storage and, when the free-VRAM guard
+allows it, batched energy-group contractions. Coupled profiles expose
+`group_batch_active` and `fgmres_workspace_bytes`; check both before comparing
+timings. The executable 3-D, 11-group accuracy and performance gate is
+[`notebooks/colab_hpmr3d_adaptive_bdf_gpu.ipynb`](../notebooks/colab_hpmr3d_adaptive_bdf_gpu.ipynb).
 
 For a long run, `multigroup_kwargs={"coarse_correction": True}` adds an
 adjoint-weighted rank-one amplitude correction. It reduces group work but first

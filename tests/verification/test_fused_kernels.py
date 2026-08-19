@@ -188,6 +188,22 @@ def test_cpu_fallbacks_match_the_expressions_they_replace():
     kernels.cg_direction(np, pf, z, beta)
     np.testing.assert_allclose(pf, p_ref, rtol=1e-14)
 
+    out_ref = x + alpha * z
+    out = x.copy()
+    kernels.axpy_inplace(np, out, z, alpha)
+    np.testing.assert_allclose(out, out_ref, rtol=1e-14)
+
+    weights = rng.standard_normal((3, n))
+    vectors = rng.standard_normal((3, n))
+    out = x.copy()
+    kernels.group_accumulate(np, out, weights, vectors, alpha=-0.4)
+    np.testing.assert_allclose(
+        out, x - 0.4 * np.sum(weights * vectors, axis=0), rtol=1e-14)
+
+    out = x.copy()
+    kernels.product_accumulate(np, out, r, z, alpha=-0.4)
+    np.testing.assert_allclose(out, x - 0.4 * r * z, rtol=1e-14)
+
     zf, az = z.copy(), rng.standard_normal(n)
     kernels.neumann_step(np, zf, r, az, inv_diag)
     np.testing.assert_allclose(zf, z + inv_diag * (r - az), rtol=1e-14)

@@ -28,6 +28,8 @@ import math
 
 import numpy as np
 
+from .backend import asnumpy
+
 BC_ZERO_FLUX = "zero-flux"
 BC_REFLECTIVE = "reflective"
 BC_VACUUM = "vacuum"
@@ -342,3 +344,38 @@ class GroupOperator:
         if self.row_scale is not None:
             out *= self.row_scale
         return out
+
+    def assemble(self):
+        """Return the exact scalar stencil as a host CSR matrix.
+
+        Matrix-free application remains the production path.  The explicit
+        form is used to construct small conservative Galerkin/CMFD coarse
+        operators and by diagnostics that need an algebraic reference.
+        """
+        import scipy.sparse as sp
+
+        shape = self.shape
+        idx = np.arange(int(np.prod(shape))).reshape(shape)
+        rows, cols, values = [], [], []
+
+        def add(row, col, value):
+            rows.append(np.asarray(row).ravel())
+            cols.append(np.asarray(col).ravel())
+            values.append(np.asarray(asnumpy(value)).ravel())
+
+        add(idx, idx, self._stencil_diag)
+        add(idx[1:, :, :], idx[:-1, :, :], -asnumpy(self.wx))
+        add(idx[:-1, :, :], idx[1:, :, :], -asnumpy(self.wx))
+        add(idx[:, 1:, :], idx[:, :-1, :], -asnumpy(self.wy))
+        add(idx[:, :-1, :], idx[:, 1:, :], -asnumpy(self.wy))
+        add(idx[:, :, 1:], idx[:, :, :-1], -asnumpy(self.wz))
+        add(idx[:, :, :-1], idx[:, :, 1:], -asnumpy(self.wz))
+        matrix = sp.csr_matrix(
+            (np.concatenate(values),
+             (np.concatenate(rows), np.concatenate(cols))),
+            shape=(idx.size, idx.size))
+        if self.row_scale is not None:
+            scale = np.broadcast_to(
+                asnumpy(self.row_scale), shape).reshape(-1)
+            matrix = sp.diags(scale) @ matrix
+        return matrix.tocsr()

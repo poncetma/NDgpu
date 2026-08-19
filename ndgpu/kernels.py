@@ -18,7 +18,7 @@ kernel can be A/B'd against the generic path at runtime.
 
 Switching off:  ``NDGPU_FUSED=0`` in the environment, or :func:`set_fused` for
 all of them / :func:`set_fused_group` for one family ("stencil", "krylov",
-"block", "groups"). Those switches are what the benchmark notebooks toggle, and the
+"block", "groups", "adaptive"). Those switches are what the benchmark notebooks toggle, and the
 per-group one exists because "is fusion faster" turned out to be the wrong
 question -- see below.
 
@@ -52,7 +52,7 @@ _ENABLED = os.environ.get("NDGPU_FUSED", "1").lower() not in ("0", "false", "no"
 #: first T4 measurements showed the stencil winning 6-7x while large solves got
 #: *slower*, which is only diagnosable by toggling the groups independently.
 _GROUPS = {"stencil": True, "krylov": True, "block": True,
-           "groups": True}
+           "groups": True, "adaptive": True}
 
 
 def set_fused(flag: bool) -> bool:
@@ -68,7 +68,7 @@ def set_fused(flag: bool) -> bool:
 
 
 def set_fused_group(name: str, flag: bool) -> bool:
-    """Enable/disable one kernel group: "stencil", "krylov", "block", "groups"."""
+    """Enable/disable one named fused-kernel family."""
     if name not in _GROUPS:
         raise ValueError(f"unknown kernel group {name!r}; use {sorted(_GROUPS)}")
     prev = _GROUPS[name]
@@ -91,7 +91,13 @@ def use_fused(xp, group: str | None = None) -> bool:
 
 def module_of(a):
     """The array module (numpy or cupy) that owns `a`."""
-    if isinstance(a, np.ndarray):
+    if hasattr(a, "__cuda_array_interface__"):
+        import cupy
+
+        return cupy
+    # NumPy arithmetic on a 0-d array may return a NumPy scalar.  Treat it as
+    # host data too instead of importing CuPy merely to classify it.
+    if isinstance(a, (np.ndarray, np.generic)) or np.isscalar(a):
         return np
     import cupy
 
@@ -374,6 +380,46 @@ def cg_direction(xp, p, z, beta):
         p += z
 
 
+def axpy_inplace(xp, out, x, alpha):
+    """``out += alpha*x`` without the full-size product temporary on GPU.
+
+    BDF extrapolation applies this operation repeatedly to every flux and
+    precursor field.  Keeping it here makes that otherwise backend-neutral
+    history algebra one launch and one memory pass per history coefficient.
+    """
+    if use_fused(xp, "adaptive"):
+        _block_kernel(
+            "ndgpu_adaptive_axpy", "T x, T alpha", "T out",
+            "out += alpha * x;")(x, alpha, out)
+    else:
+        out += alpha * x
+
+
+def basis_accumulate(xp, out, basis, coefficients, n_vectors, alpha=1.0):
+    """Add a short linear combination of contiguous basis vectors to ``out``.
+
+    This is the bandwidth-bound vector half of Arnoldi orthogonalization and
+    solution reconstruction.  A single kernel replaces one launch and one
+    full-size temporary per basis vector.
+    """
+    n_vectors = int(n_vectors)
+    if n_vectors < 1:
+        return out
+    if use_fused(xp, "krylov"):
+        _block_kernel(
+            "ndgpu_basis_accumulate",
+            "raw T basis, raw T coefficients, T alpha, int32 K, int64 N",
+            "T out",
+            "T v = out; for (int k = 0; k < K; ++k)"
+            " v += alpha * coefficients[k] * basis[k * N + i]; out = v;")(
+                basis, coefficients, alpha, np.int32(n_vectors),
+                np.int64(out.size), out)
+    else:
+        for j in range(n_vectors):
+            out += alpha * coefficients[j] * basis[j]
+    return out
+
+
 def neumann_step(xp, z, r, az, inv_diag):
     """One damped-Jacobi sweep  z <- z + inv_diag*(r - A z), in place.
 
@@ -546,8 +592,8 @@ def batched_matvec(xp, out, A, b):
 # --------------------------------------------------------------------------
 
 
-def group_accumulate(xp, out, W, P):
-    """out += sum_g W[g] * P[g], contracting the leading (group) axis.
+def group_accumulate(xp, out, W, P, alpha=1.0):
+    """out += alpha*sum_g W[g] * P[g], contracting the group axis.
 
     ``W`` and ``P`` are (G, \\*grid); ``out`` is (\\*grid). This is the whole
     in-scatter row for one group, or the fission source over all groups, in one
@@ -565,15 +611,27 @@ def group_accumulate(xp, out, W, P):
         for g in range(W.shape[0]):
             # Match the fused kernel: accumulation and multiplication use the
             # seeded output's precision even when inputs have narrower dtypes.
-            out += (W[g].astype(out.dtype, copy=False)
+            out += (alpha * W[g].astype(out.dtype, copy=False)
                     * P[g].astype(out.dtype, copy=False))
         return out
     _block_kernel(
         "ndgpu_group_accumulate",
-        "raw W weights, raw P phi, int32 G, int32 N", "T out",
+        "raw W weights, raw P phi, T alpha, int32 G, int32 N", "T out",
         "T v = out; for (int g = 0; g < G; ++g)"
-        " v += (T)weights[g * N + i] * (T)phi[g * N + i]; out = v;")(
-            W, P, np.int32(W.shape[0]), np.int32(out.size), out)
+        " v += alpha * (T)weights[g * N + i]"
+        " * (T)phi[g * N + i]; out = v;")(
+            W, P, alpha, np.int32(W.shape[0]), np.int32(out.size), out)
+    return out
+
+
+def product_accumulate(xp, out, x, y, alpha=1.0):
+    """``out += alpha*x*y`` in one launch, without a product temporary."""
+    if use_fused(xp, "groups"):
+        _block_kernel(
+            "ndgpu_product_accumulate", "T x, T y, T alpha", "T out",
+            "out += alpha * x * y;")(x, y, alpha, out)
+    else:
+        out += alpha * x * y
     return out
 
 

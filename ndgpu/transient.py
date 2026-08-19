@@ -43,8 +43,9 @@ import numpy as np
 
 from .backend import asnumpy, device_name, get_backend, synchronize
 from .grid import Grid
-from .linalg import (fgmres, get_linear_solver, mixed_precision_preconditioner,
-                     neumann_preconditioner, pcg, pcg_workspaces)
+from .linalg import (FGMRESWorkspace, fgmres, get_linear_solver,
+                     mixed_precision_preconditioner, neumann_preconditioner,
+                     pcg, pcg_workspaces)
 from .materials import Kinetics
 from .multigroup import (EnergyGroupGaussSeidelPreconditioner,
                          AdjointCoarseCorrectionPreconditioner,
@@ -188,6 +189,8 @@ class TransientResult:
     cuda_graph_replays: int = 0
     cuda_graph_errors: list = field(default_factory=list)
     adjoint_coarse_setups: int = 0
+    group_batch_active: bool = False
+    fgmres_workspace_bytes: int = 0
     time_scheme: str = "backward-euler"
     time_orders: list = field(default_factory=list)
     # Number of endpoint neutronics/feedback constituent solves performed for
@@ -196,8 +199,13 @@ class TransientResult:
     # Accepted adaptive-step diagnostics. Empty for a fixed schedule.
     step_widths: list = field(default_factory=list)
     local_errors: list = field(default_factory=list)
+    order_candidate_errors: list = field(default_factory=list)
+    next_time_orders: list = field(default_factory=list)
     rejected_steps: int = 0
     rejected_errors: list = field(default_factory=list)
+    rejected_times: list = field(default_factory=list)
+    rejected_step_widths: list = field(default_factory=list)
+    rejected_time_orders: list = field(default_factory=list)
     rejected_step_iterations: list = field(default_factory=list)
     rejected_feedback_iterations: list = field(default_factory=list)
 
@@ -249,6 +257,19 @@ class TransientSolver:
                  and BDF histories are committed only after True, providing
                  rollback between constituent iterations and a clean seam for
                  the adaptive-step error test.
+    adaptive_error_state : optional callable ``(t, dt) -> (corrected,
+                 predicted)``. Each returned item is an iterable of arrays
+                 appended to the adaptive BDF error norm after an implicit
+                 constituent solve. Coupled drivers use this for temperature
+                 or other accepted state owned outside the neutron solver.
+    adaptive_order_error_state : optional callable ``(t, dt, order) ->
+                 (corrected, predicted)`` for candidate-order defects of that
+                 same external state. It is used only when
+                 ``adaptive_bdf['automatic_order']`` is enabled.
+    adaptive_order_callback : optional callable ``(next_order)`` invoked after
+                 an accepted step selects the following BDF order. Coupled
+                 drivers use it to keep external multistep histories on the
+                 same order as the neutron/precursor solve.
     kinetics   : Kinetics (velocities, delayed families). Per-material tables
                  (2D velocities/beta, rows indexing the problem_at materials
                  list) and per-family chi_delayed (I, G) are supported: the
@@ -273,12 +294,17 @@ class TransientSolver:
                  symmetric_operator: bool = True,
                  mix_material=None, mix_weight=None,
                  xs_update_at=None, on_step=None, feedback_iteration=None,
+                 adaptive_error_state=None, adaptive_order_error_state=None,
+                 adaptive_order_callback=None,
                  phase_context=None):
         self.grid = grid
         self.problem_at = problem_at
         self.xs_update_at = xs_update_at
         self.on_step = on_step
         self.feedback_iteration = feedback_iteration
+        self.adaptive_error_state = adaptive_error_state
+        self.adaptive_order_error_state = adaptive_order_error_state
+        self.adaptive_order_callback = adaptive_order_callback
         # Optional driver instrumentation: callable(name) -> context manager.
         # Keeping it outside the numerical result avoids timing overhead unless
         # a coupled/benchmark driver explicitly opts in.
@@ -412,6 +438,7 @@ class TransientSolver:
               time_scheme: str = "backward-euler",
               time_weight: float | None = None,
               bdf_restart_times=None,
+              step_alignment_times=None,
               adaptive_bdf: dict | None = None,
               max_feedback_iterations: int = 12,
               verbose: bool = False) -> TransientResult:
@@ -478,7 +505,13 @@ class TransientSolver:
             ``scatter_sweeps`` (default 3), ``inner_rtol`` (1e-3),
             ``inner_maxiter`` (300), ``precond_degree`` (the solver setting),
             ``rtol`` (default ``0.1*tol_step``), ``restart`` (30), and
-            ``maxiter`` (300). ``coarse_correction=True`` computes one initial
+            ``maxiter`` (300). ``energy_anderson=1`` applies a depth-one
+            Anderson update between energy-group subsweeps; this dynamically
+            removes the dominant group-coupling error mode without an extra
+            fine operator application. ``inner_fixed_relaxations=1`` replaces
+            tolerance-based group PCG by deterministic polynomial corrections
+            without reduction synchronizations; it is a GPU experiment, not a
+            CPU recommendation. ``coarse_correction=True`` computes one initial
             adjoint and adds an adjoint-weighted rank-one amplitude correction;
             this has startup cost and is intended for longer runs. Advanced
             coupled/IQS drivers that already own a compatible adjoint may pass
@@ -499,13 +532,23 @@ class TransientSolver:
         adaptive_bdf : experimental BDF local-error controller. A dictionary
             with ``rtol`` (required in production; default 1e-3), optional
             ``atol``, ``min_dt``, ``max_dt``, ``safety``, ``min_factor``,
-            ``max_factor``, and ``max_rejections``. It uses ``dt`` as the
+            ``max_factor``, ``max_rejections``, ``automatic_order``, and
+            ``order_hysteresis``. ``rejection_strategy='half'`` reproduces the
+            paper's factor-two retry; ``'error'`` scales rejected widths by
+            the measured defect, capped by ``reject_max_factor``. It uses
+            ``dt`` as the
             initial width, aligns steps to ``bdf_restart_times`` and ``t_end``,
-            and currently supports only scalar ``dt``, BDF2--BDF6, and the
+            and currently supports only scalar ``dt``, BDF1--BDF6, and the
             monolithic diffusion step. Rejected attempts do not advance flux,
-            precursor, BDF, or ``on_step`` state. The first implementation
-            controls the multigroup flux defect; coupled thermal contribution
-            to the norm is a subsequent validation gate.
+            precursor, BDF, or ``on_step`` state. Flux and precursor fields
+            are included in the error norm. With automatic order enabled,
+            candidate ``q-1/q/q+1`` predictor defects compete by safe proposed
+            width. A coupled driver may add its state through
+            ``adaptive_error_state`` and ``adaptive_order_error_state``.
+        step_alignment_times : optional interior endpoints that an adaptive
+            schedule must hit exactly without discarding BDF history. Use
+            ``bdf_restart_times`` instead when the solution or coefficients
+            are discontinuous and history must also be reset.
         scatter_subsweeps : Gauss-Seidel passes over the groups per fixed-point
             evaluation (fission source held fixed). With downscatter only, one
             ordered pass is exact, so extra passes are pointless; with
@@ -584,7 +627,8 @@ class TransientSolver:
         allowed_mg = {"scatter_sweeps", "inner_rtol", "inner_atol",
                       "inner_maxiter", "precond_degree", "rtol", "atol",
                       "restart", "maxiter", "coarse_correction",
-                      "coarse_adjoint"}
+                      "coarse_adjoint", "energy_anderson",
+                      "inner_fixed_relaxations"}
         unknown_mg = sorted(set(mg_kw) - allowed_mg)
         if unknown_mg:
             raise ValueError(f"unknown multigroup_kwargs: {unknown_mg}")
@@ -594,6 +638,8 @@ class TransientSolver:
             allowed_adaptive = {
                 "rtol", "atol", "min_dt", "max_dt", "safety", "floor",
                 "min_factor", "max_factor", "max_rejections",
+                "automatic_order", "order_hysteresis",
+                "rejection_strategy", "reject_max_factor",
             }
             unknown = sorted(set(adaptive_kw) - allowed_adaptive)
             if unknown:
@@ -603,8 +649,8 @@ class TransientSolver:
             if step_solver != "monolithic":
                 raise ValueError("adaptive_bdf currently requires "
                                  "step_solver='monolithic'")
-            if not isinstance(scheme, BDF) or scheme.max_order < 2:
-                raise ValueError("adaptive_bdf currently requires bdf2..bdf6")
+            if not isinstance(scheme, BDF):
+                raise ValueError("adaptive_bdf currently requires bdf1..bdf6")
             initial_dt = float(dt)
             if (not np.isfinite(t_end) or t_end < 0.0
                     or not np.isfinite(initial_dt) or initial_dt <= 0.0):
@@ -631,7 +677,25 @@ class TransientSolver:
                 floor=adaptive_kw.get("floor", 1e-6),
                 min_factor=adaptive_kw.get("min_factor", 0.2),
                 max_factor=adaptive_kw.get("max_factor", 5.0),
+                rejection_strategy=adaptive_kw.get(
+                    "rejection_strategy", "half"),
+                reject_max_factor=adaptive_kw.get(
+                    "reject_max_factor", 0.5),
             )
+            automatic_order = bool(adaptive_kw.get("automatic_order", False))
+            order_hysteresis = float(adaptive_kw.get(
+                "order_hysteresis", 1.05))
+            if (not np.isfinite(order_hysteresis)
+                    or order_hysteresis < 1.0):
+                raise ValueError(
+                    "adaptive_bdf order_hysteresis must be finite and >= 1")
+            if automatic_order:
+                scheme.enable_order_selection()
+                if (self.adaptive_error_state is not None
+                        and self.adaptive_order_error_state is None):
+                    raise ValueError(
+                        "automatic_order with external adaptive_error_state "
+                        "requires adaptive_order_error_state")
             # Dynamic stepping owns its target sequence. Fixed schedules keep
             # the old arrays bit-for-bit so the validated path is unchanged.
             target_times = np.empty(0)
@@ -667,6 +731,27 @@ class TransientSolver:
                         raise ValueError(
                             f"BDF restart time {event:g} must coincide with a step end")
                     restart_steps.add(int(matches[0]) + 1)
+        alignment_times = np.empty(0)
+        if step_alignment_times is not None:
+            alignment_times = np.asarray(step_alignment_times, dtype=float)
+            if (alignment_times.ndim != 1
+                    or not np.all(np.isfinite(alignment_times))):
+                raise ValueError(
+                    "step_alignment_times must be a finite 1D sequence")
+            if np.any(alignment_times <= 0.0) or np.any(alignment_times >= t_end):
+                raise ValueError(
+                    "step_alignment_times must lie inside (0, t_end)")
+            alignment_times = np.unique(np.sort(alignment_times))
+            if not adaptive:
+                for event in alignment_times:
+                    if not np.any(np.isclose(
+                            target_times, event, rtol=1e-12,
+                            atol=1e-14 * max(1.0, abs(event)))):
+                        raise ValueError(
+                            f"step alignment time {event:g} must coincide "
+                            "with a step end")
+        stop_times = np.unique(np.concatenate(
+            (restart_times, alignment_times)))
         scheme.prepare_step(1, dt_step)
         synchronize(xp)
         t0 = time.perf_counter()
@@ -833,7 +918,10 @@ class TransientSolver:
         sch_phi.start([p.copy() for p in phi])
         C_hist = [C]
         S_prev = S
-        history_limit = int(getattr(scheme, "max_order", 1))
+        # The recurrence consumes q precursor states, while its degree-q LTE
+        # predictor consumes q+1. Keep the same one-extra-state convention as
+        # BDF's flux history.
+        history_limit = int(getattr(scheme, "max_order", 1)) + 1
 
         chi_d2 = kin.chi_delayed if (kin.chi_delayed is not None
                                      and kin.chi_delayed.ndim == 2) else None
@@ -915,6 +1003,8 @@ class TransientSolver:
         src_w = getattr(ops[0], "rhs_weight", None)
         monolithic_block = None
         monolithic_precond = None
+        monolithic_workspace = None
+        monolithic_workspace_bytes = 0
         coarse_setups = 0
         last = (mats, mmap, mix_m0, mix_w0)
         last_upd = upd0
@@ -934,7 +1024,12 @@ class TransientSolver:
         feedback_its: list[int] = []
         accepted_widths: list[float] = []
         local_errors: list[float] = []
+        order_candidate_errors: list[dict[int, float]] = []
+        next_time_orders: list[int] = []
         rejected_errors: list[float] = []
+        rejected_times: list[float] = []
+        rejected_widths: list[float] = []
+        rejected_orders: list[int] = []
         rejected_step_its: list[int] = []
         rejected_feedback_its: list[int] = []
         rejection_streak = 0
@@ -957,7 +1052,7 @@ class TransientSolver:
                         S_prev = S
                         restarted_events.add(float(event))
                 limit = float(t_end)
-                future_events = restart_times[restart_times > t_start + 1e-14]
+                future_events = stop_times[stop_times > t_start + 1e-14]
                 if future_events.size:
                     limit = min(limit, float(future_events[0]))
                 next_dt = min(next_adaptive_dt, adaptive_max_dt,
@@ -975,7 +1070,11 @@ class TransientSolver:
                 C_hist = [C]
                 S_prev = S
             scheme.prepare_step(n, dt_step)
-            predicted_phi = (scheme.predict(dt_step) if adaptive else None)
+            predicted_phi = (scheme.predict(
+                dt_step,
+                max_degree=(scheme.order_at(n)
+                            if automatic_order else None))
+                if adaptive else None)
             accepted_phi = ([p.copy() for p in phi] if adaptive else None)
             accepted_source = S
             time_order_n = int(getattr(
@@ -1056,7 +1155,7 @@ class TransientSolver:
                     if monolithic_block is None:
                         monolithic_block = MultigroupStepOperator(
                             ops, fields.sigma_s, fields.nu_sigma_f, w_fis, k0,
-                            rhs_weight=src_w)
+                            rhs_weight=src_w, group_batch=batch)
                         monolithic_precond = EnergyGroupGaussSeidelPreconditioner(
                             monolithic_block,
                             scatter_sweeps=int(mg_kw.get("scatter_sweeps", 3)),
@@ -1064,8 +1163,25 @@ class TransientSolver:
                             inner_rtol=float(mg_kw.get("inner_rtol", 1e-3)),
                             inner_atol=float(mg_kw.get("inner_atol", 0.0)),
                             inner_maxiter=int(mg_kw.get("inner_maxiter", 300)),
+                            anderson_depth=int(mg_kw.get(
+                                "energy_anderson", 0)),
+                            inner_fixed_relaxations=int(mg_kw.get(
+                                "inner_fixed_relaxations", 0)),
                             precond_degree=int(mg_kw.get(
                                 "precond_degree", self.precond_degree)))
+                        if monolithic_workspace is None:
+                            monolithic_workspace = FGMRESWorkspace.like(
+                                (batch["phi"] if batch is not None
+                                 else xp.stack(phi)),
+                                restart=int(mg_kw.get("restart", 30)),
+                                operator_out=True)
+                            monolithic_workspace_bytes = sum(
+                                value.nbytes for value in (
+                                    monolithic_workspace.x,
+                                    monolithic_workspace.r,
+                                    monolithic_workspace.w,
+                                    monolithic_workspace.V,
+                                    monolithic_workspace.Z))
                     fixed_rhs = monolithic_block.fixed_rhs(
                         inv_vdt, phi_old, dsrc_g)
                     phi_stack = (batch["phi"] if batch is not None
@@ -1086,7 +1202,8 @@ class TransientSolver:
                             "rtol", max(0.1 * tol_step, 1e-12))),
                         atol=float(mg_kw.get("atol", 0.0)),
                         restart=int(mg_kw.get("restart", 30)),
-                        maxiter=int(mg_kw.get("maxiter", 300)))
+                        maxiter=int(mg_kw.get("maxiter", 300)),
+                        workspace=monolithic_workspace)
                     for g in range(G):
                         phi[g][...] = solved[g]
                     S = fission_source(phi) / k0
@@ -1134,11 +1251,38 @@ class TransientSolver:
                            scheme.precursor_update(
                                n, C_hist, S, S_prev, beta, lam, dt_step)]
                 if adaptive:
+                    predicted_C = scheme.predict_history(
+                        C_hist, dt_step,
+                        max_degree=(time_order_n
+                                    if automatic_order else None))
+                    corrected_error_state = list(phi) + list(C_trial)
+                    predicted_error_state = (list(predicted_phi)
+                                             + list(predicted_C))
+                    external_corrected = []
+                    if self.adaptive_error_state is not None:
+                        extra = self.adaptive_error_state(t, dt_step)
+                        if (not isinstance(extra, (tuple, list))
+                                or len(extra) != 2):
+                            raise ValueError(
+                                "adaptive_error_state must return "
+                                "(corrected, predicted)")
+                        extra_corrected, extra_predicted = map(list, extra)
+                        if len(extra_corrected) != len(extra_predicted):
+                            raise ValueError(
+                                "adaptive_error_state corrected/predicted "
+                                "lengths differ")
+                        corrected_error_state.extend(extra_corrected)
+                        predicted_error_state.extend(extra_predicted)
+                        external_corrected = extra_corrected
                     local_error = scheme.error_norm(
-                        phi, predicted_phi, rtol=adaptive_rtol,
+                        corrected_error_state, predicted_error_state,
+                        rtol=adaptive_rtol,
                         atol=adaptive_atol)
                     if local_error > 1.0:
                         rejected_errors.append(local_error)
+                        rejected_times.append(t)
+                        rejected_widths.append(dt_step)
+                        rejected_orders.append(time_order_n)
                         rejected_step_its.append(outer_total)
                         rejected_feedback_its.append(coupled_it)
                         rejection_streak += 1
@@ -1167,13 +1311,56 @@ class TransientSolver:
                                   f"error = {local_error:.3e}")
                         continue
 
+                    next_order_n = time_order_n
+                    if automatic_order:
+                        candidate_errors = {time_order_n: local_error}
+                        candidates = {max(1, time_order_n - 1), time_order_n}
+                        higher = time_order_n + 1
+                        if (higher <= scheme.max_order
+                                and scheme.history_length >= higher + 1):
+                            candidates.add(higher)
+                        for candidate in sorted(candidates):
+                            if candidate == time_order_n:
+                                continue
+                            candidate_predicted = (
+                                scheme.predict(dt_step, max_degree=candidate)
+                                + scheme.predict_history(
+                                    C_hist, dt_step, max_degree=candidate))
+                            candidate_corrected = list(phi) + list(C_trial)
+                            if self.adaptive_order_error_state is not None:
+                                extra = self.adaptive_order_error_state(
+                                    t, dt_step, candidate)
+                                if (not isinstance(extra, (tuple, list))
+                                        or len(extra) != 2):
+                                    raise ValueError(
+                                        "adaptive_order_error_state must return "
+                                        "(corrected, predicted)")
+                                extra_c, extra_p = map(list, extra)
+                                if len(extra_c) != len(extra_p):
+                                    raise ValueError(
+                                        "adaptive_order_error_state corrected/"
+                                        "predicted lengths differ")
+                                candidate_corrected.extend(extra_c)
+                                candidate_predicted.extend(extra_p)
+                            elif external_corrected:
+                                raise AssertionError(
+                                    "external candidate-order state is missing")
+                            candidate_errors[candidate] = scheme.error_norm(
+                                candidate_corrected, candidate_predicted,
+                                rtol=adaptive_rtol, atol=adaptive_atol)
+                        next_order_n, proposed_dt = controller.choose_order(
+                            dt_step, candidate_errors, time_order_n,
+                            hysteresis=order_hysteresis)
+                        order_candidate_errors.append(candidate_errors)
+                        next_time_orders.append(next_order_n)
+                    else:
+                        proposed_dt = controller.propose(
+                            dt_step, local_error, time_order_n, accepted=True)
                     local_errors.append(local_error)
                     accepted_widths.append(dt_step)
                     next_adaptive_dt = min(
                         adaptive_max_dt,
-                        max(adaptive_min_dt,
-                            controller.propose(dt_step, local_error,
-                                               time_order_n, accepted=True)))
+                        max(adaptive_min_dt, proposed_dt))
                     rejection_streak = 0
                 else:
                     accepted_widths.append(dt_step)
@@ -1183,6 +1370,8 @@ class TransientSolver:
                 del C_hist[history_limit:]
                 S_prev = S
                 sch_phi.push([p.copy() for p in phi])
+                if adaptive and automatic_order:
+                    scheme.select_order(next_order_n)
                 step_its.append(outer_total)
                 feedback_its.append(coupled_it)
                 time_orders.append(time_order_n)
@@ -1191,6 +1380,9 @@ class TransientSolver:
                 if self.on_step is not None:
                     callback_phi = batch["phi"] if batch is not None else phi
                     self.on_step(t, callback_phi, power[-1])
+                if (adaptive and automatic_order
+                        and self.adaptive_order_callback is not None):
+                    self.adaptive_order_callback(next_order_n)
                 if verbose and (n % max(1, n_steps // 20) == 0 or n == n_steps):
                     print(f"  t = {t:8.4f} s   P/P0 = {power[-1]:.5f}   "
                           f"({outer_total} FGMRES applies, "
@@ -1394,13 +1586,20 @@ class TransientSolver:
                 workspace.graph_error for workspace in (workspaces or [])
                 if workspace.graph_error)),
             adjoint_coarse_setups=coarse_setups,
+            group_batch_active=batch is not None,
+            fgmres_workspace_bytes=monolithic_workspace_bytes,
             time_scheme=scheme.name,
             time_orders=time_orders,
             feedback_iterations=feedback_its,
             step_widths=accepted_widths,
             local_errors=local_errors,
+            order_candidate_errors=order_candidate_errors,
+            next_time_orders=next_time_orders,
             rejected_steps=len(rejected_errors),
             rejected_errors=rejected_errors,
+            rejected_times=rejected_times,
+            rejected_step_widths=rejected_widths,
+            rejected_time_orders=rejected_orders,
             rejected_step_iterations=rejected_step_its,
             rejected_feedback_iterations=rejected_feedback_its,
             solve_seconds=time.perf_counter() - t0,

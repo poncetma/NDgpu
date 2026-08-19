@@ -385,6 +385,9 @@ class CoupledTransientResult:
     steps: int
     time_scheme: str = "backward-euler"
     time_orders: list = field(default_factory=list)
+    step_widths: list = field(default_factory=list)
+    local_errors: list = field(default_factory=list)
+    rejected_steps: int = 0
     phase_seconds: dict = field(default_factory=dict)
     counters: dict = field(default_factory=dict)
 
@@ -395,6 +398,7 @@ class CoupledTransientResult:
 
 
 def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
+                      initial_coupled_steady=None,
                       dt_thermal=None, verbose=False, transient_kwargs=None,
                       solver_cls=None, precond_degree=1, check_every=4,
                       precond_dtype=None,
@@ -414,13 +418,17 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
 
     The neutronics step is set by prompt kinetics (milliseconds); the thermal
     response is seconds. Backward Euler on the conduction side is
-    unconditionally stable, so ``dt_thermal`` can be a multiple of ``dt`` --
-    the temperature is then advanced once every few neutronics steps with the
-    power accumulated over them, which is where most of the saving is.
+    unconditionally stable, so ``dt_thermal`` can be a multiple of a fixed
+    ``dt``. With adaptive BDF, thermal exchange times are inserted as exact
+    non-restarting step endpoints. In both cases the temperature advances with
+    the time-weighted mean power over its interval.
 
     problem_at : as ``TransientSolver``'s, for the driving perturbation (a
                  drum rotation, a rod). Defaults to a stationary core, i.e. the
                  transient is driven by the feedback alone.
+    initial_coupled_steady : compatible converged :class:`CoupledResult` to
+                 reuse. This separates one-time hot-equilibrium startup from
+                 repeated method/tolerance benchmark legs.
     precond_degree, check_every, precond_dtype : GPU-oriented controls for the neutron
                  Neumann-PCG solves. Explicit values in
                  ``transient_kwargs['linsolve_kwargs']`` take precedence over
@@ -441,14 +449,18 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
 
     xp = ctx.thermal_solver().xp
     profiler = _CoupledPhaseProfiler(xp, enabled=profile)
+    adaptive_neutronics = ((transient_kwargs or {}).get("adaptive_bdf")
+                           is not None)
     dt = float(dt)
     dt_thermal = float(dt if dt_thermal is None else dt_thermal)
     if not np.isfinite(dt) or not np.isfinite(dt_thermal) or dt <= 0.0 or dt_thermal <= 0.0:
         raise ValueError("dt and dt_thermal must be finite and positive")
-    every = int(round(dt_thermal / dt))
-    if every < 1 or not np.isclose(every * dt, dt_thermal, rtol=1e-12,
-                                   atol=1e-14 * max(1.0, dt_thermal)):
-        raise ValueError("dt_thermal must be an integer multiple of dt")
+    if not adaptive_neutronics:
+        every = int(round(dt_thermal / dt))
+        if every < 1 or not np.isclose(
+                every * dt, dt_thermal, rtol=1e-12,
+                atol=1e-14 * max(1.0, dt_thermal)):
+            raise ValueError("dt_thermal must be an integer multiple of dt")
     thermal_diagnostics_every = int(thermal_diagnostics_every)
     if thermal_diagnostics_every < 0:
         raise ValueError("thermal_diagnostics_every must be non-negative")
@@ -469,9 +481,13 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
     # Start from the converged coupled steady state, so t=0 is an equilibrium
     # of BOTH physics -- otherwise the run opens with a transient that is
     # nothing but the initial condition relaxing.
-    steady = CoupledSolver(ctx).solve(tol=1e-8, anderson_depth=5)
+    steady = (CoupledSolver(ctx).solve(tol=1e-8, anderson_depth=5)
+              if initial_coupled_steady is None else initial_coupled_steady)
     if not steady.converged:
         raise RuntimeError(f"coupled steady state did not converge: {steady}")
+    if np.asarray(steady.temperature).shape != tuple(ctx.shape):
+        raise ValueError("initial_coupled_steady temperature shape is "
+                         "incompatible with the coupling context")
 
     def thermal_solver_for(step):
         return ConductionSolver(
@@ -487,7 +503,8 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
     # Everything the loop touches lives on the solve device from here on.
     steady_T = np.asarray(steady.temperature)
     state = {"T": xp.asarray(steady_T, dtype=thermal.dtype),
-             "peak": [], "mean": [], "accum": None, "n": 0, "hook": None,
+             "peak": [], "mean": [], "accum": None, "n": 0,
+             "elapsed": 0.0, "last_t": 0.0, "hook": None,
              "min_integral": None}
     state["hook"] = ctx.feedback.hook(state["T"])
     fuel = _fuel_mask(ctx)
@@ -518,6 +535,11 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
     def on_step(t, phi, power_ratio):
         profiler.pause_neutronics()
         try:
+            step_width = float(t) - state["last_t"]
+            if not np.isfinite(step_width) or step_width <= 0.0:
+                raise RuntimeError("coupled transient received non-increasing "
+                                   "accepted times")
+            state["last_t"] = float(t)
             with profiler.region("power_edit"):
                 raw_power.fill(0)
                 # One contraction kernel when the multigroup transient hands
@@ -535,9 +557,11 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
                     xp.minimum(state["min_integral"], integral))
                 # Accumulate power over the sub-steps so a coarser thermal step
                 # sees the mean source over its own interval, not a snapshot.
-                state["accum"] = (q if state["accum"] is None
-                                  else state["accum"] + q)
+                weighted_q = q * step_width
+                state["accum"] = (weighted_q if state["accum"] is None
+                                  else state["accum"] + weighted_q)
                 state["n"] += 1
+                state["elapsed"] += step_width
             profiler.counters["neutronics_steps"] += 1
 
             # Flush a trailing partial interval too. A constant-width thermal
@@ -545,16 +569,22 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
             # correctly shifted backward-Euler operator.
             final_window = np.isclose(t, t_end, rtol=1e-12,
                                       atol=1e-14 * max(1.0, t_end))
-            if state["n"] == every or final_window:
-                width = state["n"] * dt
-                stepper = (thermal if state["n"] == every
+            full_window = np.isclose(
+                state["elapsed"], dt_thermal, rtol=1e-12,
+                atol=1e-14 * max(1.0, dt_thermal))
+            if state["elapsed"] > dt_thermal and not full_window:
+                raise RuntimeError(
+                    "adaptive neutron step crossed a thermal exchange time")
+            if full_window or final_window:
+                width = state["elapsed"]
+                stepper = (thermal if full_window
                            else thermal_solver_for(width))
                 next_thermal = profiler.counters["thermal_steps"] + 1
                 diagnostics = (thermal_diagnostics_every > 0 and
                                next_thermal % thermal_diagnostics_every == 0)
                 with profiler.region("thermal_solve"):
                     res = stepper.step(
-                        state["accum"] / state["n"], state["T"],
+                        state["accum"] / width, state["T"],
                         rtol=thermal_rtol, maxiter=thermal_maxiter,
                         check_every=thermal_check_every,
                         diagnostics=diagnostics, synchronize_timing=False)
@@ -582,6 +612,7 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
                 state["cached_peak"] = float(packet[1])
                 state["cached_mean"] = float(packet[2])
                 state["accum"], state["n"] = None, 0
+                state["elapsed"] = 0.0
                 state["min_integral"] = None
 
             # Temperature is constant between thermal exchanges; reuse the
@@ -644,6 +675,15 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
     else:
         step_kwargs = dict(rebalance=False)
     step_kwargs.update(transient_kwargs or {})
+    if adaptive_neutronics and dt_thermal < t_end:
+        thermal_times = np.arange(dt_thermal, t_end, dt_thermal)
+        thermal_times = thermal_times[
+            thermal_times < t_end - 1e-14 * max(1.0, t_end)]
+        supplied_value = step_kwargs.get("step_alignment_times")
+        supplied = np.asarray(
+            () if supplied_value is None else supplied_value, dtype=float)
+        step_kwargs["step_alignment_times"] = np.unique(np.concatenate(
+            (supplied, thermal_times)))
     # The coupled fixed point has already paid for a converged hot eigenpair.
     # Hand it to the transient initializer instead of immediately solving the
     # same time-zero problem again. Callers can still override this explicitly
@@ -668,8 +708,15 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
     profiler.counters["initial_eigen_inner_iterations"] = \
         res.steady.inner_iterations
     profiler.counters["initial_state_reuses"] = int(res.initial_state_reused)
+    profiler.counters["coupled_steady_reuses"] = int(
+        initial_coupled_steady is not None)
     profiler.counters["neutron_inner_iterations"] = res.total_inner_iterations
     profiler.counters["neutron_outer_iterations"] = sum(res.step_iterations)
+    profiler.counters["neutron_rejected_outer_iterations"] = sum(
+        res.rejected_step_iterations)
+    profiler.counters["neutron_total_outer_iterations"] = (
+        sum(res.step_iterations) + sum(res.rejected_step_iterations))
+    profiler.counters["neutron_rejected_steps"] = res.rejected_steps
     profiler.counters["neutron_monolithic_steps"] = int(
         res.step_method == "monolithic") * (len(res.times) - 1)
     # Backward-compatible name. For a monolithic run these are FGMRES applies,
@@ -681,6 +728,8 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
     profiler.counters["cuda_graph_replays"] = res.cuda_graph_replays
     profiler.counters["cuda_graph_errors"] = len(res.cuda_graph_errors)
     profiler.counters["adjoint_coarse_setups"] = res.adjoint_coarse_setups
+    profiler.counters["group_batch_active"] = int(res.group_batch_active)
+    profiler.counters["fgmres_workspace_bytes"] = res.fgmres_workspace_bytes
     profiler.counters["neutron_bdf_max_order"] = max(res.time_orders, default=1)
     phase_seconds = profiler.seconds()
 
@@ -692,6 +741,8 @@ def coupled_transient(ctx: CouplingContext, t_end, dt, *, problem_at=None,
         k0=res.k0, temperature=final_temperature, flux=res.flux, steady=steady,
         seconds=seconds, device=ctx.device, steps=len(res.times) - 1,
         time_scheme=res.time_scheme, time_orders=list(res.time_orders),
+        step_widths=list(res.step_widths), local_errors=list(res.local_errors),
+        rejected_steps=res.rejected_steps,
         phase_seconds=phase_seconds, counters=dict(profiler.counters))
 
 

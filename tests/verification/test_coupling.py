@@ -162,6 +162,7 @@ def test_coupled_transient_accepts_monolithic_neutron_steps():
         ctx, t_end=0.1, dt=0.05, dt_thermal=0.1)
     direct = coupled_transient(
         ctx, t_end=0.1, dt=0.05, dt_thermal=0.1,
+        initial_coupled_steady=fixed.steady,
         transient_kwargs={
             "step_solver": "monolithic",
             "multigroup_kwargs": {"rtol": 1e-9},
@@ -172,6 +173,8 @@ def test_coupled_transient_accepts_monolithic_neutron_steps():
                                fixed.peak_temperature, rtol=0, atol=2e-6)
     assert direct.counters["neutron_monolithic_steps"] == 2
     assert direct.counters["neutron_outer_iterations"] > 0
+    assert direct.counters["coupled_steady_reuses"] == 1
+    assert direct.steady is fixed.steady
 
 
 def test_coupled_transient_forwards_bdf_controls_and_reports_order():
@@ -184,6 +187,32 @@ def test_coupled_transient_forwards_bdf_controls_and_reports_order():
     assert result.time_orders == [1, 2, 3]
     assert result.counters["neutron_bdf_max_order"] == 3
     np.testing.assert_allclose(result.power, 1.0, rtol=0, atol=2e-8)
+
+
+def test_adaptive_coupling_aligns_variable_steps_to_thermal_exchanges():
+    """Unequal neutron widths must not cross or mis-average thermal windows."""
+    from ndgpu.coupling import coupled_transient
+
+    result = coupled_transient(
+        _ctx(_problem(refine=2)), t_end=0.25, dt=0.03, dt_thermal=0.10,
+        transient_kwargs={
+            "time_scheme": "bdf3", "step_solver": "monolithic",
+            "multigroup_kwargs": {"rtol": 1e-9},
+            "adaptive_bdf": {
+                "rtol": 1e-3, "min_dt": 1e-6, "max_dt": 0.2,
+                "automatic_order": True,
+                "rejection_strategy": "error",
+            },
+        })
+    assert np.any(np.isclose(result.times, 0.10))
+    assert np.any(np.isclose(result.times, 0.20))
+    assert sum(result.step_widths) == pytest.approx(0.25, abs=2e-14)
+    assert result.counters["thermal_steps"] == 3
+    assert result.counters["neutronics_steps"] == result.steps
+    assert result.counters["neutron_rejected_steps"] == result.rejected_steps
+    assert len(result.local_errors) == result.steps
+    np.testing.assert_allclose(result.power, 1.0, rtol=0, atol=3e-8)
+    assert np.ptp(result.mean_temperature) < 2e-6
 
 
 def test_coupled_transient_matches_the_uncoupled_one_without_feedback():

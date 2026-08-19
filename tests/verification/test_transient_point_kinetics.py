@@ -168,12 +168,19 @@ def test_adaptive_bdf_rejects_aligns_event_and_restarts_order():
         return cache[key], None
 
     committed_times = []
+    adaptive_error_calls = []
+
+    def adaptive_error_state(t, _dt):
+        adaptive_error_calls.append(t)
+        marker = np.asarray([t])
+        return [marker], [marker]
 
     result = TransientSolver(
         GRID, ramp_problem, KIN, device="cpu",
         xs_update_at=lambda _t: (lambda _fields: None),
         feedback_iteration=lambda _t, _flux, _power, _iteration: True,
         on_step=lambda t, _flux, _power: committed_times.append(t),
+        adaptive_error_state=adaptive_error_state,
     ).solve(
             t_end=0.02, dt=0.01, time_scheme="bdf3",
             bdf_restart_times=[0.01], step_solver="monolithic",
@@ -183,6 +190,10 @@ def test_adaptive_bdf_rejects_aligns_event_and_restarts_order():
 
     assert result.rejected_steps > 0
     assert len(result.rejected_errors) == len(result.rejected_step_iterations)
+    assert len(result.rejected_errors) == len(result.rejected_times)
+    assert len(result.rejected_errors) == len(result.rejected_step_widths)
+    assert len(result.rejected_errors) == len(result.rejected_time_orders)
+    assert all(width > 0.0 for width in result.rejected_step_widths)
     assert len(result.step_widths) == len(result.local_errors) == len(
         result.times) - 1
     assert max(result.local_errors) <= 1.0
@@ -190,16 +201,47 @@ def test_adaptive_bdf_rejects_aligns_event_and_restarts_order():
     assert sum(result.step_widths) == pytest.approx(0.02, abs=2e-15)
     assert result.times[-1] == pytest.approx(0.02, abs=2e-15)
     np.testing.assert_allclose(committed_times, result.times[1:], atol=2e-15)
+    assert len(adaptive_error_calls) == len(result.step_widths) + result.rejected_steps
     event = int(np.flatnonzero(np.isclose(result.times, 0.01))[0])
     # time_orders indexes steps, so the first step leaving the event is event.
     assert result.time_orders[event] == 1
     assert result.power[-1] == pytest.approx(3.634, abs=2e-2)
 
 
+def test_adaptive_bdf_automatic_order_selects_and_reports_candidates():
+    prob = absorption_step_problem(0.00005)
+    result = TransientSolver(GRID, prob, KIN, device="cpu").solve(
+        t_end=0.04, dt=0.001, time_scheme="bdf4",
+        step_solver="monolithic", tol_step=1e-9,
+        adaptive_bdf={"rtol": 1e-2, "min_dt": 1e-6,
+                      "max_dt": 0.005, "automatic_order": True},
+        multigroup_kwargs={"rtol": 1e-11})
+    assert len(result.next_time_orders) == len(result.step_widths)
+    assert len(result.order_candidate_errors) == len(result.step_widths)
+    assert set(result.time_orders) <= {1, 2, 3, 4}
+    assert max(result.time_orders) > 1
+    assert all(order in candidates for order, candidates in zip(
+        result.time_orders, result.order_candidate_errors))
+
+
+def test_adaptive_backward_euler_uses_same_accept_reject_controller():
+    result = TransientSolver(
+        GRID, absorption_step_problem(0.00005), KIN, device="cpu").solve(
+            t_end=0.02, dt=0.001, time_scheme="bdf1",
+            step_solver="monolithic", tol_step=1e-9,
+            adaptive_bdf={"rtol": 1e-2, "min_dt": 1e-6,
+                          "max_dt": 0.005},
+            multigroup_kwargs={"rtol": 1e-11})
+    assert result.time_scheme == "backward-euler"
+    assert set(result.time_orders) == {1}
+    assert len(result.local_errors) == len(result.step_widths)
+    assert max(result.local_errors) <= 1.0
+
+
 @pytest.mark.parametrize("kwargs,match", [
     ({"adaptive_bdf": {"rtol": 1e-3}}, "monolithic"),
     ({"adaptive_bdf": {"rtol": 1e-3}, "step_solver": "monolithic",
-      "time_scheme": "backward-euler"}, "bdf2..bdf6"),
+      "time_scheme": "backward-euler"}, "bdf1..bdf6"),
     ({"adaptive_bdf": {"mystery": 1}, "step_solver": "monolithic",
       "time_scheme": "bdf2"}, "unknown adaptive_bdf"),
 ])
@@ -254,6 +296,29 @@ def test_monolithic_adjoint_coarse_correction_is_opt_in_and_counted():
     assert result.step_method == "monolithic"
     assert result.adjoint_coarse_setups == 2
     assert np.all(np.isfinite(result.power))
+
+
+def test_monolithic_energy_anderson_is_opt_in_and_preserves_solution():
+    prob = absorption_step_problem(0.001)
+    common = dict(t_end=0.004, dt=0.002, step_solver="monolithic",
+                  tol_step=1e-9)
+    plain = TransientSolver(GRID, prob, KIN, device="cpu").solve(
+        **common, multigroup_kwargs={"rtol": 1e-11})
+    accelerated = TransientSolver(GRID, prob, KIN, device="cpu").solve(
+        **common, multigroup_kwargs={"rtol": 1e-11,
+                                     "scatter_sweeps": 3,
+                                     "energy_anderson": 1})
+    reduction_free = TransientSolver(GRID, prob, KIN, device="cpu").solve(
+        **common, multigroup_kwargs={"rtol": 1e-11,
+                                     "scatter_sweeps": 4,
+                                     "energy_anderson": 1,
+                                     "inner_fixed_relaxations": 1})
+    np.testing.assert_allclose(
+        accelerated.power, plain.power, rtol=2e-9, atol=2e-12)
+    np.testing.assert_allclose(
+        accelerated.flux_numpy, plain.flux_numpy, rtol=2e-9, atol=2e-12)
+    np.testing.assert_allclose(
+        reduction_free.power, plain.power, rtol=2e-9, atol=2e-12)
 
 
 def test_monolithic_step_options_fail_fast():

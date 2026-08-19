@@ -113,6 +113,9 @@ pip install -e .[cuda12]        # + CuPy for CUDA 12.x GPUs
 - **[Latest GPU Colab](notebooks/colab_coupled_transient_gpu_latest.ipynb)** —
   executable coverage of the current tri-grid and coupled-transient features,
   including an optional one-minute 3-D HP-MR workload.
+- **[3-D HP-MR adaptive-BDF GPU gate](notebooks/colab_hpmr3d_adaptive_bdf_gpu.ipynb)** —
+  fine-BE accuracy reference, matched adaptive-BE/BDF performance, GPU-kernel
+  microbenchmarks, phase/work counters, and downloadable result artifacts.
 - **[Quasi-static acceleration plan](docs/quasistatic_acceleration_plan.md)** —
   implemented fixed/adiabatic/IQS paths, residual-triggered fallback, GPU
   architecture, validation gates, and performance targets for long coupled
@@ -453,7 +456,10 @@ print(res.power)   # P(t)/P(0)
 direct = TransientSolver(prob.grid, prob.problem_at, prob.kinetics,
                          bc=prob.bc, device="cpu").solve(
                              t_end=0.5, dt=1e-3,
-                             step_solver="monolithic")
+                             step_solver="monolithic",
+                             multigroup_kwargs={"scatter_sweeps": 3,
+                                                "energy_anderson": 1,
+                                                "inner_rtol": 0.1})
 
 # CPU-validated high-order path. An explicit sequence of widths enables
 # nonuniform BDF; restart at known discontinuities so history cannot span them.
@@ -467,10 +473,15 @@ print(bdf.time_orders)
 BDF ramps from first order as history becomes available. Orders 3--6 are
 A(alpha)-stable rather than A-stable and remain opt-in. Explicit nonuniform
 step schedules and event-triggered history restart are implemented and tested.
-An experimental monolithic BDF2--BDF6 path also performs error-controlled
-width acceptance/rejection with full neutron-history rollback and telemetry;
-its error norm is flux-only and its order is not yet automatically selected,
-so explicit schedules remain the production default.
+An experimental monolithic BDF1--BDF6 path also performs error-controlled
+width acceptance/rejection with full neutron, precursor, and coupled-state
+rollback and telemetry. Optional `q-1/q/q+1` selection chooses the candidate
+with the largest safe next width; the corrected LRA CPU benchmark shows a
+5.18x matched-error speedup over adaptive backward Euler. An opt-in
+error-scaled rejection rule (capped at a factor-two retry) reduces
+practical-tolerance LRA solver work by another 5.6%; the paper-faithful preset
+retains factor-two rejection. Explicit schedules
+remain the production default until the HP-MR and GPU gates are complete.
 The same nonuniform history now supplies a polynomial endpoint predictor for
 state-dependent feedback; on the LRA prompt-supercritical test this removes
 the catastrophic one-step Doppler lag without adding another spatial solve.
@@ -489,7 +500,7 @@ point-kinetics reference:
 | **2D TWIGL** ramp | P(0.1), P(0.5) vs literature 1.31, 2.11 | 1.308, 2.109 |
 | **3D Langenbuch (LMW)** rod-bank transient | peak power / time vs reference ≈1.6 @ ≈21 s | 1.61 @ 21 s |
 | **ANL-7416 Problem 8-A1** (2D r-z, 6 precursor families) | initial k vs book 0.86690/0.86705; Exhibit A power trace | k to 75 pcm (coarse) / ~40 pcm (refined); ramp phase < 3%, tail within the documented discretization band |
-| **LRA-2D** BWR rod withdrawal with adiabatic/Doppler feedback | original map/data audit; raw rods-in/out k and coupled peak history | rods-in +19 pcm; rods-out −377 pcm on 3.75 cm FV; fully implicit BDF reproduction in progress |
+| **LRA-2D** BWR rod withdrawal with adiabatic/Doppler feedback | original map/data audit; raw rods-in/out k and coupled peak history | reflector erratum resolved; 3.75 cm FV endpoints −10/−64 pcm and transient metrics within 3.5% of ANL |
 
 (TWIGL at the converged `cells_per_8cm=4` mesh, `dt=1e-3`.)
 
@@ -503,15 +514,18 @@ worth by ~5%, as re-deriving that scheme shows — see
 erratum in the book), so the eigenvalue is validated tightly and the
 excursion tail within a quantified band.
 
-`ndgpu.benchmarks.build_lra2d` and `run_lra2d_cpu` expose the LRA-2D model and
-its physical power/temperature histories. The current checkpoint uses the
-monolithic multigroup step because group fixed-point iteration fails through
-the prompt-supercritical peak. The refined rods-in eigenvalue is within 19 pcm,
-but the raw rods-out value is 377 pcm low and the fully coupled transient does
-not yet meet the published reference envelope, so the detailed
-[CPU checkpoint](benchmark-results/lra2d-bdf-cpu/README.md) reports both the
-improvements and the remaining mismatch rather than presenting it as a
-validation result.
+`ndgpu.benchmarks.build_lra2d`, `lra2d_static_keff`, and `run_lra2d_cpu`
+expose the LRA-2D static endpoints and physical power/temperature histories.
+The audit found that Cherezov Table 4 prints both reflector absorptions one
+decade too high. Restoring the original ANL/DIF3D values and the specified
+axial buckling resolves the former rods/control discrepancy: at 3.75 cm the
+raw endpoint errors are -10 and -64 pcm, and the fully coupled transient's six
+power/temperature metrics are within 3.5% of the original reference. See the
+detailed [CPU benchmark](benchmark-results/lra2d-bdf-cpu/README.md).
+The consolidated eight-page
+[adaptive-BDF LRA report](benchmark-results/lra2d-adaptive-bdf-report/adaptive-bdf-lra-benchmark.pdf)
+compares directly with the original ANL reference data and includes complete
+controller histories and a matched-error backward-Euler performance study.
 
 ## Neutron noise (frequency domain)
 

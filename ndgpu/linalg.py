@@ -25,6 +25,7 @@ import inspect
 import numpy as np
 
 from . import kernels
+from .backend import asnumpy
 
 
 @dataclass
@@ -100,6 +101,59 @@ class PCGWorkspace:
                     or value.shape != template.shape
                     or value.dtype != template.dtype):
                 raise ValueError("PCG fallback workspace does not match the solve")
+
+
+@dataclass
+class FGMRESWorkspace:
+    """Persistent storage for repeated same-shaped flexible GMRES solves.
+
+    The contiguous ``V`` and ``Z`` arrays make GPU Arnoldi projections a
+    matrix-vector reduction instead of one host-synchronizing dot product per
+    stored vector.  Allocating the maximum restart basis once also avoids
+    repeatedly growing and releasing two lists of large device arrays at every
+    adaptive step attempt.
+    """
+
+    x: object
+    r: object
+    w: object
+    V: object
+    Z: object
+    restart: int
+    operator_out: bool = False
+
+    @classmethod
+    def like(cls, template, restart=30, *, operator_out=False):
+        restart = int(restart)
+        if restart < 1:
+            raise ValueError("restart must be positive")
+        xp = kernels.module_of(template)
+        shape = tuple(template.shape)
+        return cls(
+            xp.empty_like(template), xp.empty_like(template),
+            xp.empty_like(template),
+            xp.empty((restart + 1,) + shape, dtype=template.dtype),
+            xp.empty((restart,) + shape, dtype=template.dtype),
+            restart, bool(operator_out))
+
+    def validate(self, template, restart):
+        xp = kernels.module_of(template)
+        if int(restart) > self.restart:
+            raise ValueError("FGMRES workspace restart capacity is too small")
+        for name in ("x", "r", "w"):
+            value = getattr(self, name)
+            if (kernels.module_of(value) is not xp
+                    or value.shape != template.shape
+                    or value.dtype != template.dtype):
+                raise ValueError(f"FGMRES workspace {name} is incompatible")
+        expected = tuple(template.shape)
+        if (kernels.module_of(self.V) is not xp
+                or self.V.shape[1:] != expected
+                or self.V.dtype != template.dtype
+                or kernels.module_of(self.Z) is not xp
+                or self.Z.shape[1:] != expected
+                or self.Z.dtype != template.dtype):
+            raise ValueError("FGMRES basis workspace is incompatible")
 
 
 def pcg_workspaces(operators, templates, *, fallback=False):
@@ -499,6 +553,81 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
     return x, maxiter
 
 
+def fixed_pcg(apply_A, b, x0, inv_diag, xp, iterations=1, precond=None,
+              workspace=None):
+    """Apply a fixed number of PCG steps without convergence synchronization.
+
+    This is an inexact-preconditioner primitive, not a standalone converged
+    solve.  Flexible GMRES supplies the true outer residual test.  Keeping the
+    PCG work fixed means every recurrence coefficient remains a zero-dimensional
+    device scalar and no per-group value is transferred to the host.  Tiny
+    denominator regularization makes an already-exact warm start a no-op.
+
+    Returns ``(x, iterations)`` with the requested deterministic work count.
+    """
+    iterations = int(iterations)
+    if iterations < 0:
+        raise ValueError("fixed PCG iterations must be non-negative")
+    M = precond if precond is not None else (lambda r: inv_diag * r)
+
+    if workspace is None:
+        x = x0.copy()
+        r = b - apply_A(x)
+        z_buf = p_buf = ap_buf = None
+    else:
+        workspace.validate(x0)
+        x, r = workspace.x, workspace.r
+        z_buf, p_buf, ap_buf = workspace.z, workspace.p, workspace.ap
+        if x0 is not x:
+            xp.copyto(x, x0)
+        if workspace.operator_out:
+            apply_A(x, out=ap_buf)
+        else:
+            xp.copyto(ap_buf, apply_A(x))
+        xp.subtract(b, ap_buf, out=r)
+    if iterations == 0:
+        return x, 0
+
+    def apply_preconditioner(source, out=None):
+        if out is None:
+            return M(source)
+        if precond is None:
+            xp.multiply(inv_diag, source, out=out)
+            return out
+        if getattr(precond, "ndgpu_out", False):
+            kwargs = ({"scratch": ap_buf}
+                      if getattr(precond, "ndgpu_scratch", False) else {})
+            return precond(source, out=out, **kwargs)
+        xp.copyto(out, precond(source))
+        return out
+
+    z = apply_preconditioner(r, z_buf)
+    if workspace is None:
+        p = z.copy()
+    else:
+        xp.copyto(p_buf, z)
+        p = p_buf
+    rz = kernels.dot(xp, r, z)
+    tiny = np.finfo(b.dtype).tiny
+    for step in range(iterations):
+        if workspace is None:
+            ap = apply_A(p)
+        elif workspace.operator_out:
+            ap = apply_A(p, out=ap_buf)
+        else:
+            xp.copyto(ap_buf, apply_A(p))
+            ap = ap_buf
+        alpha = rz / (kernels.dot(xp, p, ap) + tiny)
+        kernels.cg_update(xp, x, r, p, ap, alpha)
+        if step + 1 == iterations:
+            break
+        z = apply_preconditioner(r, z_buf)
+        rz_new = kernels.dot(xp, r, z)
+        kernels.cg_direction(xp, p, z, rz_new / (rz + tiny))
+        rz = rz_new
+    return x, iterations
+
+
 def gmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
           precond=None, restart=30, raise_on_fail=True):
     """Solve A x = b with restarted, right-preconditioned GMRES(m).
@@ -586,8 +715,111 @@ def gmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
     return x, it
 
 
+def _fgmres_workspace_solve(apply_A, b, x0, xp, M, *, rtol, atol,
+                            maxiter, restart, raise_on_fail, workspace):
+    """Allocation-stable FGMRES implementation used when storage is supplied."""
+    workspace.validate(x0, restart)
+    x, r, w = workspace.x, workspace.r, workspace.w
+    V, Z = workspace.V, workspace.Z
+
+    def apply_operator(value, out):
+        if workspace.operator_out:
+            return apply_A(value, out=out)
+        xp.copyto(out, apply_A(value))
+        return out
+
+    def apply_preconditioner(value, out):
+        if getattr(M, "ndgpu_out", False):
+            return M(value, out=out)
+        xp.copyto(out, M(value))
+        return out
+
+    def norm(value):
+        return float(xp.sqrt(kernels.dot(xp, value, value)))
+
+    xp.copyto(x, x0)
+    stop = max(float(rtol) * norm(b), float(atol))
+    apply_operator(x, w)
+    xp.subtract(b, w, out=r)
+    res = norm(r)
+    if res <= stop:
+        return x, 0
+
+    it = 0
+    while it < maxiter:
+        m = min(restart, maxiter - it)
+        xp.multiply(r, 1.0 / res, out=V[0])
+        H = np.zeros((m + 1, m))
+        cs, sn = np.zeros(m), np.zeros(m)
+        g = np.zeros(m + 1)
+        g[0] = res
+        k = 0
+        for j in range(m):
+            it += 1
+            apply_preconditioner(V[j], Z[j])
+            apply_operator(Z[j], w)
+            if kernels.is_cupy(xp):
+                # Two-pass classical Gram--Schmidt (CGS2) retains MGS-level
+                # orthogonality, but both projection passes remain on device.
+                basis = V[:j + 1].reshape(j + 1, -1)
+                flat_w = w.reshape(-1)
+                h1 = basis @ flat_w
+                kernels.basis_accumulate(
+                    xp, w, V, h1, j + 1, alpha=-1.0)
+                h2 = basis @ flat_w
+                kernels.basis_accumulate(
+                    xp, w, V, h2, j + 1, alpha=-1.0)
+                h_device = h1 + h2
+                wnorm = xp.sqrt(kernels.dot(xp, w, w))
+                packed = xp.concatenate((h_device, wnorm.reshape(1)))
+                host = asnumpy(packed)  # one host synchronization per Arnoldi step
+                H[:j + 1, j] = host[:-1]
+                H[j + 1, j] = float(host[-1])
+            else:
+                # Preserve modified Gram--Schmidt on CPU, where scalar access
+                # does not synchronize a device and small BLAS calls cost more.
+                for i in range(j + 1):
+                    H[i, j] = float(kernels.dot(xp, V[i], w))
+                    kernels.axpy_inplace(xp, w, V[i], -H[i, j])
+                H[j + 1, j] = norm(w)
+            breakdown = H[j + 1, j] <= 1e-300
+            if not breakdown:
+                xp.multiply(w, 1.0 / H[j + 1, j], out=V[j + 1])
+            for i in range(j):
+                h0, h1_host = H[i, j], H[i + 1, j]
+                H[i, j] = cs[i] * h0 + sn[i] * h1_host
+                H[i + 1, j] = -sn[i] * h0 + cs[i] * h1_host
+            denom = float(np.hypot(H[j, j], H[j + 1, j]))
+            if denom == 0.0:
+                cs[j], sn[j] = 1.0, 0.0
+            else:
+                cs[j] = H[j, j] / denom
+                sn[j] = H[j + 1, j] / denom
+            H[j, j], H[j + 1, j] = denom, 0.0
+            g[j + 1] = -sn[j] * g[j]
+            g[j] = cs[j] * g[j]
+            k = j + 1
+            if abs(g[k]) <= stop or breakdown:
+                break
+
+        y = np.linalg.solve(H[:k, :k], g[:k])
+        y_device = xp.asarray(y, dtype=x.dtype)
+        kernels.basis_accumulate(xp, x, Z, y_device, k)
+        apply_operator(x, w)
+        xp.subtract(b, w, out=r)
+        res = norm(r)
+        if res <= stop:
+            return x, it
+    if raise_on_fail:
+        raise RuntimeError(
+            f"FGMRES failed to converge in {it} applies "
+            f"(residual {res:.3e}, target {stop:.3e})")
+    return x, it
+
+
 def fgmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0,
-           maxiter=5000, precond=None, restart=30, raise_on_fail=True):
+           maxiter=5000, precond=None, restart=30, raise_on_fail=True,
+           workspace=None):
     """Solve a real non-symmetric system with flexible restarted GMRES.
 
     This has the same public signature and true-residual stopping rule as
@@ -599,7 +831,9 @@ def fgmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0,
     PCG iteration count can change from one Arnoldi vector to the next.
 
     ``inv_diag`` supplies the default Jacobi preconditioner for interface
-    compatibility.  Returns ``(x, n_iterations)``, counting operator applies.
+    compatibility. ``workspace`` may be an :class:`FGMRESWorkspace`; on GPU
+    this also batches all Arnoldi projections into one host synchronization per
+    iteration. Returns ``(x, n_iterations)``, counting operator applies.
     """
     dot = lambda u, v: float(xp.sum(u * v))
     norm = lambda u: float(xp.sqrt(xp.sum(u * u)))
@@ -608,6 +842,11 @@ def fgmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0,
     restart = int(restart)
     if restart < 1:
         raise ValueError("restart must be positive")
+    if workspace is not None:
+        return _fgmres_workspace_solve(
+            apply_A, b, x0, xp, M, rtol=rtol, atol=atol,
+            maxiter=maxiter, restart=restart, raise_on_fail=raise_on_fail,
+            workspace=workspace)
     x = x0.copy()
     stop = max(rtol * norm(b), atol)
     r = b - apply_A(x)
