@@ -1,0 +1,108 @@
+{
+  "case": {
+    "refine": 1,
+    "dt_s": 1e-06,
+    "bdf_order": 5,
+    "coupling": "implicit-bdf5-cell",
+    "axial_buckling": true,
+    "control_worth_scale": 1.0,
+    "adaptive_rtol": 1e-05,
+    "cherezov_controls": false,
+    "static_endpoints": true,
+    "automatic_order_selection": true,
+    "spatial_discretization": "cell-centred finite volume"
+  },
+  "ndgpu": {
+    "k0": 1.003891222039794,
+    "rods_in": 1.003891222039794,
+    "solve_seconds": 17.65401633293368,
+    "steps": 469,
+    "fgmres_applications": 13087,
+    "accepted_fgmres_applications": 12151,
+    "rejected_fgmres_applications": 936,
+    "inner_iterations": 99876,
+    "feedback_iterations": 517,
+    "accepted_feedback_iterations": 471,
+    "rejected_feedback_iterations": 46,
+    "max_feedback_iterations": 2,
+    "rejected_steps": 27,
+    "min_step_s": 1e-06,
+    "max_step_s": 0.1,
+    "mean_step_s": 0.006396588486140723,
+    "order_counts": {
+      "1": 16,
+      "2": 9,
+      "3": 11,
+      "4": 29,
+      "5": 404
+    },
+    "next_order_counts": {
+      "1": 14,
+      "2": 9,
+      "3": 11,
+      "4": 29,
+      "5": 406
+    },
+    "first_peak_time_s": 1.3023410384183627,
+    "first_peak_power_w_cm3": 5972.865794141073,
+    "second_peak_power_w_cm3": 1028.4742943653962,
+    "power_at_3s_w_cm3": 112.79205268806498,
+    "mean_temperature_at_3s_k": 1354.0819883261365,
+    "peak_temperature_at_3s_k": 4437.96112664328,
+    "peak_cell_temperature_at_3s_k": 4437.96112664328,
+    "rods_out": 1.028260895464134
+  },
+  "anl_reference": {
+    "rods_in": 0.99633,
+    "rods_out": 1.01546,
+    "first_peak_time_s": 1.436,
+    "first_peak_power_w_cm3": 5411.0,
+    "second_peak_power_w_cm3": 784.0,
+    "power_at_3s_w_cm3": 96.2,
+    "mean_temperature_at_3s_k": 1087.0,
+    "peak_temperature_at_3s_k": 2948.0
+  },
+  "cherezov_femcore": {
+    "rods_in": 0.99639,
+    "rods_out": 1.0155,
+    "first_peak_time_s": 1.439,
+    "first_peak_power_w_cm3": 5641.0,
+    "second_peak_power_w_cm3": 820.0,
+    "power_at_3s_w_cm3": 98.7,
+    "mean_temperature_at_3s_k": 1122.0,
+    "peak_temperature_at_3s_k": 3068.0
+  },
+  "cherezov_fem_order_1": {
+    "first_peak_time_s": 1.352,
+    "first_peak_power_w_cm3": 5820.0,
+    "second_peak_power_w_cm3": 854.0,
+    "power_at_3s_w_cm3": 109.9
+  },
+  "relative_difference_vs_anl": {
+    "rods_in": 0.007589073941157974,
+    "rods_out": 0.012606006602065936,
+    "first_peak_time_s": -0.09307727129640478,
+    "first_peak_power_w_cm3": 0.1038376998967054,
+    "second_peak_power_w_cm3": 0.3118294570987196,
+    "power_at_3s_w_cm3": 0.17247456016699564,
+    "mean_temperature_at_3s_k": 0.24570560103600417,
+    "peak_temperature_at_3s_k": 0.5054142220635279
+  },
+  "relative_difference_vs_cherezov_femcore": {
+    "rods_in": 0.007528399562213566,
+    "rods_out": 0.012566120594912689,
+    "first_peak_time_s": -0.09496800665853883,
+    "first_peak_power_w_cm3": 0.05883102182965306,
+    "second_peak_power_w_cm3": 0.2542369443480441,
+    "power_at_3s_w_cm3": 0.14277662297938176,
+    "mean_temperature_at_3s_k": 0.20684669191277766,
+    "peak_temperature_at_3s_k": 0.4465323098576533
+  },
+  "relative_difference_vs_cherezov_fem_order_1": {
+    "first_peak_time_s": -0.03673000116985015,
+    "first_peak_power_w_cm3": 0.026265600367881944,
+    "second_peak_power_w_cm3": 0.2043024524184967,
+    "power_at_3s_w_cm3": 0.0263153110833938
+  },
+  "comparison_note": "refine=1 FV is a low-order spatial comparison and should be read against the paper's FEM-order ladder; refine>1 is a FV mesh convergence study, not a reproduction of fourth-order FEM. The JSON order counts expose automatic q-1/q/q+1 behavior."
+}
