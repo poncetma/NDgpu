@@ -43,7 +43,8 @@ import numpy as np
 
 from ndgpu import NoiseSolver, NoiseSource
 from ndgpu.benchmarks.hpmr import (build_hpmr2d, hpmr_raster, PITCH, FUEL,
-                                   _FUEL_SITES, _BE_SITES, _DRUM_SITES)
+                                   HPMR_FUEL_SITES, HPMR_BE_SITES,
+                                   HPMR_DRUM_SITES)
 from ndgpu.hexraster import rasterize_hex_sites
 
 refine = int(sys.argv[1]) if len(sys.argv) > 1 else 4
@@ -65,17 +66,17 @@ act = np.asarray(p.active)
 # Re-rasterize the SAME site set (identical frame) with each fuel assembly given
 # a unique id 1..N and every other site a single "other" bucket, so asm_map is
 # cell-aligned with the material map: asm_map == a+1 selects assembly a's cells.
-N_ASM = len(_FUEL_SITES)
+N_ASM = len(HPMR_FUEL_SITES)
 OTHER = N_ASM + 1
 site_asm = {(0, 0): OTHER}
-site_asm.update({s: i + 1 for i, s in enumerate(_FUEL_SITES)})
-site_asm.update({s: OTHER for s in _BE_SITES})
-site_asm.update({s: OTHER for s in _DRUM_SITES})
+site_asm.update({s: i + 1 for i, s in enumerate(HPMR_FUEL_SITES)})
+site_asm.update({s: OTHER for s in HPMR_BE_SITES})
+site_asm.update({s: OTHER for s in HPMR_DRUM_SITES})
 asm_map = rasterize_hex_sites(site_asm, PITCH, refine).material_map
 assert asm_map.shape == mmap.shape, "assembly map must align with material map"
 assert np.array_equal((asm_map >= 1) & (asm_map <= N_ASM), fuel), \
     "assembly cells must be exactly the fuel cells"
-raster = hpmr_raster(refine, np.full(len(_DRUM_SITES), angle))   # for cell geometry
+raster = hpmr_raster(refine, np.full(len(HPMR_DRUM_SITES), angle))  # cell geometry
 
 REF_ASM = 1                      # reference assembly for the "local detector"
 ref_cells = asm_map == REF_ASM

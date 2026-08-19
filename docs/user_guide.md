@@ -459,11 +459,12 @@ subsweeps. On the 11-group 2-D HP-MR gate it reduced inner work by 17--21% and
 CPU solve time by 13--18% at the conservative `inner_rtol=1e-3`. Because
 FGMRES tests the true outer residual, an inexact `inner_rtol=0.1` is both safe
 and substantially faster on that CPU gate. The T4 result has the opposite
-ranking: tolerance-based Anderson is 1.53x slower than plain group PCG. For the
-current GPU experiment use four sweeps with `energy_anderson=1` and
-`inner_fixed_relaxations=1`; its reduction-free short gate is 1.47x faster
-than plain PCG. Keep both backend-specific configurations explicit until the
-full 3-D fixed-polynomial run and other reactor libraries are measured.
+ranking. A three-sample interleaved T4 gate gives median times of 2.310 s for
+plain group PCG, 2.620 s for tolerance-based Anderson, and 2.098 s for the
+reduction-free polynomial configuration. For the current GPU experiment use
+four sweeps with `energy_anderson=1` and `inner_fixed_relaxations=1`; its 1.101x
+gain over plain PCG is accepted as an opt-in result. Keep the CPU and GPU
+configurations explicit until other devices and reactor libraries are measured.
 
 The diffusion solver also supports constant- or explicitly nonuniform-step
 BDF1--BDF6 on both in-step solver paths:

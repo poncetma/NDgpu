@@ -69,6 +69,13 @@ _DRUM_SITES = [
     (2, 2), (4, -2), (2, -4), (-2, -2), (-4, 2), (-2, 4),
 ]
 
+# Stable public geometry metadata for examples and downstream diagnostics.
+# Keep the private lists for compatibility with the internal raster builders,
+# but expose immutable tuples so example code does not depend on internals.
+HPMR_FUEL_SITES = tuple(_FUEL_SITES)
+HPMR_BE_SITES = tuple(_BE_SITES)
+HPMR_DRUM_SITES = tuple(_DRUM_SITES)
+
 # material_map indices; keep in sync with _placeholder_materials().
 VOID, FUEL, CENTRAL, BE_REFLECTOR, DRUM_BE, DRUM_ABSORBER, AXIAL_REFLECTOR = range(7)
 MATERIAL_NAMES = ("void", "fuel", "central", "be_reflector", "drum_be",
@@ -201,6 +208,16 @@ def _placeholder_materials(three_d: bool = False) -> list:
         mats.append(mat("axial_reflector", [0.60, 0.45], [0.0006, 0.0012],
                         s12=0.055))
     return mats
+
+
+def hpmr_placeholder_materials(three_d: bool = False) -> list:
+    """Return the illustrative HP-MR material set used by simple examples.
+
+    The constants exercise geometry and solver behavior; they are not a
+    predictive reactor library. Prefer :func:`hpmr_materials_builtin` for the
+    vendored 11-group benchmark data.
+    """
+    return _placeholder_materials(three_d=three_d)
 
 
 def _drum_geometry(drum_angle_deg):

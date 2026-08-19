@@ -34,7 +34,8 @@ import numpy as np
 
 from ndgpu import NoiseSolver, NoiseSource
 from ndgpu.benchmarks.hpmr import (build_hpmr2d, hpmr_raster, PITCH, FUEL,
-                                   _FUEL_SITES, _BE_SITES, _DRUM_SITES)
+                                   HPMR_FUEL_SITES, HPMR_BE_SITES,
+                                   HPMR_DRUM_SITES)
 from ndgpu.hexraster import rasterize_hex_sites, hex_site_xy
 
 f_hz = float(sys.argv[1]) if len(sys.argv) > 1 else 10.0
@@ -46,8 +47,9 @@ w = 2.0 * np.pi * f_hz
 
 # --- geometry: assembly ids (fuel) and detector ids (reflector), cell-aligned -
 p = build_hpmr2d(refine=refine, drum_angle_deg=180.0)
-N, D = len(_FUEL_SITES), len(_BE_SITES)
-allsites = {(0, 0)} | set(_FUEL_SITES) | set(_BE_SITES) | set(_DRUM_SITES)
+N, D = len(HPMR_FUEL_SITES), len(HPMR_BE_SITES)
+allsites = ({(0, 0)} | set(HPMR_FUEL_SITES) | set(HPMR_BE_SITES)
+            | set(HPMR_DRUM_SITES))
 
 
 def id_map(sites, base):
@@ -57,10 +59,11 @@ def id_map(sites, base):
     return rasterize_hex_sites(d, PITCH, refine).material_map
 
 
-asm = id_map(_FUEL_SITES, 1)                        # asm == j+1 -> assembly j's cells
-det = id_map(_BE_SITES, 1)                          # det == d+1 -> detector d's cells
+asm = id_map(HPMR_FUEL_SITES, 1)                    # asm == j+1 -> assembly j's cells
+det = id_map(HPMR_BE_SITES, 1)                      # det == d+1 -> detector d's cells
 raster = hpmr_raster(refine, np.zeros(D))           # cell geometry for plotting
-fuel_r = np.array([np.hypot(*hex_site_xy(R, C, PITCH)) for (R, C) in _FUEL_SITES])
+fuel_r = np.array([np.hypot(*hex_site_xy(R, C, PITCH))
+                   for (R, C) in HPMR_FUEL_SITES])
 
 ns = NoiseSolver(p.grid, p.materials, p.material_map, kinetics=p.kinetics, bc=p.bc,
                  active=p.active, mask_bc=p.mask_bc, mix_material=p.mix_material,
@@ -156,14 +159,15 @@ try:
                     verts.append(raster.cell_vertices(a, b, t))
                     keep.append((a, b, t))
     keep_idx = tuple(np.array(keep).T)
-    det_xy = [np.mean([hex_site_xy(*_BE_SITES[d], PITCH)], axis=0)[0] for d in range(D)]
+    det_xy = [np.mean([hex_site_xy(*HPMR_BE_SITES[d], PITCH)], axis=0)[0]
+              for d in range(D)]
 
     def paint(ax, cellvals, title, cmap, detector=None):
         pc = PolyCollection(verts, array=cellvals[keep_idx], cmap=cmap)
         pc.set_clim(0, np.percentile(cellvals[keep_idx], 99.5))
         ax.add_collection(pc)
         if detector is not None:
-            x, y = hex_site_xy(*_BE_SITES[detector], PITCH)
+            x, y = hex_site_xy(*HPMR_BE_SITES[detector], PITCH)
             ax.plot(x, y, "c*", ms=18, mec="k")
         ax.autoscale_view(); ax.set_aspect("equal"); ax.axis("off"); ax.set_title(title)
         fig.colorbar(pc, ax=ax, fraction=0.046, pad=0.02)
@@ -185,7 +189,7 @@ try:
         pc = PolyCollection(verts, array=cells[keep_idx], cmap="inferno")
         pc.set_clim(np.percentile(s, 5), 1.0)
         ax.add_collection(pc)
-        cx, cy = hex_site_xy(*_FUEL_SITES[jt], PITCH)
+        cx, cy = hex_site_xy(*HPMR_FUEL_SITES[jt], PITCH)
         ax.plot(cx, cy, "co", ms=13, mfc="none", mew=2.5)
         ax.autoscale_view(); ax.set_aspect("equal"); ax.axis("off")
         ax.set_title(f"localization score, {label} fault\n(circle = true; f={f_hz} Hz)")

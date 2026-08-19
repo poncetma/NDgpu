@@ -32,7 +32,8 @@ import numpy as np
 
 from ndgpu import NoiseSolver
 from ndgpu.benchmarks.hpmr import (build_hpmr2d, PITCH, FUEL,
-                                   _FUEL_SITES, _BE_SITES, _DRUM_SITES)
+                                   HPMR_FUEL_SITES, HPMR_BE_SITES,
+                                   HPMR_DRUM_SITES)
 from ndgpu.hexraster import rasterize_hex_sites, hex_site_xy
 
 f_hz = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
@@ -44,8 +45,9 @@ w = 2.0 * np.pi * f_hz
 
 p = build_hpmr2d(refine=refine, drum_angle_deg=180.0)
 mmap = np.asarray(p.material_map)
-N, D = len(_FUEL_SITES), len(_BE_SITES)
-allsites = {(0, 0)} | set(_FUEL_SITES) | set(_BE_SITES) | set(_DRUM_SITES)
+N, D = len(HPMR_FUEL_SITES), len(HPMR_BE_SITES)
+allsites = ({(0, 0)} | set(HPMR_FUEL_SITES) | set(HPMR_BE_SITES)
+            | set(HPMR_DRUM_SITES))
 
 
 def id_map(sites, base):
@@ -55,10 +57,10 @@ def id_map(sites, base):
     return rasterize_hex_sites(d, PITCH, refine).material_map
 
 
-asm = id_map(_FUEL_SITES, 1)
-det = id_map(_BE_SITES, 1)
+asm = id_map(HPMR_FUEL_SITES, 1)
+det = id_map(HPMR_BE_SITES, 1)
 is_fuel = mmap == FUEL
-xy = np.array([hex_site_xy(R, C, PITCH) for (R, C) in _FUEL_SITES])
+xy = np.array([hex_site_xy(R, C, PITCH) for (R, C) in HPMR_FUEL_SITES])
 fuel_r = np.hypot(xy[:, 0], xy[:, 1])
 ring_of = np.array([int(np.argmin(np.abs(np.unique(np.round(fuel_r)) - r))) for r in fuel_r])
 theta = np.arctan2(xy[:, 1], xy[:, 0]) % (2 * np.pi)

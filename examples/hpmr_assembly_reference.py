@@ -35,7 +35,7 @@ import numpy as np
 
 from ndgpu import TriDiffusionEigenSolver, flux_weighted_homogenize
 from ndgpu.benchmarks.hpmr import (build_hpmr2d, hpmr_materials_builtin,
-                                   _FUEL_SITES, PITCH)
+                                   HPMR_FUEL_SITES, PITCH)
 from ndgpu.benchmarks.hpmr_assembly import (build_hpmr_assembly2d, pin_fluxes,
                                             pin_materials_builtin, pin_powers)
 from ndgpu.hexraster import hex_site_xy
@@ -91,7 +91,7 @@ c = TriDiffusionEigenSolver(core.grid, core.materials, core.material_map,
 print(f"Core (drums {drum_deg:.0f} deg): k_eff = {c.k_eff:.6f}")
 
 # --- 4. reconstruct pin power over every fuel assembly ------------------------
-sites = np.array([hex_site_xy(R, C, PITCH) for R, C in _FUEL_SITES])
+sites = np.array([hex_site_xy(R, C, PITCH) for R, C in HPMR_FUEL_SITES])
 centres = p.pin_centres - p.pin_centres.mean(axis=0)
 pw, xy = reconstruct_pin_powers(core.raster, c.flux_numpy, core.materials,
                                 core.material_map, sites, centres, form,
