@@ -1,0 +1,78 @@
+{
+  "uncoupled_11_group_slow_symmetric": {
+    "fine_backward_euler": {
+      "steps": 64,
+      "inner_iterations": 113363,
+      "fgmres_applications": 1341,
+      "seconds": 23.405
+    },
+    "adaptive_backward_euler_rtol_1e-3": {
+      "accepted_steps": 29,
+      "rejected_steps": 8,
+      "inner_iterations": 69155,
+      "fgmres_applications": 822,
+      "seconds": 14.742920207092538,
+      "max_power_relative_error": 0.0002790641343665552,
+      "final_flux_relative_error": 0.00011600102124659724
+    },
+    "automatic_bdf5_rtol_1e-3": {
+      "accepted_steps": 29,
+      "rejected_steps": 9,
+      "inner_iterations": 71143,
+      "fgmres_applications": 846,
+      "seconds": 14.632833844050765,
+      "max_power_relative_error": 0.00020994286808819125,
+      "final_flux_relative_error": 0.000035188374282492426,
+      "order_counts": {"1": 23, "2": 6}
+    },
+    "fixed_maximum_bdf5_rtol_1e-3": {
+      "accepted_steps": 42,
+      "rejected_steps": 7,
+      "inner_iterations": 87723,
+      "seconds": 17.432214431930333,
+      "max_power_relative_error": 0.0001279636795752008,
+      "order_counts": {"1": 4, "2": 4, "3": 4, "4": 4, "5": 26}
+    }
+  },
+  "coupled_2_group_feedback_stress": {
+    "thermal_mass_scale": 0.005,
+    "adaptive_backward_euler": {
+      "accepted_steps": 17,
+      "rejected_steps": 4,
+      "inner_iterations": 5625,
+      "seconds": 0.9991250520106405,
+      "max_power_relative_error": 0.00013884767119478743,
+      "max_mean_temperature_error_k": 0.01185324209995997
+    },
+    "automatic_bdf5": {
+      "accepted_steps": 18,
+      "rejected_steps": 4,
+      "inner_iterations": 5800,
+      "seconds": 1.0556640359573066,
+      "max_power_relative_error": 0.00017618866432863656,
+      "max_mean_temperature_error_k": 0.012932695659628735,
+      "order_counts": {"1": 17, "2": 1}
+    }
+  },
+  "coupled_11_group_physical_thermal_mass": {
+    "fine_backward_euler_steps": 64,
+    "fine_backward_euler_seconds": 21.594892404042184,
+    "adaptive_backward_euler": {
+      "accepted_steps": 29,
+      "rejected_steps": 8,
+      "inner_iterations": 69171,
+      "seconds": 13.575878405943513,
+      "max_power_relative_error": 0.0002782829537991463,
+      "max_mean_temperature_error_k": 0.00012737396014017577
+    },
+    "automatic_bdf5": {
+      "accepted_steps": 29,
+      "rejected_steps": 9,
+      "inner_iterations": 70951,
+      "seconds": 14.28901013196446,
+      "max_power_relative_error": 0.00020820417781444115,
+      "max_mean_temperature_error_k": 0.00013228550028543395,
+      "order_counts": {"1": 23, "2": 6}
+    }
+  }
+}

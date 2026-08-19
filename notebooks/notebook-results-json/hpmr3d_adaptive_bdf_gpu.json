@@ -1,0 +1,226 @@
+{
+  "environment": {
+    "gpu": "Tesla T4",
+    "cupy": "14.0.1",
+    "python": "3.12.13",
+    "ndgpu_path": "/usr/local/lib/python3.12/dist-packages/ndgpu/__init__.py"
+  },
+  "configuration": {
+    "quick": true,
+    "refine": 2,
+    "nz": 10,
+    "active_cells": 13200,
+    "groups": 11,
+    "dof": 145200,
+    "duration_s": 0.08,
+    "control_intervals": 4,
+    "reference_steps": 32,
+    "adaptive_initial_steps": 8,
+    "adaptive_rtol": 0.001,
+    "fgmres_restart": 10,
+    "energy_anderson": 1,
+    "scatter_sweeps": 4,
+    "inner_rtol": 0.1,
+    "inner_fixed_relaxations": 1,
+    "drum_degrees": [
+      90.0,
+      94.0
+    ],
+    "coupled_steady_seconds": 44.107307055000035
+  },
+  "gpu_microbenchmark": {
+    "error_norm_legacy_ms": 14.388128280639648,
+    "error_norm_current_ms": 9.171535968780518,
+    "error_norm_speedup": 1.568780663306143,
+    "error_norm_host_syncs_legacy": 34,
+    "error_norm_host_syncs_current": 1,
+    "predictor_generic_ms": 3.9228960275650024,
+    "predictor_fused_ms": 2.8256479501724243,
+    "predictor_speedup": 1.3883173334900487
+  },
+  "energy_sweep_gpu_gate": {
+    "repeats": 3,
+    "baseline_samples": [
+      2.309770422999975,
+      2.256305860999987,
+      2.327347302000021
+    ],
+    "anderson_samples": [
+      2.6196737180000014,
+      2.5161600460000386,
+      2.905830590999983
+    ],
+    "baseline_seconds": 2.309770422999975,
+    "anderson_seconds": 2.6196737180000014,
+    "speedup": 0.8817015673094498,
+    "baseline_outer": 63,
+    "anderson_outer": 71,
+    "baseline_inner": 1944,
+    "anderson_inner": 2199
+  },
+  "reduction_free_gpu_gate": {
+    "repeats": 3,
+    "fixed_polynomial_samples": [
+      2.2745125169999483,
+      1.9115803199999846,
+      2.097882599000002
+    ],
+    "plain_tolerance_seconds": 2.309770422999975,
+    "tolerance_seconds": 2.6196737180000014,
+    "fixed_polynomial_seconds": 2.097882599000002,
+    "speedup_vs_plain": 1.1010008015229136,
+    "speedup_vs_anderson": 1.2487227451377507,
+    "tolerance_outer": 71,
+    "fixed_polynomial_outer": 83,
+    "tolerance_inner": 2199,
+    "fixed_polynomial_inner": 3652
+  },
+  "matched_adaptive_speedup": 0.9020637626966451,
+  "results": [
+    {
+      "method": "fine fixed BE",
+      "accepted": 32,
+      "rejected": 0,
+      "max_order": 1,
+      "order_counts": {
+        "1": 32
+      },
+      "march_seconds": 36.57774302400003,
+      "end_to_end_seconds": 36.599768439,
+      "fine_be_speedup": 1.0,
+      "inner_iterations": 91388,
+      "outer_iterations_including_rejects": 2077,
+      "max_power_relative_error": 0.0,
+      "max_mean_temperature_error_k": 0.0,
+      "max_peak_temperature_error_k": 0.0,
+      "final_flux_shape_l2_error": 0.0,
+      "group_batch_active": true,
+      "fgmres_workspace_mib": 61.270751953125
+    },
+    {
+      "method": "adaptive BE",
+      "accepted": 24,
+      "rejected": 7,
+      "max_order": 1,
+      "order_counts": {
+        "1": 24
+      },
+      "march_seconds": 36.05627109200003,
+      "end_to_end_seconds": 36.07526562200002,
+      "fine_be_speedup": 1.0144627249631395,
+      "inner_iterations": 90728,
+      "outer_iterations_including_rejects": 2062,
+      "max_power_relative_error": 0.00030070664193822516,
+      "max_mean_temperature_error_k": 1.657501832141861e-05,
+      "max_peak_temperature_error_k": 3.735978509666893e-05,
+      "final_flux_shape_l2_error": 1.3785891694207859e-06,
+      "group_batch_active": true,
+      "fgmres_workspace_mib": 61.270751953125
+    },
+    {
+      "method": "adaptive BDF5",
+      "accepted": 22,
+      "rejected": 9,
+      "max_order": 2,
+      "order_counts": {
+        "1": 15,
+        "2": 7
+      },
+      "march_seconds": 39.97086745200005,
+      "end_to_end_seconds": 39.98728644199997,
+      "fine_be_speedup": 0.9151100627957416,
+      "inner_iterations": 99440,
+      "outer_iterations_including_rejects": 2260,
+      "max_power_relative_error": 0.0002603634932848953,
+      "max_mean_temperature_error_k": 1.6549769270568504e-05,
+      "max_peak_temperature_error_k": 3.724724365383736e-05,
+      "final_flux_shape_l2_error": 2.7440271454034743e-07,
+      "group_batch_active": true,
+      "fgmres_workspace_mib": 61.270751953125
+    }
+  ],
+  "phases": {
+    "adaptive_be": {
+      "initial_eigen_solve": 0.210970947265625,
+      "operator_rebuild": 3.3742556381225586,
+      "power_edit": 0.007951711922883988,
+      "thermal_solve": 0.00984000015258789,
+      "feedback_update": 9.401600249111653e-05,
+      "telemetry_transfer": 0.003320192039012909,
+      "transient_total": 36.05662109375,
+      "result_transfer": 0.0001409599930047989,
+      "neutronics_solve": 32.44645254600049
+    },
+    "adaptive_bdf5": {
+      "initial_eigen_solve": 0.14784716796875,
+      "operator_rebuild": 3.412270378112793,
+      "power_edit": 0.007412480041384697,
+      "thermal_solve": 0.008226336121559144,
+      "feedback_update": 9.286399930715562e-05,
+      "telemetry_transfer": 0.0031626559495925902,
+      "transient_total": 39.97128125,
+      "result_transfer": 0.00017827199399471282,
+      "neutronics_solve": 36.38952468788624
+    }
+  },
+  "counters": {
+    "adaptive_be": {
+      "operator_rebuilds": 31,
+      "neutronics_steps": 24,
+      "thermal_steps": 4,
+      "thermal_iterations": 16,
+      "thermal_diagnostics": 0,
+      "feedback_updates": 4,
+      "telemetry_transfers": 4,
+      "result_transfers": 1,
+      "initial_eigen_outer_iterations": 339,
+      "initial_eigen_inner_iterations": 14049,
+      "initial_state_reuses": 1,
+      "coupled_steady_reuses": 1,
+      "neutron_inner_iterations": 90728,
+      "neutron_outer_iterations": 1576,
+      "neutron_rejected_outer_iterations": 486,
+      "neutron_total_outer_iterations": 2062,
+      "neutron_rejected_steps": 7,
+      "neutron_monolithic_steps": 24,
+      "neutron_fixed_point_sweeps": 1576,
+      "mixed_precision_fallbacks": 0,
+      "cuda_graph_captures": 0,
+      "cuda_graph_replays": 0,
+      "cuda_graph_errors": 0,
+      "adjoint_coarse_setups": 0,
+      "group_batch_active": 1,
+      "fgmres_workspace_bytes": 64247040,
+      "neutron_bdf_max_order": 1
+    },
+    "adaptive_bdf5": {
+      "operator_rebuilds": 31,
+      "neutronics_steps": 22,
+      "thermal_steps": 4,
+      "thermal_iterations": 16,
+      "thermal_diagnostics": 0,
+      "feedback_updates": 4,
+      "telemetry_transfers": 4,
+      "result_transfers": 1,
+      "initial_eigen_outer_iterations": 339,
+      "initial_eigen_inner_iterations": 14049,
+      "initial_state_reuses": 1,
+      "coupled_steady_reuses": 1,
+      "neutron_inner_iterations": 99440,
+      "neutron_outer_iterations": 1488,
+      "neutron_rejected_outer_iterations": 772,
+      "neutron_total_outer_iterations": 2260,
+      "neutron_rejected_steps": 9,
+      "neutron_monolithic_steps": 22,
+      "neutron_fixed_point_sweeps": 1488,
+      "mixed_precision_fallbacks": 0,
+      "cuda_graph_captures": 0,
+      "cuda_graph_replays": 0,
+      "cuda_graph_errors": 0,
+      "adjoint_coarse_setups": 0,
+      "group_batch_active": 1,
+      "fgmres_workspace_bytes": 64247040,
+      "neutron_bdf_max_order": 2
+    }
+  }
+}

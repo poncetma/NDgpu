@@ -1,0 +1,167 @@
+{
+  "provenance": {
+    "date": "2026-08-18",
+    "spatial_mesh": "3.75 cm cell-centred finite volume",
+    "feedback": "fully implicit assembly-average adiabatic/Doppler",
+    "host_note": "Intel Core i5-1145G7 development host; no CPU affinity was imposed; use iteration counts as the portable cost measures"
+  },
+  "anl_reference": {
+    "rods_in": 0.99633,
+    "rods_out": 1.01546,
+    "first_peak_time_s": 1.436,
+    "first_peak_power_w_cm3": 5411.0,
+    "second_peak_power_w_cm3": 784.0,
+    "power_at_3s_w_cm3": 96.2,
+    "mean_temperature_at_3s_k": 1087.0,
+    "peak_temperature_at_3s_k": 2948.0
+  },
+  "cherezov_femcore": {
+    "rods_in": 0.99639,
+    "rods_out": 1.01550,
+    "first_peak_time_s": 1.439,
+    "first_peak_power_w_cm3": 5641.0,
+    "second_peak_power_w_cm3": 820.0,
+    "power_at_3s_w_cm3": 98.7,
+    "mean_temperature_at_3s_k": 1122.0,
+    "peak_temperature_at_3s_k": 3068.0
+  },
+  "cherezov_performance": {
+    "source": "Cherezov et al. (2025), Tables 7 and 8",
+    "hardware": "not reported in the paper",
+    "rtol": 0.00001,
+    "fem_rows": [
+      {"order": 1, "dof": 144, "accepted": 403, "rejected": 5,
+       "nonlinear_iterations": 1038, "group_iterations": 11874,
+       "inner_matvecs": 109953, "seconds": 1.4},
+      {"order": 2, "dof": 529, "accepted": 485, "rejected": 12,
+       "nonlinear_iterations": 1276, "group_iterations": 12707,
+       "inner_matvecs": 132532, "seconds": 4.7},
+      {"order": 3, "dof": 1156, "accepted": 443, "rejected": 12,
+       "nonlinear_iterations": 1164, "group_iterations": 12504,
+       "inner_matvecs": 136966, "seconds": 12.2},
+      {"order": 4, "dof": 2025, "accepted": 399, "rejected": 7,
+       "nonlinear_iterations": 1029, "group_iterations": 11716,
+       "inner_matvecs": 140106, "seconds": 29.1},
+      {"order": 5, "dof": 3136, "accepted": 405, "rejected": 5,
+       "nonlinear_iterations": 1041, "group_iterations": 11874,
+       "inner_matvecs": 149251, "seconds": 62.2},
+      {"order": 6, "dof": 4484, "accepted": 396, "rejected": 7,
+       "nonlinear_iterations": 1013, "group_iterations": 11501,
+       "inner_matvecs": 158252, "seconds": 121.7},
+      {"order": 7, "dof": 6084, "accepted": 421, "rejected": 9,
+       "nonlinear_iterations": 1086, "group_iterations": 12010,
+       "inner_matvecs": 170313, "seconds": 237.0},
+      {"order": 8, "dof": 7921, "accepted": 412, "rejected": 7,
+       "nonlinear_iterations": 1062, "group_iterations": 12058,
+       "inner_matvecs": 181587, "seconds": 438.1}
+    ]
+  },
+  "static_ndgpu": {
+    "rods_in": 0.9962305135451943,
+    "rods_out": 1.01481577726139
+  },
+  "static_convergence": [
+    {"refine": 1, "cell_width_cm": 15.0,
+     "rods_in": 1.003891222039794, "rods_out": 1.028260895464134},
+    {"refine": 2, "cell_width_cm": 7.5,
+     "rods_in": 0.9974989202837077, "rods_out": 1.0167750715024162},
+    {"refine": 4, "cell_width_cm": 3.75,
+     "rods_in": 0.9962305135451943, "rods_out": 1.01481577726139},
+    {"refine": 8, "cell_width_cm": 1.875,
+     "rods_in": 0.996249873326458, "rods_out": 1.0150874444741766},
+    {"refine": 15, "cell_width_cm": 1.0,
+     "rods_in": 0.9963253671670673, "rods_out": 1.0153202022896337}
+  ],
+  "tolerance_ladder": [
+    {
+      "method": "automatic BDF5", "rtol": 0.001,
+      "accepted": 199, "rejected": 22, "fgmres": 12575,
+      "inner": 301861, "seconds": 24.943107216153294,
+      "first_peak_time_s": 1.4658906325027221,
+      "first_peak_power_w_cm3": 5409.931348341851,
+      "second_peak_power_w_cm3": 806.4178162583055,
+      "power_at_3s_w_cm3": 98.82496096042388,
+      "mean_temperature_at_3s_k": 1084.7507525271108,
+      "peak_temperature_at_3s_k": 2953.488487517373
+    },
+    {
+      "method": "automatic BDF5", "rtol": 0.0001,
+      "accepted": 284, "rejected": 22, "fgmres": 12306,
+      "inner": 294134, "seconds": 24.117517866194248,
+      "first_peak_time_s": 1.4681776118887893,
+      "first_peak_power_w_cm3": 5563.325180092243,
+      "second_peak_power_w_cm3": 807.0782018537797,
+      "power_at_3s_w_cm3": 98.82945488478121,
+      "mean_temperature_at_3s_k": 1084.6978993052367,
+      "peak_temperature_at_3s_k": 2953.236580885218
+    },
+    {
+      "method": "automatic BDF5", "rtol": 0.00001,
+      "accepted": 414, "rejected": 29, "fgmres": 14385,
+      "inner": 341182, "seconds": 29.62731117196381,
+      "first_peak_time_s": 1.4699737477432149,
+      "first_peak_power_w_cm3": 5599.090494852009,
+      "second_peak_power_w_cm3": 807.1906338167898,
+      "power_at_3s_w_cm3": 98.83171598556481,
+      "mean_temperature_at_3s_k": 1084.6802171465897,
+      "peak_temperature_at_3s_k": 2953.1668701940484
+    },
+    {
+      "method": "automatic BDF5", "rtol": 0.000001,
+      "accepted": 605, "rejected": 28, "fgmres": 17920,
+      "inner": 421475, "seconds": 33.68396491697058,
+      "first_peak_time_s": 1.4697774852221146,
+      "first_peak_power_w_cm3": 5601.558245663714,
+      "second_peak_power_w_cm3": 807.2016569180669,
+      "power_at_3s_w_cm3": 98.83190341662802,
+      "mean_temperature_at_3s_k": 1084.6788275955325,
+      "peak_temperature_at_3s_k": 2953.16133704652
+    }
+  ],
+  "matched_backward_euler": {
+    "method": "backward Euler", "rtol": 0.0001,
+    "accepted": 3187, "rejected": 20, "fgmres": 66849,
+    "inner": 1515351, "seconds": 131.3074415428564,
+    "first_peak_time_s": 1.4661230822225808,
+    "first_peak_power_w_cm3": 5437.984884387391,
+    "second_peak_power_w_cm3": 802.7401997112033,
+    "power_at_3s_w_cm3": 98.97411342863964,
+    "mean_temperature_at_3s_k": 1084.2380077776731,
+    "peak_temperature_at_3s_k": 2952.0280893524814
+  },
+  "cell_local_matched_performance": {
+    "temporal_reference": "3.75 cm cell-local automatic BDF5 at rtol=1e-6",
+    "automatic_bdf5": {
+      "rtol": 0.001, "accepted": 201, "rejected": 30,
+      "fgmres": 13129, "inner": 315381, "seconds": 27.53722750605084,
+      "first_peak_time_s": 1.4645864849013233,
+      "first_peak_power_w_cm3": 5248.712749667739,
+      "first_peak_temporal_error": -0.031125596634766883
+    },
+    "backward_euler": {
+      "rtol": 0.0001, "accepted": 3180, "rejected": 19,
+      "fgmres": 66671, "inner": 1512769, "seconds": 140.5423640580848,
+      "first_peak_time_s": 1.4657250048363233,
+      "first_peak_power_w_cm3": 5258.980149210111,
+      "first_peak_temporal_error": -0.029230308955638717
+    },
+    "backward_euler_over_bdf5": {
+      "accepted_steps": 15.82089552238806,
+      "fgmres": 5.078147612156295,
+      "inner": 4.796639620015156,
+      "seconds": 5.1037223710049595
+    }
+  },
+  "fine_cell_local_accuracy": {
+    "cell_width_cm": 1.0, "rtol": 0.00001,
+    "accepted": 391, "rejected": 29, "seconds": 614.5030961148441,
+    "rods_in": 0.9963253671670673, "rods_out": 1.0153202022896337,
+    "first_peak_time_s": 1.4443244200907197,
+    "first_peak_power_w_cm3": 5397.667298689516,
+    "second_peak_power_w_cm3": 791.9923280717463,
+    "power_at_3s_w_cm3": 98.03181311349579,
+    "mean_temperature_at_3s_k": 1088.7454904294782,
+    "peak_temperature_at_3s_k": 2946.2804118620293,
+    "peak_cell_temperature_at_3s_k": 3328.7573970346166
+  }
+}

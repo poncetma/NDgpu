@@ -1,0 +1,79 @@
+{
+  "case": {
+    "refine": 4,
+    "cell_width_cm": 3.75,
+    "thermal_zones": "cell",
+    "implicit_feedback": true,
+    "automatic_bdf_max_order": 5,
+    "initial_dt_s": 1e-6,
+    "max_dt_s": 0.1
+  },
+  "practical_rtol_1e-3": {
+    "factor_two": {
+      "solve_seconds_samples": [
+        27.56895970716141,
+        24.637832025066018,
+        26.875995355891064
+      ],
+      "median_solve_seconds": 26.875995355891064,
+      "accepted_steps": 201,
+      "rejected_steps": 30,
+      "fgmres_applications": 13129,
+      "rejected_fgmres_applications": 2523,
+      "inner_iterations": 315381,
+      "feedback_iterations": 387,
+      "first_peak_time_s": 1.4645864849013233,
+      "first_peak_power_w_cm3": 5248.712749667739,
+      "second_peak_power_w_cm3": 778.4422379583433,
+      "power_at_3s_w_cm3": 95.82585271180314,
+      "mean_temperature_at_3s_k": 1059.88149234924,
+      "peak_temperature_at_3s_k": 2862.2295305629705
+    },
+    "error_scaled_cap_0_5": {
+      "solve_seconds_samples": [
+        25.49424048489891,
+        26.5596093069762,
+        24.55035316804424
+      ],
+      "median_solve_seconds": 25.49424048489891,
+      "accepted_steps": 201,
+      "rejected_steps": 25,
+      "fgmres_applications": 12395,
+      "rejected_fgmres_applications": 2144,
+      "inner_iterations": 297831,
+      "feedback_iterations": 356,
+      "first_peak_time_s": 1.4662541481587354,
+      "first_peak_power_w_cm3": 5313.105176073751,
+      "second_peak_power_w_cm3": 778.7773675017417,
+      "power_at_3s_w_cm3": 95.8300595944787,
+      "mean_temperature_at_3s_k": 1059.8488436533976,
+      "peak_temperature_at_3s_k": 2862.0715045913457
+    },
+    "median_wall_speedup": 1.054198707029951,
+    "fgmres_reduction_fraction": 0.05590677126970833,
+    "inner_iteration_reduction_fraction": 0.05564697936781227
+  },
+  "tight_rtol_1e-5": {
+    "factor_two": {
+      "solve_seconds": 28.624966274015605,
+      "accepted_steps": 410,
+      "rejected_steps": 27,
+      "fgmres_applications": 14159,
+      "rejected_fgmres_applications": 1093,
+      "inner_iterations": 335854,
+      "first_peak_time_s": 1.4698616033487781,
+      "first_peak_power_w_cm3": 5414.1287896006015
+    },
+    "error_scaled_cap_0_5": {
+      "solve_seconds": 29.179163737921044,
+      "accepted_steps": 413,
+      "rejected_steps": 26,
+      "fgmres_applications": 14160,
+      "rejected_fgmres_applications": 1027,
+      "inner_iterations": 335917,
+      "first_peak_time_s": 1.4698616033487781,
+      "first_peak_power_w_cm3": 5414.1287896006015
+    }
+  },
+  "decision": "retain error-scaled rejection as an opt-in practical-tolerance optimization; retain factor-two rejection for Cherezov reproduction"
+}
