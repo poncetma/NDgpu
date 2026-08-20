@@ -157,6 +157,21 @@ class SerialReductions:
     def max(self, value):
         return self.xp.max(value)
 
+    def sum_many(self, values):
+        """Reduce several independent arrays into one backend-native vector."""
+        values = tuple(values)
+        if not values:
+            return self.xp.empty(0, dtype=float)
+        return self.xp.stack([self.xp.sum(value) for value in values])
+
+    def dot_many(self, pairs):
+        """Compute several dot products without retaining product arrays."""
+        pairs = tuple(pairs)
+        if not pairs:
+            return self.xp.empty(0, dtype=float)
+        return self.xp.stack([
+            kernels.dot(self.xp, left, right) for left, right in pairs])
+
 
 class DistributedReductions(SerialReductions):
     """Local array reductions followed by communicator-wide collectives."""
@@ -175,6 +190,12 @@ class DistributedReductions(SerialReductions):
 
     def max(self, value):
         return self.context.allreduce_max(super().max(value))
+
+    def sum_many(self, values):
+        return self.context.allreduce_sum(super().sum_many(values))
+
+    def dot_many(self, pairs):
+        return self.context.allreduce_sum(super().dot_many(pairs))
 
 
 @dataclass

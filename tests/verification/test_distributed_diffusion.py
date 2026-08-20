@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from ndgpu import DiffusionEigenSolver, Grid, PWR_TWO_GROUP
 from ndgpu.distributed import (CartesianSlabPartition, DistributedContext,
                                SerialReductions, TriRowPartition)
 from ndgpu.linalg import PCGWorkspace, pcg
@@ -22,6 +23,24 @@ class _MirroredCommunicator:
     def Sendrecv(self, send, *, dest, sendtag, recvbuf, source, recvtag):
         assert (dest, source, sendtag, recvtag) == (1, 1, 7, 7)
         recvbuf[...] = send
+
+
+class _CountingReductions(SerialReductions):
+    def __init__(self, xp):
+        super().__init__(xp)
+        self.calls = {"dot": 0, "sum": 0, "dot_many": 0}
+
+    def dot(self, left, right):
+        self.calls["dot"] += 1
+        return super().dot(left, right)
+
+    def sum(self, value):
+        self.calls["sum"] += 1
+        return super().sum(value)
+
+    def dot_many(self, pairs):
+        self.calls["dot_many"] += 1
+        return super().dot_many(pairs)
 
 
 def _mirrored_context():
@@ -66,6 +85,12 @@ def test_serial_context_and_reductions_do_not_require_mpi():
     assert context.describe()["communication_mode"] == "serial"
     assert context.reductions.dot(values, values) == 55.0
     assert context.reductions.sum(values) == 15.0
+    np.testing.assert_array_equal(
+        context.reductions.sum_many((values, values * values)),
+        np.asarray([15.0, 55.0]))
+    np.testing.assert_array_equal(
+        context.reductions.dot_many(((values, values), (values, values + 1))),
+        np.asarray([55.0, 70.0]))
     assert isinstance(context.reductions, SerialReductions)
 
 
@@ -121,3 +146,24 @@ def test_distributed_reductions_disable_pcg_graph_blocks():
     np.testing.assert_allclose(solved, np.linalg.solve(matrix, rhs))
     assert workspace.graph_error == (
         "CUDA graph capture is disabled for distributed reductions")
+
+
+def test_size_one_power_iteration_matches_serial_reduction_order():
+    grid = Grid(shape=(5, 4, 3), size=(50.0, 40.0, 30.0))
+    serial_solver = DiffusionEigenSolver(grid, PWR_TWO_GROUP, device="cpu")
+    provider_solver = DiffusionEigenSolver(grid, PWR_TWO_GROUP, device="cpu")
+
+    reference = serial_solver.solve(tol_k=1e-9, tol_source=1e-8)
+    reductions = _CountingReductions(np)
+    result = provider_solver.solve(
+        tol_k=1e-9, tol_source=1e-8, reductions=reductions)
+
+    assert result.k_eff == reference.k_eff
+    assert result.k_history == reference.k_history
+    assert result.source_error_history == reference.source_error_history
+    assert result.outer_iterations == reference.outer_iterations
+    assert result.inner_iterations == reference.inner_iterations
+    np.testing.assert_array_equal(result.flux, reference.flux)
+    assert reductions.calls["dot"] > result.inner_iterations
+    assert reductions.calls["sum"] > result.outer_iterations
+    assert reductions.calls["dot_many"] >= result.outer_iterations

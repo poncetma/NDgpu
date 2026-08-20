@@ -47,7 +47,7 @@ from .spn import (CongruentSDPNOperator, SDPNGroupOperator, _SDPN_C, _SDPN_G,
 from .stencil import BC_VACUUM, BC_ZERO_FLUX, GroupOperator
 
 
-def _anderson_source(hist, raw, xp):
+def _anderson_source(hist, raw, xp, reductions=None):
     """Anderson-accelerated next iterate from a history of (input, raw_output).
 
     Given the recent (S_j, G(S_j)) pairs (latest last) and the latest raw iterate
@@ -61,8 +61,24 @@ def _anderson_source(hist, raw, xp):
     res = [Gj - Sj for Sj, Gj in hist]                    # residuals f_j = G_j - S_j
     dres = [res[i] - res[-1] for i in range(len(res) - 1)]
     m = len(dres)
-    A = np.array([[float(xp.sum(dres[i] * dres[j])) for j in range(m)] for i in range(m)])
-    b = np.array([-float(xp.sum(dres[i] * res[-1])) for i in range(m)])
+    if reductions is None:
+        A = np.array([
+            [float(xp.sum(dres[i] * dres[j])) for j in range(m)]
+            for i in range(m)])
+        b = np.array([
+            -float(xp.sum(dres[i] * res[-1])) for i in range(m)])
+    else:
+        upper = [(i, j) for i in range(m) for j in range(i, m)]
+        pairs = [(dres[i], dres[j]) for i, j in upper]
+        pairs.extend((dres[i], res[-1]) for i in range(m))
+        # The serial path converts every entry through Python float, so keep
+        # the replicated small dense solve in FP64 even for FP32 field data.
+        packed = np.asarray(
+            asnumpy(reductions.dot_many(pairs)), dtype=np.float64)
+        A = np.empty((m, m), dtype=packed.dtype)
+        for value, (i, j) in zip(packed, upper):
+            A[i, j] = A[j, i] = value
+        b = -packed[len(upper):]
     A[np.diag_indices(m)] += 1e-12 * (np.trace(A) + 1e-300)
     try:
         gamma = np.linalg.solve(A, b)
@@ -394,7 +410,7 @@ class _PowerIterationSolver:
               max_outer: int = 2000, inner_rtol_floor: float = 1e-10,
               k_guess: float = 1.0, verbose: bool = False,
               adjoint: bool = False, anderson_depth: int = 8,
-              state0=None) -> Result:
+              state0=None, reductions=None) -> Result:
         """Run power iteration until |dk| < tol_k and the relative L2 change of
         the normalized fission source < tol_source.
 
@@ -413,8 +429,17 @@ class _PowerIterationSolver:
         (sigma_s[g'->g] becomes sigma_s[g->g']). The dominant eigenvalue is
         identical to the forward k; the eigenvector is the adjoint flux, used
         for adjoint-weighted kinetics and first-order perturbation theory.
+
+        reductions : optional reduction provider for spatially distributed
+        solves. It supplies global ``sum``, packed ``dot_many``, and PCG dot
+        products over owned cells. The default retains the existing local
+        NumPy/CuPy reductions exactly.
         """
         xp, G = self.xp, self.n_groups
+        if reductions is not None and self._linsolve is not pcg:
+            raise NotImplementedError(
+                "distributed reductions currently support linear_solver='cg'")
+        reduce_sum = xp.sum if reductions is None else reductions.sum
         synchronize(xp)
         t0 = time.perf_counter()
 
@@ -448,7 +473,7 @@ class _PowerIterationSolver:
             return kernels.group_accumulate(xp, out, batch["W"], batch["phi"])
 
         fsrc = fission_source()
-        total = xp.sum(fsrc)
+        total = reduce_sum(fsrc)
         if float(total) <= 0:
             raise RuntimeError("initial fission source is zero")
         k = float(k_guess)
@@ -486,20 +511,32 @@ class _PowerIterationSolver:
                             q0 += s * self._phi(state[gf])
                 if self._src_weight is not None:
                     q0 = q0 * self._src_weight
+                linsolve_kwargs = {
+                    "rtol": rtol,
+                    "precond": self.preconds[g],
+                }
+                if reductions is not None:
+                    linsolve_kwargs["reductions"] = reductions
                 state[g], n_it = self._linsolve(
                     self.ops[g].apply, self._rhs(g, q0), state[g],
-                    self.ops[g].inv_diag, xp, rtol=rtol,
-                    precond=self.preconds[g])
+                    self.ops[g].inv_diag, xp, **linsolve_kwargs)
                 if batch is not None:
                     batch["phi"][g] = self._phi(state[g])
                 inner_total += n_it
 
             fsrc_new = fission_source()
-            total_new = xp.sum(fsrc_new)
+            total_new = reduce_sum(fsrc_new)
             k_new = k * float(total_new / total)
 
-            diff = fsrc_new / total_new - fsrc / total
-            src_err = float(xp.sqrt(xp.sum(diff * diff) / xp.sum((fsrc_new / total_new) ** 2)))
+            normalized_new = fsrc_new / total_new
+            diff = normalized_new - fsrc / total
+            if reductions is None:
+                src_err = float(xp.sqrt(
+                    xp.sum(diff * diff) / xp.sum(normalized_new ** 2)))
+            else:
+                errors = reductions.dot_many(
+                    ((diff, diff), (normalized_new, normalized_new)))
+                src_err = float(xp.sqrt(errors[0] / errors[1]))
             dk = abs(k_new - k)
 
             # Normalize so the mean fission source stays at 1 (avoids drift).
@@ -529,10 +566,10 @@ class _PowerIterationSolver:
                 hist.append((fsrc_in, g_fsrc))
                 if len(hist) > anderson_depth:
                     hist.pop(0)
-                fsrc = _anderson_source(hist, g_fsrc, xp)
-                fsrc = fsrc * (self.grid.n_cells / float(xp.sum(fsrc)))
+                fsrc = _anderson_source(hist, g_fsrc, xp, reductions=reductions)
+                fsrc = fsrc * (self.grid.n_cells / float(reduce_sum(fsrc)))
             prev_src_err = src_err
-            total = xp.sum(fsrc)
+            total = reduce_sum(fsrc)
 
         synchronize(xp)
         # Retain the converged per-group state (moment vectors for the block
