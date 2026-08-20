@@ -51,6 +51,7 @@ export PYTHONPATH="$pip_wheel"
     numpy==2.3.2 \
     scipy==1.16.3 \
     cupy-cuda12x==13.6.0 \
+    mpi4py==4.1.2 \
     pytest==8.4.2
 unset PYTHONPATH
 
@@ -58,6 +59,7 @@ unset PYTHONPATH
 import platform
 
 import cupy
+import mpi4py
 import numpy
 import pytest
 import scipy
@@ -76,7 +78,8 @@ if isinstance(name, bytes):
     name = name.decode()
 print(f"arch={platform.machine()} device={name} cuda_devices={runtime.getDeviceCount()}")
 print(f"numpy={numpy.__version__} scipy={scipy.__version__} "
-      f"cupy={cupy.__version__} pytest={pytest.__version__}")
+      f"cupy={cupy.__version__} mpi4py={mpi4py.__version__} "
+      f"pytest={pytest.__version__}")
 print(f"cupy_sum={total}")
 PY
 

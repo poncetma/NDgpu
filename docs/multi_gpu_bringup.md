@@ -34,6 +34,23 @@ explicit `gather_flux()` call. For now, construction with more than one rank
 fails before cross-section fields are allocated; Phase 2 and Phase 3 will lift
 that guard after their halo operators pass correctness gates.
 
+The Phase 1 size-one acceptance executable is
+`examples/distributed_size_one_gate.py`. The corresponding reproducible Slurm
+launchers are `slurm/stage_and_submit_phase1_cpu_gate.sh` and
+`slurm/stage_and_submit_phase1_gpu_gate.sh`.
+
+Accepted stacks on 2026-08-20:
+
+- Merlin CPU: OpenMPI 4.1.6 with `mpi4py 4.1.2` in the isolated
+  `/data/scratch/shared/poncet_m/ndgpu-mpi4py-x86-py312` target.
+- Grace-Hopper: OpenMPI 5.0.7 with `mpi4py 4.1.2` installed offline in
+  `/data/scratch/shared/poncet_m/ndgpu-gh-py313-v1`.
+
+The generated GH module `openmpi/5.0.7-iw2c-GH200-gpu` currently references
+stale dependency module names. The gate therefore validates and uses the
+intact site installation prefix directly; its libraries retain full dependency
+RPATHs. Remove this workaround once PSI regenerates the aarch64 module tree.
+
 ## Environment rules
 
 - Run one MPI rank per allocated GPU.

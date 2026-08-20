@@ -1,8 +1,20 @@
 # Multi-GPU standalone diffusion development plan
 
-Status: Phase 1 implemented; MPI/GPU acceptance run pending
+Status: Phase 1 accepted on Merlin CPU and Grace-Hopper GPU
 
 Date: 2026-08-20
+
+Phase 1 acceptance evidence (2026-08-20):
+
+- Merlin CPU job `8544402`, OpenMPI 4.1.6, one real Slurm/MPI rank: passed.
+- GH200 job `196908`, OpenMPI 5.0.7, CuPy FP64, one real Slurm/MPI rank:
+  passed in explicit `host-staged` mode.
+- Cartesian serial/distributed histories were identical at 21 outer and 92
+  inner iterations, with `k_eff = 0.7347185328944782`.
+- Triangular serial/distributed histories were identical at 9 outer and 114
+  inner iterations, with `k_eff = 1.268919614519496` on CPU and the expected
+  last-bit backend difference (`1.2689196145194954`) on GH200.
+- Both gates required array-equal serial/distributed flux on the same backend.
 
 ## Objective
 

@@ -169,8 +169,11 @@ class SerialReductions:
         pairs = tuple(pairs)
         if not pairs:
             return self.xp.empty(0, dtype=float)
+        # Match the power iteration's historical multiply-then-sum order.
+        # PCG uses the separately injected fused ``dot`` method; changing the
+        # Anderson/source-error order here perturbs size-one GPU histories.
         return self.xp.stack([
-            kernels.dot(self.xp, left, right) for left, right in pairs])
+            self.xp.sum(left * right) for left, right in pairs])
 
 
 class DistributedReductions(SerialReductions):
