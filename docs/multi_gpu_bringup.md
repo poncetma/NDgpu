@@ -2,8 +2,37 @@
 
 The first implementation slice provides MPI rank placement, communication
 probes, global reduction providers, and spatial partition metadata. It does
-not yet provide a distributed diffusion operator or eigenvalue solver. Track
-the remaining phases in `multi_gpu_diffusion_plan.md`.
+not yet provide a multi-rank diffusion operator. Track the remaining phases in
+`multi_gpu_diffusion_plan.md`.
+
+## Phase 1 solver API
+
+The explicit distributed solver API is available for size-one CPU and GPU
+communicators. It exercises the distributed reductions and result ownership
+without claiming that spatial decomposition is ready:
+
+```python
+from mpi4py import MPI
+from ndgpu import DistributedTriDiffusionEigenSolver
+
+solver = DistributedTriDiffusionEigenSolver(
+    problem.grid,
+    problem.materials,
+    problem.material_map,
+    active=problem.active,
+    mask_bc=problem.mask_bc,
+    communicator=MPI.COMM_WORLD,
+    decomposition="rows",
+    device="gpu",
+)
+result = solver.solve(verbose=True)
+flux = result.gather_flux(root=0)
+```
+
+`result.local_flux` is always the owned field. Global flux construction is an
+explicit `gather_flux()` call. For now, construction with more than one rank
+fails before cross-section fields are allocated; Phase 2 and Phase 3 will lift
+that guard after their halo operators pass correctness gates.
 
 ## Environment rules
 

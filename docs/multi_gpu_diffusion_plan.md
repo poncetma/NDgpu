@@ -1,6 +1,6 @@
 # Multi-GPU standalone diffusion development plan
 
-Status: in progress (Phase 0 and Phase 1 foundation)
+Status: Phase 1 implemented; MPI/GPU acceptance run pending
 
 Date: 2026-08-20
 

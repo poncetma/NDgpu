@@ -365,6 +365,69 @@ class DistributedContext:
         return receive
 
 
+@dataclass
+class DistributedResult:
+    """Rank-local eigenvalue result with explicit global-field gathering."""
+
+    k_eff: float
+    local_flux: object
+    partition: SpatialPartition
+    context: DistributedContext
+    converged: bool
+    outer_iterations: int
+    inner_iterations: int
+    solve_seconds: float
+    device: str
+    k_history: list = field(default_factory=list)
+    source_error_history: list = field(default_factory=list)
+
+    @classmethod
+    def from_local_result(cls, result, partition, context):
+        return cls(
+            k_eff=result.k_eff,
+            local_flux=result.flux,
+            partition=partition,
+            context=context,
+            converged=result.converged,
+            outer_iterations=result.outer_iterations,
+            inner_iterations=result.inner_iterations,
+            solve_seconds=result.solve_seconds,
+            device=result.device,
+            k_history=result.k_history,
+            source_error_history=result.source_error_history,
+        )
+
+    @property
+    def rank(self) -> int:
+        return self.context.rank
+
+    @property
+    def size(self) -> int:
+        return self.context.size
+
+    @property
+    def local_flux_numpy(self) -> np.ndarray:
+        return asnumpy(self.local_flux)
+
+    def gather_flux(self, root: int = 0):
+        """Collect the global flux explicitly; collective in multi-rank use."""
+        if not 0 <= root < self.size:
+            raise ValueError(f"root {root} is outside communicator size {self.size}")
+        if self.size != 1:
+            raise NotImplementedError(
+                "multi-rank flux gathering requires the Phase 2 spatial layout")
+        return self.local_flux if self.rank == root else None
+
+    def __repr__(self):
+        status = "converged" if self.converged else "NOT CONVERGED"
+        return (
+            f"DistributedResult(k_eff={self.k_eff:.6f}, {status}, "
+            f"rank {self.rank}/{self.size}, {self.outer_iterations} outers / "
+            f"{self.inner_iterations} inners, {self.solve_seconds:.2f} s on "
+            f"{self.device})"
+        )
+
+
 def _discover_local_rank(communicator, mpi) -> int:
     for name in ("SLURM_LOCALID", "OMPI_COMM_WORLD_LOCAL_RANK",
                  "MV2_COMM_WORLD_LOCAL_RANK"):

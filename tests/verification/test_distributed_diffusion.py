@@ -3,9 +3,12 @@
 import numpy as np
 import pytest
 
-from ndgpu import DiffusionEigenSolver, Grid, PWR_TWO_GROUP
+from ndgpu import (DiffusionEigenSolver, DistributedDiffusionEigenSolver,
+                   DistributedTriDiffusionEigenSolver, Grid, PWR_TWO_GROUP,
+                   TriDiffusionEigenSolver, TriGrid)
 from ndgpu.distributed import (CartesianSlabPartition, DistributedContext,
-                               SerialReductions, TriRowPartition)
+                               DistributedResult, SerialReductions,
+                               TriRowPartition)
 from ndgpu.linalg import PCGWorkspace, pcg
 
 
@@ -167,3 +170,50 @@ def test_size_one_power_iteration_matches_serial_reduction_order():
     assert reductions.calls["dot"] > result.inner_iterations
     assert reductions.calls["sum"] > result.outer_iterations
     assert reductions.calls["dot_many"] >= result.outer_iterations
+
+
+def test_size_one_distributed_cartesian_solver_matches_serial_result():
+    grid = Grid(shape=(5, 4, 3), size=(50.0, 40.0, 30.0))
+    reference = DiffusionEigenSolver(
+        grid, PWR_TWO_GROUP, device="cpu").solve(
+            tol_k=1e-9, tol_source=1e-8)
+    solver = DistributedDiffusionEigenSolver(
+        grid, PWR_TWO_GROUP, context=DistributedContext.serial("cpu"),
+        decomposition="slab")
+    result = solver.solve(tol_k=1e-9, tol_source=1e-8)
+
+    assert isinstance(result, DistributedResult)
+    assert isinstance(result.partition, CartesianSlabPartition)
+    assert result.k_eff == reference.k_eff
+    assert result.k_history == reference.k_history
+    assert result.source_error_history == reference.source_error_history
+    assert result.outer_iterations == reference.outer_iterations
+    assert result.inner_iterations == reference.inner_iterations
+    np.testing.assert_array_equal(result.local_flux, reference.flux)
+    assert result.gather_flux(root=0) is result.local_flux
+    with pytest.raises(ValueError, match="outside communicator"):
+        result.gather_flux(root=1)
+
+
+def test_size_one_distributed_tri_solver_matches_serial_result():
+    grid = TriGrid(shape=(5, 4, 2), side=2.0)
+    reference = TriDiffusionEigenSolver(
+        grid, PWR_TWO_GROUP, device="cpu").solve(
+            tol_k=1e-9, tol_source=1e-8)
+    solver = DistributedTriDiffusionEigenSolver(
+        grid, PWR_TWO_GROUP, context=DistributedContext.serial("cpu"),
+        decomposition="rows")
+    result = solver.solve(tol_k=1e-9, tol_source=1e-8)
+
+    assert isinstance(result.partition, TriRowPartition)
+    assert result.k_eff == reference.k_eff
+    assert result.outer_iterations == reference.outer_iterations
+    assert result.inner_iterations == reference.inner_iterations
+    np.testing.assert_array_equal(result.local_flux, reference.flux)
+
+
+def test_multi_rank_solver_rejects_before_field_construction():
+    context, _ = _mirrored_context()
+    with pytest.raises(NotImplementedError, match="Phase 2/3 spatial operator"):
+        DistributedDiffusionEigenSolver(
+            object(), object(), context=context, decomposition="slab")
