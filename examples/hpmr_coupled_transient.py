@@ -27,7 +27,11 @@ or hours. See ``notebooks/colab_hpmr_coupled_transient.ipynb``.
 With ``--quasistatic-shape-dt``, amplitude and precursors still advance at
 ``--dt`` but the expensive spatial diffusion shape is corrected only at the
 requested cadence. IQS retains the time derivative and spatial precursor
-history; ``--shape-method adiabatic`` selects instantaneous eigen shapes.
+history. Guarded adaptive IQS is the preferred HP-MR production method: by
+default a projected shape defect forces an early correction or, above the hard
+threshold, a full-diffusion fine-step fallback. Use ``--unguarded-iqs`` only
+for fixed-cadence benchmark comparisons. ``--shape-method adiabatic`` selects
+instantaneous eigen shapes.
 Omit the quasi-static option to retain the full transient-diffusion reference.
 """
 
@@ -76,11 +80,33 @@ ap.add_argument("--adjoint-every", type=int, default=1,
 ap.add_argument("--shape-method", choices=("iqs", "adiabatic"), default="iqs",
                 help="time-dependent IQS (default) or instantaneous eigen shape")
 ap.add_argument("--residual-tol", type=float, default=None,
-                help="force an early shape update above this projected defect")
+                help="force an early shape update above this projected defect "
+                     "(guarded IQS default: 0.002)")
 ap.add_argument("--fallback-residual", type=float, default=None,
-                help="use full diffusion for an interval above this defect")
+                help="use full diffusion for an interval above this defect "
+                     "(guarded IQS default: 0.01)")
+ap.add_argument("--iqs-predictor-tol", type=float, default=None,
+                help="adaptively halve IQS shape intervals when the independent "
+                     "coarse predictor disagrees by this relative amount "
+                     "(guarded IQS default: 0.02)")
+ap.add_argument("--unguarded-iqs", action="store_true",
+                help="disable the preferred HP-MR IQS residual, fallback, and "
+                     "predictor guards for fixed-cadence benchmark comparisons")
 ap.add_argument("--quiet", action="store_true")
 args = ap.parse_args()
+
+guarded_iqs = (args.quasistatic_shape_dt is not None
+               and args.shape_method == "iqs" and not args.unguarded_iqs)
+if guarded_iqs:
+    if args.residual_tol is None:
+        args.residual_tol = 2e-3
+    if args.fallback_residual is None:
+        args.fallback_residual = 1e-2
+    if args.iqs_predictor_tol is None:
+        args.iqs_predictor_tol = 2e-2
+elif args.unguarded_iqs and any(value is not None for value in (
+        args.residual_tol, args.fallback_residual, args.iqs_predictor_tol)):
+    ap.error("--unguarded-iqs cannot be combined with explicit IQS guards")
 
 three_d = args.nz > 0
 mats = hpmr_endfb8_builtin(three_d=three_d) if args.groups == "11" else None
@@ -139,8 +165,10 @@ else:
         adjoint_every=args.adjoint_every, shape_method=args.shape_method,
         residual_tol=args.residual_tol,
         fallback_residual=args.fallback_residual,
-        profile=args.profile)
-    mode = (f"{args.shape_method} quasi-static, shape dt "
+        iqs_predictor_tol=args.iqs_predictor_tol,
+        profile=args.profile, verbose=not args.quiet)
+    guard_label = "guarded adaptive, " if guarded_iqs else ""
+    mode = (f"{guard_label}{args.shape_method} quasi-static, shape dt "
             f"{args.quasistatic_shape_dt:g} s")
 wall = time.perf_counter() - t0
 
@@ -166,6 +194,11 @@ if args.quasistatic_shape_dt is not None:
     print(f"  {'shape / adjoint solves':<32}: "
           f"{shape_solves} / "
           f"{res.counters['adjoint_eigen_solves']}")
+    if res.predictor_disagreement.size:
+        i = int(np.argmax(res.predictor_disagreement))
+        print(f"  {'max IQS predictor disagreement':<32}: "
+              f"{100 * res.predictor_disagreement[i]:.1f}% at "
+              f"t = {res.predictor_disagreement_times[i]:.2f} s")
 if res.phase_seconds:
     print("\n  transient phase timings (overlap-free CUDA events on GPU):")
     for name, value in sorted(res.phase_seconds.items()):

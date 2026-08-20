@@ -248,6 +248,16 @@ def test_adiabatic_shape_updates_preserve_exact_uniform_solution():
     assert adiabatic.shape_update_reasons == ["maximum_interval"] * 4
 
 
+def test_quasistatic_verbose_reports_periodic_progress(capsys):
+    fixed_shape_coupled_transient(
+        coupled_context(), t_end=0.004, dt=0.002, dt_thermal=0.002,
+        verbose=True)
+    output = capsys.readouterr().out
+    assert "P/P0" in output
+    assert "T_fuel" in output
+    assert "t =    0.004 s" in output
+
+
 def test_adiabatic_quasistatic_tracks_reduced_hpmr_drum_ramp():
     """The intended use case: cached drum frames plus coupled feedback."""
     from ndgpu.benchmarks.hpmr import build_hpmr2d
@@ -315,6 +325,10 @@ def test_iqs_keeps_accepted_precursor_history_across_shape_corrections():
     # percent. Its spatial shape is useful, but adopting its precursor field
     # used to leave the accepted point amplitude about 10% low after the ramp.
     assert iqs.counters["iqs_max_amplitude_error_ppm"] > 10_000
+    assert len(iqs.predictor_disagreement) == iqs.counters["iqs_predictor_checks"]
+    assert np.all(iqs.predictor_disagreement > 0.0)
+    np.testing.assert_array_equal(iqs.predictor_disagreement_times,
+                                  iqs.shape_update_times)
     assert adaptive.counters["iqs_predictor_interval_reductions"] > 0
     assert adaptive.counters["shape_updates"] > iqs.counters["shape_updates"]
     assert abs(iqs.power[-1] / full.power[-1] - 1.0) < 1e-3

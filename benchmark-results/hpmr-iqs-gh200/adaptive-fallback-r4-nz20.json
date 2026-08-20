@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "decision": "preferred_hpmr_production_iqs_method",
+  "date": "2026-08-20",
+  "base_commit": "7ed0c2826a4f5b819908faa77c7c225f34238373",
+  "hardware": {
+    "cluster": "gmerlin7",
+    "node": "gpu002",
+    "gpu": "NVIDIA GH200 120GB",
+    "numpy": "2.3.2",
+    "scipy": "1.16.3",
+    "cupy": "13.6.0"
+  },
+  "configuration": {
+    "active_cells": 105600,
+    "groups": 11,
+    "radial_refine": 4,
+    "axial_layers": 20,
+    "t_end_s": 200.0,
+    "neutronics_dt_s": 0.05,
+    "thermal_dt_s": 0.5,
+    "maximum_shape_dt_s": 2.0,
+    "adjoint_every": 5,
+    "drum_start_deg": 90.0,
+    "drum_end_deg": 90.5,
+    "drum_motion_start_s": 1.0,
+    "drum_ramp_s": 4.0,
+    "inserted_dollars": 0.248,
+    "residual_tol": 0.002,
+    "fallback_residual": 0.01,
+    "iqs_predictor_tol": 0.02
+  },
+  "guarded_iqs": {
+    "job_id": 196799,
+    "slurm_elapsed_s": 3549,
+    "problem_build_s": 190.9,
+    "steady_s": 35.4,
+    "transient_s": 3343.2,
+    "peak_power": 5.2228,
+    "peak_power_time_s": 45.0,
+    "final_power": 1.35801,
+    "shape_updates": 131,
+    "iqs_shape_solves": 129,
+    "adjoint_solves": 29,
+    "full_diffusion_fallbacks": 2,
+    "fallback_seconds": 16.424,
+    "fallback_fixed_point_sweeps": 206,
+    "fallback_inner_iterations": 56072,
+    "residual_evaluations": 309,
+    "predictor_checks": 129,
+    "predictor_interval_reductions": 0,
+    "predictor_interval_recoveries": 0,
+    "maximum_predictor_disagreement": 0.005884,
+    "iqs_fixed_point_sweeps": 35009,
+    "iqs_inner_iterations": 9430888
+  },
+  "fixed_cadence_iqs_baseline": {
+    "job_id": 196460,
+    "slurm_elapsed_s": 2896,
+    "problem_build_s": 204.4,
+    "steady_s": 37.5,
+    "transient_s": 2663.3,
+    "peak_power": 5.2235,
+    "peak_power_time_s": 46.0,
+    "final_power": 1.3635,
+    "shape_updates": 100,
+    "iqs_shape_solves": 100,
+    "adjoint_solves": 21,
+    "full_diffusion_fallbacks": 0
+  },
+  "full_diffusion_reference": {
+    "job_id": 196622,
+    "state": "cancelled_after_preserving_results",
+    "available_through_s": 110.0,
+    "slurm_elapsed_s": 31297,
+    "preserved_log_sha256": "93ec89a27c2c6f84a1de11317a120cd368695e10f578b6fff7ce42c17b5dea1b"
+  },
+  "comparison": {
+    "guarded_transient_cost_increase_fraction": 0.2553,
+    "guarded_total_job_cost_increase_fraction": 0.2255,
+    "maximum_sampled_guarded_power_error_fraction_through_110s": 0.0017271,
+    "maximum_sampled_fixed_power_error_fraction_through_110s": 0.0570831,
+    "sampling_interval_s": 10.0,
+    "power_history": [
+      {"time_s": 10.0, "full": 2.16912, "guarded": 2.17041, "guarded_error_percent": 0.05947, "fixed": 2.0453, "fixed_error_percent": -5.70831},
+      {"time_s": 20.0, "full": 3.44761, "guarded": 3.45098, "guarded_error_percent": 0.09775, "fixed": 3.3226, "fixed_error_percent": -3.62599},
+      {"time_s": 30.0, "full": 4.56062, "guarded": 4.56533, "guarded_error_percent": 0.10328, "fixed": 4.4728, "fixed_error_percent": -1.92562},
+      {"time_s": 40.0, "full": 5.15107, "guarded": 5.15555, "guarded_error_percent": 0.08697, "fixed": 5.1252, "fixed_error_percent": -0.50223},
+      {"time_s": 50.0, "full": 5.16197, "guarded": 5.16433, "guarded_error_percent": 0.04572, "fixed": 5.1855, "fixed_error_percent": 0.45583},
+      {"time_s": 60.0, "full": 4.81154, "guarded": 4.80323, "guarded_error_percent": -0.17271, "fixed": 4.8499, "fixed_error_percent": 0.79725},
+      {"time_s": 70.0, "full": 4.30827, "guarded": 4.3027, "guarded_error_percent": -0.12929, "fixed": 4.3554, "fixed_error_percent": 1.09394},
+      {"time_s": 80.0, "full": 3.8041, "guarded": 3.79948, "guarded_error_percent": -0.12145, "fixed": 3.8488, "fixed_error_percent": 1.17505},
+      {"time_s": 90.0, "full": 3.35353, "guarded": 3.34982, "guarded_error_percent": -0.11063, "fixed": 3.3926, "fixed_error_percent": 1.16504},
+      {"time_s": 100.0, "full": 2.96983, "guarded": 2.96685, "guarded_error_percent": -0.10034, "fixed": 3.0028, "fixed_error_percent": 1.11016},
+      {"time_s": 110.0, "full": 2.64905, "guarded": 2.64666, "guarded_error_percent": -0.09022, "fixed": 2.6765, "fixed_error_percent": 1.03622}
+    ]
+  },
+  "limitations": [
+    "The full-diffusion reference was stopped at 110 seconds, so accuracy after 110 seconds is not directly validated.",
+    "The completed driver recorded fallback counts but did not print the two fallback times.",
+    "The calibrated residual thresholds are specific to this HP-MR mesh and maneuver and remain opt-in in the low-level solver API."
+  ]
+}

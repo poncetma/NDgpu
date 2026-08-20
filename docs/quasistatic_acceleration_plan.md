@@ -27,7 +27,7 @@ requires it.
 This is an acceleration method, not a new physics model. It must converge to
 the existing backward-Euler transient as the shape-update interval is reduced.
 
-## Implementation status (2026-08-11)
+## Implementation status (2026-08-20)
 
 Phases 0-3, including the guarded time-dependent IQS core, are now executable:
 
@@ -86,13 +86,42 @@ Phases 0-3, including the guarded time-dependent IQS core, are now executable:
   predictor precursor-overwrite defect. After correction, plain IQS matches
   adiabatic power while giving a substantially better final spatial shape;
   guarded IQS reduces maximum history error to 1.3-3.0% on the tested ramps.
+- The 200 s, r4 x 20-layer, 11-group HP-MR GH200 calibration in
+  `benchmark-results/hpmr-iqs-gh200` completed with 129 IQS shape solves and two
+  hard full-diffusion fallbacks. Against the preserved full-diffusion reference
+  through 110 s, guarded IQS reduced maximum sampled power error from 5.708% to
+  0.173% for a 25.5% increase in transient wall time over fixed-cadence IQS.
+
+## Production decision (2026-08-20)
+
+Guarded adaptive IQS is the preferred production treatment for HP-MR coupled
+transients. The calibrated starting profile is:
+
+```text
+shape_dt             = 2.0 s maximum
+residual_tol          = 0.002
+fallback_residual     = 0.01
+iqs_predictor_tol     = 0.02
+adjoint_every         = 5
+```
+
+`examples/hpmr_coupled_transient.py` applies this profile by default whenever
+time-dependent IQS is selected. `--unguarded-iqs` retains the previous fixed-
+cadence behavior for method comparisons. The low-level API keeps its thresholds
+optional because a new reactor model, mesh, feedback law, or faster maneuver
+must be calibrated against a shorter full-diffusion reference rather than
+inheriting HP-MR-specific error limits.
+
+The detailed configuration, counters, timing, sampled reference comparison,
+and limitations are recorded in
+[`benchmark-results/hpmr-iqs-gh200`](../benchmark-results/hpmr-iqs-gh200/README.md).
 
 The fixed-shape entry point still reports `shape_updates == 0` intentionally.
 The adiabatic option performs scheduled eigen updates; IQS is now the default.
-The remaining production work is threshold calibration on the one-minute 3-D
-case, interval-convergence studies, GPU projection fusion, and multi-interval
-fallback replay when thermal feedback changes substantially inside a rejected
-macro interval.
+The remaining production work is interval-convergence studies on materially
+different maneuvers, GPU projection fusion, exact fallback-event serialization,
+and multi-interval fallback replay when thermal feedback changes substantially
+inside a rejected macro interval.
 
 ## Mathematical split
 

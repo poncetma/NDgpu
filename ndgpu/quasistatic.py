@@ -112,6 +112,10 @@ class QuasiStaticResult:
     adjoint_residual_times: np.ndarray = field(
         default_factory=lambda: np.empty(0))
     adjoint_residual: np.ndarray = field(default_factory=lambda: np.empty(0))
+    predictor_disagreement_times: np.ndarray = field(
+        default_factory=lambda: np.empty(0))
+    predictor_disagreement: np.ndarray = field(
+        default_factory=lambda: np.empty(0))
     fallback_times: np.ndarray = field(default_factory=lambda: np.empty(0))
     phase_seconds: dict = field(default_factory=dict)
     counters: dict = field(default_factory=dict)
@@ -543,7 +547,8 @@ def _coupled_quasistatic(
         adjoint_kwargs=None,
         thermal_rtol=1e-8, thermal_maxiter=20000,
         thermal_check_every=4, thermal_precond_degree=0,
-        thermal_diagnostics_every=0, profile=False, shape_dt=None,
+        thermal_diagnostics_every=0, profile=False, verbose=False,
+        shape_dt=None,
         adjoint_every=1, shape_on_final=True, shape_method="adiabatic",
         adjoint_residual_tol=None,
         residual_tol=None, fallback_residual=None, iqs_kwargs=None,
@@ -845,6 +850,8 @@ def _coupled_quasistatic(
     residual_values = []
     adjoint_residual_times = []
     adjoint_residual_values = []
+    predictor_disagreement_times = []
+    predictor_disagreement_values = []
     fallback_times = []
     spatial_precursors = spatial_precursor_shape.copy()
     anchor_spec = spec0
@@ -1064,6 +1071,8 @@ def _coupled_quasistatic(
                     disagreement = (abs(predicted_end - provisional_power)
                                     / provisional_power)
                     predictor_disagreement = disagreement
+                    predictor_disagreement_times.append(t)
+                    predictor_disagreement_values.append(disagreement)
                     counters["iqs_predictor_checks"] += 1
                     counters["iqs_max_amplitude_error_ppm"] = max(
                         counters["iqs_max_amplitude_error_ppm"],
@@ -1241,6 +1250,10 @@ def _coupled_quasistatic(
                                               proposed_shape_step)
             peaks.append(cached_peak)
             means.append(cached_mean)
+            if verbose and (n % max(1, steps // 20) == 0 or n == steps):
+                print(f"  t = {t:8.3f} s   P/P0 = {powers[-1]:.5f}   "
+                      f"T_fuel = {cached_mean:.2f} K   "
+                      f"shape updates = {shape_updates}", flush=True)
             previous_spec = spec
             previous_hook = feedback_hook
 
@@ -1284,6 +1297,9 @@ def _coupled_quasistatic(
         shape_residual=np.asarray(residual_values),
         adjoint_residual_times=np.asarray(adjoint_residual_times),
         adjoint_residual=np.asarray(adjoint_residual_values),
+        predictor_disagreement_times=np.asarray(
+            predictor_disagreement_times),
+        predictor_disagreement=np.asarray(predictor_disagreement_values),
         fallback_times=np.asarray(fallback_times),
         phase_seconds=phase_seconds, counters=dict(counters))
 

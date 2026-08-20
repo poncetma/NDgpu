@@ -406,6 +406,15 @@ unsafe fine interval with the full diffusion equations. `iqs_predictor_tol`
 halves future shape intervals when the coarse predictor disagrees with accepted
 power and restores them after the event settles. Use
 `shape_method="adiabatic"` to select instantaneous eigen shapes.
+For production HP-MR drum transients, guarded adaptive IQS is preferred over
+fixed-cadence IQS. The r4, 11-group GH200 calibration uses
+`residual_tol=2e-3`, `fallback_residual=1e-2`,
+`iqs_predictor_tol=2e-2`, and `adjoint_every=5`: it reduced maximum sampled
+power error against the available full-diffusion reference from 5.708% to
+0.173% at a 25.5% transient-time cost. The HPMR example applies this guard
+profile automatically when IQS is selected; pass `--unguarded-iqs` only for
+fixed-cadence benchmark comparisons. See
+[`benchmark-results/hpmr-iqs-gh200`](../benchmark-results/hpmr-iqs-gh200/README.md).
 For expensive adjoint solves, combine a larger `adjoint_every` with
 `adjoint_residual_tol`: the former limits maximum adjoint age and the latter
 refreshes early when the amplitude-free transposed-eigenproblem residual is too
