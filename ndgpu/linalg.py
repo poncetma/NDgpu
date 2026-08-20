@@ -288,7 +288,8 @@ def _pcg_graph_capable(xp, workspace, precond, vector_size):
 
 def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
         precond=None, check_every=1, raise_on_fail=True, workspace=None,
-        residual_replace_every=0, fallback_precond=None, graph_block=0):
+        residual_replace_every=0, fallback_precond=None, graph_block=0,
+        reductions=None):
     """Solve A x = b with preconditioned CG.
 
     apply_A  : callable, x -> A x (A symmetric positive definite)
@@ -322,6 +323,10 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
                uncaptured paths make convergence decisions at identical
                iterations. Unsupported configurations fall back transparently
                and record ``workspace.graph_error``.
+    reductions : optional object supplying ``dot(left, right)``. Distributed
+               providers combine owned-cell dot products with a global sum;
+               the default keeps the existing backend-local reduction. CUDA
+               graph blocks are disabled when a distributed provider is used.
 
     Returns (x, n_iterations).
     """
@@ -332,7 +337,8 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
     # written as separate array expressions it is almost entirely kernel-launch
     # overhead. The coefficients deliberately stay 0-d *device* scalars -- only
     # the convergence test (every `check_every` iterations) touches the host.
-    dot = lambda u, v: kernels.dot(xp, u, v)
+    dot = ((lambda u, v: kernels.dot(xp, u, v)) if reductions is None
+           else reductions.dot)
     M = precond if precond is not None else (lambda r: inv_diag * r)
     residual_replace_every = int(residual_replace_every)
     graph_block = int(graph_block)
@@ -387,7 +393,8 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
             maxiter=maxiter, precond=fallback_precond,
             check_every=check_every, raise_on_fail=raise_on_fail,
             workspace=workspace,
-            residual_replace_every=residual_replace_every)
+            residual_replace_every=residual_replace_every,
+            reductions=reductions)
         return solved, iterations + fallback_iterations
 
     stop2 = max(rtol * float(xp.sqrt(dot(b, b))), atol) ** 2
@@ -403,13 +410,20 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
     rz = dot(r, z)
     tiny = np.finfo(b.dtype).tiny
 
-    graph_active = bool(graph_block and _pcg_graph_capable(
-        xp, workspace, precond, b.size))
+    distributed_reductions = bool(
+        reductions is not None and getattr(reductions, "distributed", True))
+    graph_active = bool(
+        graph_block and not distributed_reductions
+        and _pcg_graph_capable(xp, workspace, precond, b.size))
     if graph_block and not graph_active and workspace is not None:
-        workspace.graph_error = (
-            "capture needs CuPy fused reductions, an out= operator and an "
-            f"allocation-free preconditioner; vector size must be <= "
-            f"{kernels.DOT_FUSED_MAX}")
+        if distributed_reductions:
+            workspace.graph_error = (
+                "CUDA graph capture is disabled for distributed reductions")
+        else:
+            workspace.graph_error = (
+                "capture needs CuPy fused reductions, an out= operator and an "
+                f"allocation-free preconditioner; vector size must be <= "
+                f"{kernels.DOT_FUSED_MAX}")
 
     if graph_active:
         scalars = workspace.scalars(xp, b.dtype)

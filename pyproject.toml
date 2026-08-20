@@ -16,6 +16,7 @@ dependencies = ["numpy>=1.24", "scipy>=1.10"]
 [project.optional-dependencies]
 cuda12 = ["cupy-cuda12x"]
 cuda11 = ["cupy-cuda11x"]
+mpi = ["mpi4py>=3.1"]
 test = ["pytest"]
 # External multiphysics coupling (examples/precice). Optional: the internal
 # CoupledSolver never touches preCICE. NOTE pyprecice is source-only on PyPI

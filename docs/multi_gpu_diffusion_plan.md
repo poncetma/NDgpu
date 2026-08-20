@@ -1,6 +1,6 @@
 # Multi-GPU standalone diffusion development plan
 
-Status: proposed
+Status: in progress (Phase 0 and Phase 1 foundation)
 
 Date: 2026-08-20
 
