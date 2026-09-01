@@ -280,7 +280,8 @@ class DistributedContext:
             if duplicates and not allow_shared_device:
                 raise RuntimeError(
                     "multiple MPI ranks selected the same GPU; request one GPU "
-                    "per rank or pass allow_shared_device=True only for tests")
+                    "per rank or pass allow_shared_device=True only for tests; "
+                    f"placements={placements}")
 
         if communication == "auto":
             communication = "host-staged" if xp is not np else "cpu-mpi"
@@ -514,7 +515,8 @@ def _cuda_device_identity(xp, device_id: int) -> str:
         return str(uuid)
     except (AttributeError, RuntimeError):
         try:
-            return runtime.deviceGetPCIBusId(device_id).decode()
+            bus_id = runtime.deviceGetPCIBusId(device_id)
+            return bus_id.decode() if isinstance(bus_id, bytes) else str(bus_id)
         except AttributeError:
             props = runtime.getDeviceProperties(device_id)
             name = props["name"]

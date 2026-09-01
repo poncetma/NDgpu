@@ -9,7 +9,7 @@ from ndgpu import (DiffusionEigenSolver, DistributedDiffusionEigenSolver,
                    TriDiffusionEigenSolver, TriGrid)
 from ndgpu.distributed import (CartesianSlabPartition, DistributedContext,
                                DistributedResult, SerialReductions,
-                               TriRowPartition)
+                               TriRowPartition, _cuda_device_identity)
 from ndgpu.linalg import PCGWorkspace, pcg
 from ndgpu.stencil import GroupOperator
 
@@ -122,6 +122,25 @@ def test_serial_context_and_reductions_do_not_require_mpi():
         context.reductions.dot_many(((values, values), (values, values + 1))),
         np.asarray([55.0, 70.0]))
     assert isinstance(context.reductions, SerialReductions)
+
+
+def test_cuda_identity_preserves_string_pci_bus_id():
+    class Runtime:
+        @staticmethod
+        def deviceGetUuid(device_id):
+            del device_id
+            raise RuntimeError("UUID API unavailable")
+
+        @staticmethod
+        def deviceGetPCIBusId(device_id):
+            assert device_id == 1
+            return "0039:01:00.0"
+
+    class XP:
+        class cuda:
+            runtime = Runtime()
+
+    assert _cuda_device_identity(XP, 1) == "0039:01:00.0"
 
 
 def test_cpu_mpi_context_reduces_and_exchanges_backend_arrays():

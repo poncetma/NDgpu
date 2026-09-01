@@ -1,6 +1,6 @@
 # Multi-GPU standalone diffusion development plan
 
-Status: Phase 1 accepted; Phase 2 Cartesian operator prototype in progress
+Status: Phase 2 Cartesian multi-GPU domain decomposition accepted
 
 Date: 2026-08-20
 
@@ -25,6 +25,25 @@ Phase 2 operator evidence (2026-09-01):
   with the serial stencil to a maximum absolute error of
   `4.440892098500626e-16` across mixed boundary laws.
 - In-process gates also cover cuts along all three axes and one-cell slabs.
+
+Phase 2 eigenvalue and multi-GPU evidence (2026-09-01):
+
+- Merlin CPU jobs `8756663` (two ranks) and `8756664` (four ranks) completed
+  with exit `0:0`. Both retained the serial 23 outer and 186 total inner
+  iterations for the `(17, 13, 9)` bare-box problem.
+- The two-rank CPU eigenvalue was bit-identical to serial. The four-rank
+  eigenvalue differed by `2.220446049250313e-16`; normalized gathered-flux L2
+  errors were below `3.3e-16`.
+- GH200 job `202426` completed with exit `0:0` on two distinct devices at PCI
+  locations `0029:01:00.0` and `0039:01:00.0`. Each rank owned a
+  `(64, 96, 64)` half-domain of the global `(128, 96, 64)` problem.
+- The two-GPU host-staged result differed from the serial GPU solve by
+  `1.3503664852976272e-10` in eigenvalue and `7.117145762278103e-10` in
+  normalized flux L2. Both used 19 outer and 1226 total inner iterations.
+- The focused distributed suite passed 14 tests; the combined distributed,
+  Krylov, and stencil regression gate passed 82 tests with 2 expected skips.
+- This accepts the Phase 2 Cartesian slab path. Phase 3 triangular row
+  decomposition is still required before HP-MR can use multiple GPUs.
 
 ## Objective
 

@@ -1,40 +1,55 @@
 # Multi-GPU diffusion bring-up
 
-The first implementation slice provides MPI rank placement, communication
-probes, global reduction providers, and spatial partition metadata. It does
-not yet provide a multi-rank diffusion operator. Track the remaining phases in
-`multi_gpu_diffusion_plan.md`.
+The accepted Cartesian implementation provides MPI rank placement, global
+reductions, one-axis spatial decomposition, blocking halo exchange, rank-local
+cross-section fields and operators, distributed PCG/power iteration, and
+explicit gathered output. The triangular HP-MR row decomposition remains
+Phase 3; track it in `multi_gpu_diffusion_plan.md`.
 
-## Phase 1 solver API
+## Cartesian solver API
 
-The explicit distributed solver API is available for size-one CPU and GPU
-communicators. It exercises the distributed reductions and result ownership
-without claiming that spatial decomposition is ready:
+The explicit distributed solver accepts size-one and multi-rank CPU/GPU MPI
+communicators:
 
 ```python
 from mpi4py import MPI
-from ndgpu import DistributedTriDiffusionEigenSolver
+from ndgpu import DistributedDiffusionEigenSolver
 
-solver = DistributedTriDiffusionEigenSolver(
+solver = DistributedDiffusionEigenSolver(
     problem.grid,
     problem.materials,
     problem.material_map,
     active=problem.active,
     mask_bc=problem.mask_bc,
     communicator=MPI.COMM_WORLD,
-    decomposition="rows",
+    decomposition="slab",
     device="gpu",
 )
 result = solver.solve(verbose=True)
 flux = result.gather_flux(root=0)
 ```
 
-`result.local_flux` is always the owned field. Global flux construction is an
-explicit `gather_flux()` call. For now, construction with more than one rank
-fails before cross-section fields are allocated; Phase 2 and Phase 3 will lift
-that guard after their halo operators pass correctness gates.
+`result.local_flux` and all solve fields are rank-local. Global flux
+construction is an explicit collective `gather_flux()` call that returns a
+host array on the selected root and `None` elsewhere. The solver accepts
+global setup maps during bring-up or already-sliced maps with the local
+partition shape. Only the global grid metadata and small material tables are
+replicated during the solve.
 
-The Phase 1 size-one acceptance executable is
+The Cartesian gate is `examples/distributed_cartesian_eigen_gate.py`.
+Reproducible launchers are:
+
+- `slurm/stage_and_submit_phase2_cpu_eigen_gates.sh` for two and four CPU
+  ranks.
+- `slurm/stage_and_submit_phase2_gh_eigen_gate.sh` for two GH200s.
+
+The accepted GH launcher uses `gh-hourly`: `gh-interactive` limits a job to
+one GPU. Its `srun` step includes both `--gpus-per-task=1` and
+`--gpu-bind=single:1`; omitting explicit binding can make rank placement
+ambiguous. Device uniqueness is checked through PCI bus identity before any
+cross-section fields are allocated.
+
+The retained Phase 1 size-one acceptance executable is
 `examples/distributed_size_one_gate.py`. The corresponding reproducible Slurm
 launchers are `slurm/stage_and_submit_phase1_cpu_gate.sh` and
 `slurm/stage_and_submit_phase1_gpu_gate.sh`.
@@ -45,6 +60,11 @@ Accepted stacks on 2026-08-20:
   `/data/scratch/shared/poncet_m/ndgpu-mpi4py-x86-py312` target.
 - Grace-Hopper: OpenMPI 5.0.7 with `mpi4py 4.1.2` installed offline in
   `/data/scratch/shared/poncet_m/ndgpu-gh-py313-v1`.
+
+Accepted multi-GPU Cartesian solve on 2026-09-01:
+
+- Two GH200s on `gpu003`, OpenMPI 5.0.7, CuPy 13.6.0, `mpi4py 4.1.2`, explicit
+  host-staged communication, job `202426`.
 
 The generated GH module `openmpi/5.0.7-iw2c-GH200-gpu` currently references
 stale dependency module names. The gate therefore validates and uses the
