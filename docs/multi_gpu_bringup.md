@@ -157,6 +157,11 @@ CUDA-aware path from two synchronization pairs per operator application to
 one. Unit tests cover both physical-boundary ranks;
 production use still requires the real-MPI GH probe and transient timing gate.
 
+The real two-rank CPU/OpenMPI 4.1.6 protocol gate passed as Merlin job
+`8759584` (`0:0`, 39 s). It completed 200 nonblocking 32 KiB halo exchanges
+at 16.9 us per exchange and verifies request/tag correctness outside the unit
+test mock. This does not replace the pending CUDA-aware GH acceptance gate.
+
 The generated GH module `openmpi/5.0.7-iw2c-GH200-gpu` currently references
 stale dependency module names. The gate therefore validates and uses the
 intact site installation prefix directly; its libraries retain full dependency
