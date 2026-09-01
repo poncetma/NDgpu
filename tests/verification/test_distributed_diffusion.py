@@ -476,6 +476,44 @@ def test_distributed_tri_transient_reuses_compatible_initial_eigenstate():
     assert transient.k0 == steady.k_eff
 
 
+def test_single_reduction_pcg_preserves_distributed_transient_history():
+    from ndgpu.benchmarks import HPMR_KINETICS, build_hpmr2d
+
+    initial = build_hpmr2d(
+        refine=1, drum_angle_deg=120.0, absorber="polar")
+    perturbed = build_hpmr2d(
+        refine=1, drum_angle_deg=118.0, absorber="polar")
+    context = DistributedContext.serial("cpu")
+    common = dict(
+        bc=initial.bc, active=initial.active, mask_bc=initial.mask_bc,
+        mix_material=initial.mix_material, mix_weight=initial.mix_weight)
+    steady = DistributedTriDiffusionEigenSolver(
+        initial.grid, initial.materials, initial.material_map,
+        context=context, **common).solve(tol_k=1e-9, tol_source=1e-8)
+
+    def problem_at(time):
+        problem = initial if time == 0.0 else perturbed
+        return (problem.materials, problem.material_map,
+                problem.mix_material, problem.mix_weight)
+
+    solver = DistributedTriTransientSolver(
+        initial.grid, problem_at, HPMR_KINETICS, context=context,
+        bc=initial.bc, active=initial.active, mask_bc=initial.mask_bc)
+    solve_kwargs = dict(
+        t_end=0.02, dt=0.01, initial_steady=steady,
+        tol_step=1e-7, rebalance=True)
+    reference = solver.solve(**solve_kwargs)
+    optimized = solver.solve(
+        **solve_kwargs, linsolve_kwargs={"single_reduction": True})
+
+    np.testing.assert_allclose(
+        optimized.power, reference.power, rtol=2e-9, atol=2e-11)
+    np.testing.assert_allclose(
+        optimized.flux, reference.flux, rtol=2e-8, atol=2e-10)
+    assert optimized.step_iterations == reference.step_iterations
+    assert optimized.initial_state_reused
+
+
 @pytest.mark.parametrize(
     "solve_kwargs, message",
     [
