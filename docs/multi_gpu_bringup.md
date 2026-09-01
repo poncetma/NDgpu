@@ -1,10 +1,11 @@
 # Multi-GPU diffusion bring-up
 
-The accepted Cartesian implementation provides MPI rank placement, global
-reductions, one-axis spatial decomposition, blocking halo exchange, rank-local
-cross-section fields and operators, distributed PCG/power iteration, and
-explicit gathered output. The triangular HP-MR row decomposition remains
-Phase 3; track it in `multi_gpu_diffusion_plan.md`.
+The accepted Cartesian and triangular implementations provide MPI rank
+placement, global reductions, one-axis spatial decomposition, blocking halo
+exchange, rank-local cross-section fields and operators, distributed
+PCG/power iteration, fixed-point transient stepping, and explicit gathered
+output. Track subsequent optimization and physics extensions in
+`multi_gpu_diffusion_plan.md`.
 
 ## Cartesian solver API
 
@@ -49,6 +50,53 @@ one GPU. Its `srun` step includes both `--gpus-per-task=1` and
 ambiguous. Device uniqueness is checked through PCI bus identity before any
 cross-section fields are allocated.
 
+## Triangular and transient APIs
+
+`DistributedTriDiffusionEigenSolver` partitions triangular-grid rows and
+supports both 2-D triangles and extruded 3-D prisms. It retains active masks,
+mask boundary conditions, and volume-mixed drum cells. The corresponding
+fixed-point transient API localizes every material/mixing map returned by
+`problem_at(t)`:
+
+```python
+from mpi4py import MPI
+from ndgpu import DistributedTriTransientSolver
+
+solver = DistributedTriTransientSolver(
+    problem.grid,
+    problem_at,
+    kinetics,
+    active=problem.active,
+    mask_bc=problem.mask_bc,
+    communicator=MPI.COMM_WORLD,
+    decomposition="rows",
+    device="gpu",
+)
+result = solver.solve(
+    t_end=1.0, dt=0.01, verbose=MPI.COMM_WORLD.Get_rank() == 0)
+flux = result.gather_flux(root=0)
+precursors = result.gather_precursors(root=0)
+```
+
+`result.local_flux` and `result.local_precursors` remain rank-local. Both
+gather methods are collective and return host arrays only on the selected
+root.
+
+Current limitations are explicit: distributed transients support fixed-step,
+fixed-point stepping with global kinetics. Adaptive BDF, monolithic stepping,
+feedback callbacks, `xs_update_at`, and `initial_steady` handoff are rejected.
+Multi-rank triangular discontinuity factors are also deferred because their
+asymmetric partition-interface coefficients require a separate exchange.
+
+Reproducible HPMR gates are:
+
+- `slurm/stage_and_submit_phase3_gh_tri_gate.sh` for triangular eigenvalue
+  decomposition on two GH200s.
+- `slurm/stage_and_submit_phase4_cpu_transient_gates.sh` for two and four CPU
+  transient ranks.
+- `slurm/stage_and_submit_phase4_gh_transient_gate.sh` for a two-GH200 moving
+  drum transient.
+
 The retained Phase 1 size-one acceptance executable is
 `examples/distributed_size_one_gate.py`. The corresponding reproducible Slurm
 launchers are `slurm/stage_and_submit_phase1_cpu_gate.sh` and
@@ -65,6 +113,12 @@ Accepted multi-GPU Cartesian solve on 2026-09-01:
 
 - Two GH200s on `gpu003`, OpenMPI 5.0.7, CuPy 13.6.0, `mpi4py 4.1.2`, explicit
   host-staged communication, job `202426`.
+
+Accepted triangular solves on 2026-09-01:
+
+- Polar volume-mixed r32 HPMR eigenvalue on two GH200s, job `202433`.
+- Polar volume-mixed r16 HPMR moving-drum transient on two GH200s, job
+  `202439`.
 
 The generated GH module `openmpi/5.0.7-iw2c-GH200-gpu` currently references
 stale dependency module names. The gate therefore validates and uses the

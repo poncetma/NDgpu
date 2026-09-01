@@ -14,6 +14,7 @@ from .distributed_stencil import (DistributedCartesianGroupOperator,
                                   DistributedTriGroupOperator)
 from .distributed_solver import (DistributedDiffusionEigenSolver,
                                  DistributedTriDiffusionEigenSolver)
+from .distributed_transient import DistributedTriTransientSolver
 from .femffusion import read_material_xml, read_xsec
 from .griffin_xs import (read_library as read_griffin_library,
                         read_material as read_griffin_material,
@@ -132,6 +133,7 @@ __all__ = [
     "DistributedResult",
     "DistributedDiffusionEigenSolver",
     "DistributedTriDiffusionEigenSolver",
+    "DistributedTriTransientSolver",
     "DistributedCartesianGroupOperator",
     "DistributedTriGroupOperator",
     "SerialReductions",

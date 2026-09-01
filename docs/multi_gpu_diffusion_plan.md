@@ -1,6 +1,7 @@
 # Multi-GPU standalone diffusion development plan
 
-Status: Phase 2 Cartesian multi-GPU domain decomposition accepted
+Status: Phase 3 triangular multi-GPU decomposition and fixed-point transient
+extension accepted
 
 Date: 2026-08-20
 
@@ -56,10 +57,37 @@ Phase 3 triangular CPU evidence (2026-09-01):
   row cuts crossed heterogeneous core and absorber regions rather than only
   void backing rows.
 
+Phase 3 triangular GPU evidence (2026-09-01):
+
+- GH200 job `202433` completed with exit `0:0` on two distinct devices at PCI
+  locations `0029:01:00.0` and `0039:01:00.0`.
+- The polar volume-mixed r32 HPMR mesh had global shape `(579, 579, 2)` and
+  local shapes `(290, 579, 2)` and `(289, 579, 2)`. Each rank owned 1,719
+  mixed drum cells.
+- The distributed and serial GPU solves retained 18 outer and 5,566 total
+  inner iterations. The eigenvalue error was `1.51e-14` and normalized
+  gathered-flux L2 error was `1.02e-13`.
+
+Fixed-point transient extension evidence (2026-09-01):
+
+- Merlin jobs `8757114` (two ranks) and `8757115` (four ranks) completed with
+  exit `0:0`. A two-step polar volume-mixed HPMR drum perturbation retained the
+  serial 12 and 8 nonlinear sweeps and 609 total inner iterations.
+- The CPU maximum power-history error was below `1.1e-13`; final flux and
+  precursor relative L2 errors were below `3.7e-14` and `5.6e-16`.
+- GH200 job `202439` completed with exit `0:0` on two distinct GPUs. The r16
+  global shape `(291, 291, 2)` was divided into local row slabs
+  `(146, 291, 2)` and `(145, 291, 2)`.
+- The multi-GPU transient matched the single-GPU power history within
+  `1.81e-13`, final flux within `3.92e-14`, and final precursors within
+  `3.01e-15`. Both paths used 13 and 11 nonlinear sweeps and 6,577 total inner
+  iterations.
+
 ## Objective
 
 Add a production-quality multi-GPU execution path for standalone multigroup
-diffusion eigenvalue calculations. The first production target is the
+diffusion eigenvalue and fixed-step transient calculations. The first
+production target is the
 body-fitted 2-D HP-MR problem solved by `TriDiffusionEigenSolver`, followed by
 extruded 3-D triangular meshes and the Cartesian `DiffusionEigenSolver`.
 
@@ -83,10 +111,13 @@ Included in the first production release:
 - Single-node and multi-node NVIDIA GPU execution under Slurm.
 - A host-staging communication fallback for installations without CUDA-aware
   MPI, clearly reported as a fallback rather than silently selected.
+- Fixed-step, fixed-point diffusion transients with global kinetics and
+  time-varying material maps or volume-mixing maps.
 
 Explicitly deferred:
 
-- Transients, IQS, thermal feedback, noise, S_N, SP3, SDPN, and hybrid methods.
+- Adaptive-BDF and monolithic transient stepping; IQS, thermal feedback,
+  noise, S_N, SP3, SDPN, and hybrid methods.
 - Distributed mesh adaptation or dynamic repartitioning.
 - Multi-GPU execution from one Python process.
 - Fault tolerance and checkpoint/restart during an eigenvalue solve.
@@ -403,7 +434,8 @@ explicit distributed solver first:
 
 ```python
 from mpi4py import MPI
-from ndgpu import DistributedTriDiffusionEigenSolver
+from ndgpu import (DistributedTriDiffusionEigenSolver,
+                   DistributedTriTransientSolver)
 
 solver = DistributedTriDiffusionEigenSolver(
     problem.grid,
@@ -422,6 +454,28 @@ result = solver.solve(tol_k=1e-8, tol_source=1e-7, verbose=True)
 flux = result.gather_flux(root=0)  # collective; non-root ranks receive None
 if result.rank == 0:
     print(flux.shape)
+```
+
+The transient solver follows the same ownership contract. `problem_at(t)` may
+return either `(materials, material_map)` or the four-entry volume-mixing form.
+The final flux and precursor fields remain local until their explicit gather
+collectives are called:
+
+```python
+transient = DistributedTriTransientSolver(
+    problem.grid,
+    problem_at,
+    kinetics,
+    active=problem.active,
+    mask_bc=problem.mask_bc,
+    communicator=MPI.COMM_WORLD,
+    decomposition="rows",
+    device="gpu",
+)
+result = transient.solve(
+    t_end=1.0, dt=0.01, verbose=MPI.COMM_WORLD.Get_rank() == 0)
+flux = result.gather_flux(root=0)
+precursors = result.gather_precursors(root=0)
 ```
 
 An explicit class makes ownership and collective behavior visible and avoids
@@ -443,6 +497,8 @@ summary on rank zero plus rank-level communication telemetry files.
   wrappers and halo workspaces.
 - `ndgpu/distributed_solver.py`: distributed power iteration and public
   diffusion solver classes.
+- `ndgpu/distributed_transient.py`: distributed triangular fixed-point
+  transient driver and rank-local problem-map localization.
 - `examples/hpmr_eigen_multi_gpu.py`: standalone HP-MR benchmark/production
   entry point.
 - `slurm/run_ndgpu_multi_gpu.sh`: one-rank-per-GPU Slurm launcher with strict
@@ -546,6 +602,26 @@ Acceptance:
 - Forward outer and total inner iteration counts do not materially change.
 - Deliberately treating an MPI cut as a physical boundary is caught by a
   regression test.
+
+### Phase 3T: fixed-point transient extension
+
+Deliverables:
+
+- Global reductions for power normalization, source convergence, rebalance,
+  PCG, and Anderson acceleration.
+- Rank-local localization and caching of time-varying material and mixing maps.
+- Explicit final flux and precursor gathers without implicit global fields.
+- Moving-drum HPMR comparisons on CPU MPI and multiple GH200 GPUs.
+
+Acceptance:
+
+- Complete power histories and final flux/precursor fields agree with the
+  corresponding serial-backend solve within the requested solver tolerance.
+- Distributed and serial runs retain the same nonlinear and inner iteration
+  counts for the acceptance perturbation.
+- Every rank owns only its row slab throughout the transient.
+- Unsupported adaptive, monolithic, feedback, and initial-state handoff modes
+  fail before entering collective iterations.
 
 ### Phase 4: distributed setup and output
 

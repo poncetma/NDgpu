@@ -475,6 +475,11 @@ class DistributedResult:
     def local_flux_numpy(self) -> np.ndarray:
         return asnumpy(self.local_flux)
 
+    @property
+    def flux(self):
+        """Rank-local compatibility alias for solver-internal handoffs."""
+        return self.local_flux
+
     def gather_flux(self, root: int = 0):
         """Collect the global flux explicitly; collective in multi-rank use."""
         if not 0 <= root < self.size:
@@ -492,6 +497,46 @@ class DistributedResult:
             f"{self.inner_iterations} inners, {self.solve_seconds:.2f} s on "
             f"{self.device})"
         )
+
+
+class DistributedTransientResult:
+    """Rank-local transient result with explicit final-state gathering."""
+
+    def __init__(self, local_result, partition, context):
+        self.local_result = local_result
+        self.partition = partition
+        self.context = context
+
+    @property
+    def local_flux(self):
+        return self.local_result.flux
+
+    @property
+    def local_precursors(self):
+        return self.local_result.precursors
+
+    @property
+    def rank(self):
+        return self.context.rank
+
+    @property
+    def size(self):
+        return self.context.size
+
+    def gather_flux(self, root=0):
+        return self.context.gather_spatial(
+            self.local_flux, self.partition, root=root)
+
+    def gather_precursors(self, root=0):
+        return self.context.gather_spatial(
+            self.local_precursors, self.partition, root=root)
+
+    def __getattr__(self, name):
+        return getattr(self.local_result, name)
+
+    def __repr__(self):
+        return (f"DistributedTransientResult(rank {self.rank}/{self.size}, "
+                f"{self.local_result!r})")
 
 
 def _discover_local_rank(communicator, mpi) -> int:

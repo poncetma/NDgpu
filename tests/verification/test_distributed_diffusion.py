@@ -6,7 +6,8 @@ import pytest
 from ndgpu import (DiffusionEigenSolver, DistributedDiffusionEigenSolver,
                    DistributedCartesianGroupOperator,
                    DistributedTriGroupOperator,
-                   DistributedTriDiffusionEigenSolver, Grid, PWR_TWO_GROUP,
+                   DistributedTriDiffusionEigenSolver,
+                   DistributedTriTransientSolver, Grid, PWR_TWO_GROUP,
                    TriDiffusionEigenSolver, TriGrid)
 from ndgpu.distributed import (CartesianSlabPartition, DistributedContext,
                                DistributedResult, SerialReductions,
@@ -374,3 +375,62 @@ def test_multi_rank_tri_solver_rejects_discontinuity_factors_early():
     with pytest.raises(NotImplementedError, match="discontinuity factors"):
         DistributedTriDiffusionEigenSolver(
             object(), object(), context=context, df=object())
+
+
+def test_size_one_distributed_tri_transient_matches_drum_step_exactly():
+    from ndgpu.benchmarks import HPMR_KINETICS, build_hpmr2d
+    from ndgpu.transient import TransientSolver
+
+    initial = build_hpmr2d(
+        refine=1, drum_angle_deg=120.0, absorber="polar")
+    perturbed = build_hpmr2d(
+        refine=1, drum_angle_deg=110.0, absorber="polar")
+
+    def problem_at(time):
+        problem = initial if time == 0.0 else perturbed
+        return (problem.materials, problem.material_map,
+                problem.mix_material, problem.mix_weight)
+
+    common = dict(
+        bc=initial.bc, active=initial.active, mask_bc=initial.mask_bc)
+    reference = TransientSolver(
+        initial.grid, problem_at, HPMR_KINETICS, device="cpu",
+        group_operator=TriGroupOperator,
+        eig_solver=TriDiffusionEigenSolver, **common).solve(
+            t_end=0.01, dt=0.01, tol_step=1e-6, rebalance=True)
+    distributed = DistributedTriTransientSolver(
+        initial.grid, problem_at, HPMR_KINETICS,
+        context=DistributedContext.serial("cpu"), **common).solve(
+            t_end=0.01, dt=0.01, tol_step=1e-6, rebalance=True)
+
+    np.testing.assert_array_equal(distributed.power, reference.power)
+    np.testing.assert_array_equal(distributed.local_flux, reference.flux)
+    np.testing.assert_array_equal(
+        distributed.local_precursors, reference.precursors)
+    assert distributed.step_iterations == reference.step_iterations
+    assert (distributed.total_inner_iterations ==
+            reference.total_inner_iterations)
+
+
+@pytest.mark.parametrize(
+    "solve_kwargs, message",
+    [
+        ({"step_solver": "monolithic"}, "fixed-point"),
+        ({"adaptive_bdf": {}}, "adaptive BDF"),
+        ({"initial_steady": object()}, "initial_steady"),
+    ],
+)
+def test_distributed_tri_transient_rejects_unsupported_modes(
+        solve_kwargs, message):
+    from ndgpu.benchmarks import HPMR_KINETICS, build_hpmr2d
+
+    problem = build_hpmr2d(refine=1, absorber="polar")
+    solver = DistributedTriTransientSolver(
+        problem.grid,
+        lambda time: (problem.materials, problem.material_map),
+        HPMR_KINETICS,
+        context=DistributedContext.serial("cpu"),
+        bc=problem.bc, active=problem.active, mask_bc=problem.mask_bc)
+
+    with pytest.raises(NotImplementedError, match=message):
+        solver.solve(t_end=0.01, dt=0.01, **solve_kwargs)

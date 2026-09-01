@@ -140,7 +140,7 @@ def _require_global_kinetics(kin: Kinetics, who: str):
             f"(diffusion)")
 
 
-def _anderson_mix(hist, S, xp):
+def _anderson_mix(hist, S, xp, reductions=None):
     """One Anderson update of the fixed-point iterate S from the history of
     (S_j, G(S_j)) pairs (oldest first; the current sweep is hist[-1]): the
     residual-minimizing affine combination of the stored sweeps. Returns S
@@ -149,9 +149,19 @@ def _anderson_mix(hist, S, xp):
     F = [Gj - Sj for Sj, Gj in hist]
     dF = [Fj - F[-1] for Fj in F[:-1]]
     m = len(dF)
-    A = np.array([[float(xp.sum(dF[i] * dF[j])) for j in range(m)]
-                  for i in range(m)])
-    b = np.array([-float(xp.sum(dF[i] * F[-1])) for i in range(m)])
+    if reductions is None:
+        A = np.array([[float(xp.sum(dF[i] * dF[j])) for j in range(m)]
+                      for i in range(m)])
+        b = np.array([-float(xp.sum(dF[i] * F[-1])) for i in range(m)])
+    else:
+        upper = [(i, j) for i in range(m) for j in range(i, m)]
+        pairs = [(dF[i], dF[j]) for i, j in upper]
+        pairs.extend((dF[i], F[-1]) for i in range(m))
+        packed = np.asarray(asnumpy(reductions.dot_many(pairs)), dtype=np.float64)
+        A = np.empty((m, m), dtype=np.float64)
+        for value, (i, j) in zip(packed, upper):
+            A[i, j] = A[j, i] = value
+        b = -packed[len(upper):]
     A[np.diag_indices(m)] += 1e-12 * (np.trace(A) + 1e-300)
     try:
         gamma = np.linalg.solve(A, b)
@@ -296,7 +306,7 @@ class TransientSolver:
                  xs_update_at=None, on_step=None, feedback_iteration=None,
                  adaptive_error_state=None, adaptive_order_error_state=None,
                  adaptive_order_callback=None,
-                 phase_context=None):
+                 phase_context=None, reductions=None):
         self.grid = grid
         self.problem_at = problem_at
         self.xs_update_at = xs_update_at
@@ -309,6 +319,7 @@ class TransientSolver:
         # Keeping it outside the numerical result avoids timing overhead unless
         # a coupled/benchmark driver explicitly opts in.
         self.phase_context = phase_context
+        self.reductions = reductions
         self.kinetics = kinetics
         self.bc = bc
         self.active = active
@@ -595,11 +606,19 @@ class TransientSolver:
             critical equilibrium fields.
         """
         xp, kin = self.xp, self.kinetics
+        reductions = self.reductions
         beta, lam = kin.beta, kin.decay
         scheme = make_time_scheme(time_scheme, time_weight)
         step_solver = str(step_solver).lower()
         if step_solver not in ("fixed-point", "monolithic"):
             raise ValueError("step_solver must be 'fixed-point' or 'monolithic'")
+        if reductions is not None and step_solver != "fixed-point":
+            raise NotImplementedError(
+                "distributed transient reductions currently support only "
+                "step_solver='fixed-point'")
+        if reductions is not None and adaptive_bdf is not None:
+            raise NotImplementedError(
+                "distributed adaptive BDF error norms are not implemented")
         if step_solver == "monolithic" and not self.symmetric_operator:
             raise ValueError("monolithic group preconditioning currently needs "
                              "symmetric within-group diffusion operators")
@@ -616,6 +635,8 @@ class TransientSolver:
             if int(max_feedback_iterations) < 1:
                 raise ValueError("max_feedback_iterations must be positive")
         lin_kw = dict(linsolve_kwargs or {})
+        if reductions is not None and "reductions" in lin_kw:
+            raise ValueError("distributed transient solver owns its reductions")
         if "workspace" in lin_kw:
             raise ValueError(
                 "linsolve_kwargs['workspace'] is managed per energy group; "
@@ -841,7 +862,9 @@ class TransientSolver:
         vol_w = None if met is None else xp.asarray(met[0], dtype=self.dtype)
 
         def total_power(src):
-            return float(xp.sum(src if vol_w is None else src * vol_w))
+            value = src if vol_w is None else src * vol_w
+            return float(xp.sum(value) if reductions is None
+                         else reductions.sum(value))
 
         fields = eig.fields
         scalar = self.dtype.type
@@ -1402,7 +1425,9 @@ class TransientSolver:
                     term = dsrc_g[g] + inv_vdt[g] * phi_old[g]
                     if src_w is not None:
                         term = term * src_w
-                    fixed_total += float(xp.sum(term))
+                    fixed_total += float(
+                        xp.sum(term) if reductions is None
+                        else reductions.sum(term))
                     # The coarse scheme needs this per CELL, not just its total;
                     # it is constant through the step, so it is built once here.
                     fixed_cell = term if fixed_cell is None else fixed_cell + term
@@ -1456,7 +1481,9 @@ class TransientSolver:
                         sol, n_it = self._linsolve(
                             ops[g].apply, q, phi[g], ops[g].inv_diag, xp,
                             rtol=rtol, precond=preconds[g], **workspace_kw,
-                            **safety_kw, **lin_kw)
+                            **safety_kw,
+                            **({} if reductions is None else
+                               {"reductions": reductions}), **lin_kw)
                         if batch is None:
                             phi[g] = sol
                         else:
@@ -1465,7 +1492,13 @@ class TransientSolver:
                 G_S = fission_source(phi) / k0
 
                 delta = G_S - S
-                change = float(xp.sqrt(xp.sum(delta * delta) / xp.sum(G_S**2)))
+                if reductions is None:
+                    change = float(xp.sqrt(
+                        xp.sum(delta * delta) / xp.sum(G_S**2)))
+                else:
+                    error_pair = reductions.dot_many(
+                        ((delta, delta), (G_S, G_S)))
+                    change = float(xp.sqrt(error_pair[0] / error_pair[1]))
 
                 # ---- whole-core rebalance -------------------------------
                 # The swept flux satisfies the balance with the source it was
@@ -1488,8 +1521,11 @@ class TransientSolver:
                 # stuck at 5e-1 after 6000 sweeps), and an earlier variant that
                 # also mis-stated the sweep's balance gave a negative power.
                 if rebalance and change > 10.0 * tol_step:
-                    w_delta = float(xp.sum(w_fis_sum * delta
-                                           * (src_w if src_w is not None else 1.0)))
+                    weighted_delta = (w_fis_sum * delta
+                                      * (src_w if src_w is not None else 1.0))
+                    w_delta = float(
+                        xp.sum(weighted_delta) if reductions is None
+                        else reductions.sum(weighted_delta))
                     denom = fixed_total - w_delta
                     if denom > 0.0:
                         # Far from 1 means the balance is being asked to
@@ -1527,7 +1563,7 @@ class TransientSolver:
                 hist = hist[-anderson_depth:]
                 S = G_S
                 if len(hist) >= 2:
-                    S = _anderson_mix(hist, S, xp)
+                    S = _anderson_mix(hist, S, xp, reductions=reductions)
                     anderson_used = True
             else:
                 raise RuntimeError(
