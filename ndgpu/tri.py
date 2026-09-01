@@ -91,7 +91,8 @@ class TriGroupOperator:
     supports_out = True
 
     def __init__(self, xp, grid: TriGrid, D, removal, bc=BC_VACUUM, active=None,
-                 mask_bc=BC_VACUUM, df=None, bcf=None):
+                 mask_bc=BC_VACUUM, df=None, bcf=None,
+                 partition_interfaces=(False, False)):
         bc = normalize_bc(bc)  # only the z faces read bc; in-plane uses mask_bc
         self.xp = xp
         self.shape = grid.shape
@@ -221,7 +222,11 @@ class TriGroupOperator:
         # (or off-array, via the required void border). Each triangle has three
         # edges; add the boundary term per exposed edge.
         if alpha_edge != 0.0 and act is not None:
-            border = (act[0].any() or act[-1].any() or act[:, 0].any() or act[:, -1].any())
+            lower_interface, upper_interface = partition_interfaces
+            border = (
+                (not lower_interface and act[0].any())
+                or (not upper_interface and act[-1].any())
+                or act[:, 0].any() or act[:, -1].any())
             if bool(border):
                 raise ValueError("active mask must have a one-cell void border")
             ad, au = act[:, :, 0], act[:, :, 1]

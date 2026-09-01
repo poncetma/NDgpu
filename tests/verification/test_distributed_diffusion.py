@@ -5,6 +5,7 @@ import pytest
 
 from ndgpu import (DiffusionEigenSolver, DistributedDiffusionEigenSolver,
                    DistributedCartesianGroupOperator,
+                   DistributedTriGroupOperator,
                    DistributedTriDiffusionEigenSolver, Grid, PWR_TWO_GROUP,
                    TriDiffusionEigenSolver, TriGrid)
 from ndgpu.distributed import (CartesianSlabPartition, DistributedContext,
@@ -12,6 +13,7 @@ from ndgpu.distributed import (CartesianSlabPartition, DistributedContext,
                                TriRowPartition, _cuda_device_identity)
 from ndgpu.linalg import PCGWorkspace, pcg
 from ndgpu.stencil import GroupOperator
+from ndgpu.tri import TriGroupOperator
 
 
 class _MirroredCommunicator:
@@ -220,6 +222,49 @@ def test_cartesian_slab_operator_preserves_mask_boundary_across_mpi_cut():
     np.testing.assert_allclose(gathered, expected, rtol=2e-15, atol=2e-15)
 
 
+@pytest.mark.parametrize("extruded", [False, True])
+def test_tri_row_operator_matches_serial_across_active_partition(extruded):
+    shape = (8, 7, 2, 3) if extruded else (8, 7, 2)
+    grid = TriGrid(shape, side=1.7, height=6.0)
+    rng = np.random.default_rng(1103 + extruded)
+    diffusion = 0.2 + rng.random(shape)
+    removal = 0.01 + 0.2 * rng.random(shape)
+    flux = rng.random(shape)
+    active = np.ones(shape, dtype=bool)
+    active[0] = active[-1] = False
+    active[:, 0] = active[:, -1] = False
+    # Exercise both connected and active-to-void faces across the row cut.
+    active[3, 2, 0] = False
+    active[4, 4, 1] = False
+    reference = TriGroupOperator(
+        np, grid, diffusion.copy(), removal.copy(), active=active,
+        bc=(("reflective", "reflective"),
+            ("reflective", "reflective"),
+            ("vacuum", "zero-flux")),
+        mask_bc="vacuum")
+    expected = reference.apply(flux)
+    gathered = np.empty_like(expected)
+    gathered_diag = np.empty_like(reference.diag)
+
+    for rank in range(2):
+        partition = TriRowPartition.create(shape, rank=rank, size=2)
+        owned = partition.owned_slice
+        context = _QueuedHaloContext(partition, [diffusion, active, flux])
+        operator = DistributedTriGroupOperator(
+            np, grid, np.array(diffusion[owned], copy=True),
+            np.array(removal[owned], copy=True), partition, context,
+            active=np.array(active[owned], copy=True),
+            bc=(("reflective", "reflective"),
+                ("reflective", "reflective"),
+                ("vacuum", "zero-flux")),
+            mask_bc="vacuum")
+        gathered[owned] = operator.apply(np.array(flux[owned], copy=True))
+        gathered_diag[owned] = operator.diag
+
+    np.testing.assert_allclose(gathered_diag, reference.diag, rtol=0.0, atol=1e-15)
+    np.testing.assert_allclose(gathered, expected, rtol=2e-15, atol=2e-15)
+
+
 def test_pcg_uses_global_reductions_without_changing_recurrence():
     matrix = np.array([
         [4.0, -1.0, 0.0],
@@ -324,8 +369,8 @@ def test_size_one_distributed_tri_solver_matches_serial_result():
     np.testing.assert_array_equal(result.local_flux, reference.flux)
 
 
-def test_multi_rank_tri_solver_rejects_before_field_construction():
+def test_multi_rank_tri_solver_rejects_discontinuity_factors_early():
     context, _ = _mirrored_context()
-    with pytest.raises(NotImplementedError, match="Phase 3 row operator"):
+    with pytest.raises(NotImplementedError, match="discontinuity factors"):
         DistributedTriDiffusionEigenSolver(
-            object(), object(), context=context, decomposition="slab")
+            object(), object(), context=context, df=object())

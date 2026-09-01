@@ -10,7 +10,8 @@ from .backend import asnumpy, device_name, get_backend
 from .distributed import (CartesianSlabPartition, DistributedContext,
                           DistributedReductions, DistributedResult,
                           SerialReductions, SpatialPartition, TriRowPartition)
-from .distributed_stencil import DistributedCartesianGroupOperator
+from .distributed_stencil import (DistributedCartesianGroupOperator,
+                                  DistributedTriGroupOperator)
 from .distributed_solver import (DistributedDiffusionEigenSolver,
                                  DistributedTriDiffusionEigenSolver)
 from .femffusion import read_material_xml, read_xsec
@@ -132,6 +133,7 @@ __all__ = [
     "DistributedDiffusionEigenSolver",
     "DistributedTriDiffusionEigenSolver",
     "DistributedCartesianGroupOperator",
+    "DistributedTriGroupOperator",
     "SerialReductions",
     "DistributedReductions",
     "SpatialPartition",

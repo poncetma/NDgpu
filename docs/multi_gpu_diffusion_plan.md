@@ -45,6 +45,17 @@ Phase 2 eigenvalue and multi-GPU evidence (2026-09-01):
 - This accepts the Phase 2 Cartesian slab path. Phase 3 triangular row
   decomposition is still required before HP-MR can use multiple GPUs.
 
+Phase 3 triangular CPU evidence (2026-09-01):
+
+- Merlin jobs `8756898` (two ranks) and `8756899` (four ranks) completed with
+  exit `0:0` on the polar volume-mixed r4 HPMR problem.
+- Both decompositions retained the serial 18 outer and 571 total inner
+  iterations. Their eigenvalue error was `2.220446049250313e-16`; normalized
+  gathered-flux L2 errors were below `1.2e-15`.
+- Every rank owned active HPMR cells and polar-mixed drum cells, proving the
+  row cuts crossed heterogeneous core and absorber regions rather than only
+  void backing rows.
+
 ## Objective
 
 Add a production-quality multi-GPU execution path for standalone multigroup

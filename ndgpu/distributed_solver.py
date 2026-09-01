@@ -6,10 +6,11 @@ import numpy as np
 
 from .distributed import (CartesianSlabPartition, DistributedContext,
                           DistributedResult, TriRowPartition)
-from .distributed_stencil import DistributedCartesianGroupOperator
+from .distributed_stencil import (DistributedCartesianGroupOperator,
+                                  DistributedTriGroupOperator)
 from .grid import Grid
 from .solver import DiffusionEigenSolver
-from .tri import TriDiffusionEigenSolver
+from .tri import TriDiffusionEigenSolver, TriGrid
 
 
 def _resolve_context(communicator, context, device, communication):
@@ -110,23 +111,53 @@ class DistributedDiffusionEigenSolver(DiffusionEigenSolver):
 
 
 class DistributedTriDiffusionEigenSolver(TriDiffusionEigenSolver):
-    """Size-one triangular entry point pending Phase 3 row decomposition."""
+    """Triangular diffusion solve with one contiguous row slab per rank."""
 
-    def __init__(self, *args, communicator=None, context=None,
+    def __init__(self, grid, materials, material_map=None, *, communicator=None,
+                 context=None, active=None, mix_material=None, mix_weight=None,
+                 df=None, bcf=None,
                  decomposition="auto", communication="auto", device="auto",
                  **kwargs):
         context, context_device = _resolve_context(
             communicator, context, device, communication)
-        if context.size != 1:
+        if context.size > 1 and (df is not None or bcf is not None):
             raise NotImplementedError(
-                "multi-rank triangular diffusion requires the Phase 3 row operator")
+                "distributed triangular discontinuity factors and boundary "
+                "corrections are not implemented")
         if decomposition not in ("auto", "rows"):
             raise ValueError("decomposition must be 'auto' or 'rows'")
 
+        partition = TriRowPartition.create(
+            grid.shape, context.rank, context.size)
+        local_grid = TriGrid(
+            partition.local_shape, side=grid.side, height=grid.height)
         self.distributed_context = context
-        super().__init__(*args, device=context_device, **kwargs)
-        self.partition = TriRowPartition.create(
-            self.grid.shape, context.rank, context.size)
+        self.partition = partition
+        self.global_grid = grid
+        self._distributed_active = _local_array(active, partition, "active")
+        local_material_map = _local_array(
+            material_map, partition, "material_map")
+        local_mix_material = _local_array(
+            mix_material, partition, "mix_material")
+        local_mix_weight = _local_array(mix_weight, partition, "mix_weight")
+
+        super().__init__(
+            local_grid, materials, material_map=local_material_map,
+            device=context_device, active=self._distributed_active,
+            mix_material=local_mix_material, mix_weight=local_mix_weight,
+            df=df, bcf=bcf, **kwargs)
+        self._normalization_cell_count = grid.n_cells
+
+    def _build_operators(self, grid, diffusion, sigma_t, removal, bc):
+        del grid, sigma_t
+        self.ops = [
+            DistributedTriGroupOperator(
+                self.xp, self.global_grid, diffusion[g], removal[g],
+                self.partition, self.distributed_context, bc=bc,
+                active=self.active, mask_bc=self.mask_bc,
+                communication_tag=500 + 10 * g)
+            for g in range(self.n_groups)
+        ]
 
     def solve(self, *args, **kwargs):
         if "reductions" in kwargs:
