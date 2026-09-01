@@ -33,6 +33,31 @@ class _MirroredCommunicator:
         recvbuf[...] = send
 
 
+class _CompletedRequest:
+    pass
+
+
+class _NonblockingMPI:
+    class Request:
+        @staticmethod
+        def Waitall(requests):
+            assert requests
+
+
+class _NonblockingCommunicator:
+    def __init__(self, receives):
+        self.receives = receives
+        self.sends = []
+
+    def Irecv(self, receive, *, source, tag):
+        receive[...] = self.receives[source, tag]
+        return _CompletedRequest()
+
+    def Isend(self, send, *, dest, tag):
+        self.sends.append((dest, tag, np.array(send, copy=True)))
+        return _CompletedRequest()
+
+
 class _CountingReductions(SerialReductions):
     def __init__(self, xp):
         super().__init__(xp)
@@ -164,6 +189,40 @@ def test_cpu_mpi_context_reduces_and_exchanges_backend_arrays():
     context.reset_communication_stats()
     assert context.communication_stats()["communication_seconds"] == 0.0
     assert context.communication_stats()["allreduce_calls"] == 0
+
+
+@pytest.mark.parametrize(
+    "rank, receive_tag, send_tag, send_index, receive_position",
+    [(0, 12, 11, -1, "upper"), (1, 11, 12, 0, "lower")],
+)
+def test_batched_halo_exchange_posts_both_directions_once(
+        rank, receive_tag, send_tag, send_index, receive_position):
+    partition = TriRowPartition.create((6, 4, 2), rank=rank, size=2)
+    values = np.arange(np.prod(partition.local_shape), dtype=float).reshape(
+        partition.local_shape)
+    neighbor = 1 - rank
+    expected_receive = np.full(values.shape[1:], 70.0 + rank)
+    communicator = _NonblockingCommunicator({
+        (neighbor, receive_tag): expected_receive,
+    })
+    context = DistributedContext(
+        communicator, np, rank=rank, size=2, local_rank=rank,
+        communication_mode="cpu-mpi", hostname="test-host",
+        batched_halos=True, _mpi=_NonblockingMPI)
+
+    lower, upper = context.exchange_halos(values, partition, tag=11)
+
+    received = upper if receive_position == "upper" else lower
+    physical = lower if receive_position == "upper" else upper
+    assert physical is None
+    np.testing.assert_array_equal(received, expected_receive)
+    assert len(communicator.sends) == 1
+    destination, actual_tag, sent = communicator.sends[0]
+    assert destination == neighbor and actual_tag == send_tag
+    np.testing.assert_array_equal(sent, values[send_index])
+    stats = context.communication_stats()
+    assert stats["sendrecv_calls"] == 1
+    assert stats["sendrecv_bytes"] == values[send_index].nbytes
 
 
 @pytest.mark.parametrize("axis,size", [(0, 3), (1, 2), (2, 2)])

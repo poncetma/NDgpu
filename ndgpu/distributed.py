@@ -216,6 +216,7 @@ class DistributedContext:
     device_id: int | None = None
     device_identity: str | None = None
     mpi_library_version: str | None = None
+    batched_halos: bool = False
     _mpi: object | None = field(default=None, repr=False)
     _reductions: object | None = field(default=None, init=False, repr=False)
     _communication_stats: dict = field(
@@ -252,7 +253,8 @@ class DistributedContext:
     @classmethod
     def from_mpi(cls, communicator, *, device: str = "gpu",
                  communication: str = "auto", local_rank: int | None = None,
-                 allow_shared_device: bool = False) -> "DistributedContext":
+                 allow_shared_device: bool = False,
+                 batched_halos: bool = False) -> "DistributedContext":
         """Construct from an mpi4py communicator and select this rank's GPU.
 
         ``communication='auto'`` deliberately chooses explicit host staging on
@@ -307,7 +309,8 @@ class DistributedContext:
         return cls(
             communicator, xp, rank, size, int(local_rank), communication,
             hostname=hostname, device_id=device_id, device_identity=identity,
-            mpi_library_version=MPI.Get_library_version().strip(), _mpi=MPI)
+            mpi_library_version=MPI.Get_library_version().strip(),
+            batched_halos=bool(batched_halos), _mpi=MPI)
 
     @property
     def reductions(self):
@@ -330,6 +333,7 @@ class DistributedContext:
             "device_id": self.device_id,
             "device_identity": self.device_identity,
             "mpi_library_version": self.mpi_library_version,
+            "batched_halos": self.batched_halos,
         }
 
     def reset_communication_stats(self):
@@ -415,6 +419,9 @@ class DistributedContext:
         if self.size == 1:
             return None, None
 
+        if self.batched_halos:
+            return self._exchange_halos_batched(value, partition, tag=tag)
+
         lower = partition.lower_rank
         upper = partition.upper_rank
         proc_null = self._mpi.PROC_NULL if self._mpi is not None else -1
@@ -432,6 +439,69 @@ class DistributedContext:
             source=upper if upper is not None else proc_null, tag=tag + 1)
         return (None if lower is None else lower_halo,
                 None if upper is None else upper_halo)
+
+    def _exchange_halos_batched(
+            self, value, partition: SpatialPartition, *, tag: int = 0):
+        """Exchange both slab faces with one nonblocking MPI completion."""
+        lower = partition.lower_rank
+        upper = partition.upper_rank
+
+        def plane(index):
+            sl = [slice(None)] * value.ndim
+            sl[partition.axis] = index
+            return self.xp.ascontiguousarray(value[tuple(sl)])
+
+        sends = []
+        lower_receive = upper_receive = None
+        requests = []
+        started = time.perf_counter()
+
+        if self.communication_mode == "host-staged":
+            lower_send = (None if lower is None else
+                          np.ascontiguousarray(asnumpy(plane(0))))
+            upper_send = (None if upper is None else
+                          np.ascontiguousarray(asnumpy(plane(-1))))
+            lower_buffer = (None if lower_send is None else
+                            np.empty_like(lower_send))
+            upper_buffer = (None if upper_send is None else
+                            np.empty_like(upper_send))
+        else:
+            lower_send = None if lower is None else plane(0)
+            upper_send = None if upper is None else plane(-1)
+            lower_buffer = (None if lower_send is None else
+                            self.xp.empty_like(lower_send))
+            upper_buffer = (None if upper_send is None else
+                            self.xp.empty_like(upper_send))
+            if self.communication_mode == "cuda-aware":
+                synchronize(self.xp)
+
+        if lower is not None:
+            requests.append(self.communicator.Irecv(
+                lower_buffer, source=lower, tag=tag))
+            requests.append(self.communicator.Isend(
+                lower_send, dest=lower, tag=tag + 1))
+            sends.append(lower_send)
+        if upper is not None:
+            requests.append(self.communicator.Irecv(
+                upper_buffer, source=upper, tag=tag + 1))
+            requests.append(self.communicator.Isend(
+                upper_send, dest=upper, tag=tag))
+            sends.append(upper_send)
+        self._mpi.Request.Waitall(requests)
+
+        if self.communication_mode == "host-staged":
+            if lower_buffer is not None:
+                lower_receive = self.xp.asarray(lower_buffer)
+            if upper_buffer is not None:
+                upper_receive = self.xp.asarray(upper_buffer)
+        else:
+            lower_receive, upper_receive = lower_buffer, upper_buffer
+            if self.communication_mode == "cuda-aware":
+                synchronize(self.xp)
+        self._record_communication(
+            "sendrecv", sum(send.nbytes for send in sends),
+            time.perf_counter() - started)
+        return lower_receive, upper_receive
 
     def gather_spatial(self, value, partition: SpatialPartition, *, root: int = 0):
         """Explicitly gather rank-local spatial slabs into one host array."""

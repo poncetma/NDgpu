@@ -14,7 +14,7 @@ import numpy as np
 from mpi4py import MPI
 
 from ndgpu.backend import asnumpy, device_name, synchronize
-from ndgpu.distributed import DistributedContext
+from ndgpu.distributed import DistributedContext, SpatialPartition
 
 
 def parse_args():
@@ -27,6 +27,7 @@ def parse_args():
     parser.add_argument("--elements", type=int, default=1 << 20)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--allreduce-iterations", type=int, default=1000)
+    parser.add_argument("--batched-halos", action="store_true")
     return parser.parse_args()
 
 
@@ -38,7 +39,8 @@ def main():
 
     communicator = MPI.COMM_WORLD
     context = DistributedContext.from_mpi(
-        communicator, device=args.device, communication=args.communication)
+        communicator, device=args.device, communication=args.communication,
+        batched_halos=args.batched_halos)
     if context.size < 2:
         raise RuntimeError("the MPI environment probe requires at least two ranks")
 
@@ -87,6 +89,42 @@ def main():
     if float(asnumpy(reduced)) != expected_sum:
         raise RuntimeError("timed all-reduce returned an incorrect value")
 
+    halo_elapsed = None
+    if args.batched_halos:
+        start = 2 * context.rank
+        partition = SpatialPartition(
+            (2 * context.size, args.elements), 0, context.rank,
+            context.size, start, start + 2)
+        halo_values = xp.stack([
+            xp.full(args.elements, 10.0 * context.rank, dtype=xp.float64),
+            xp.full(args.elements, 10.0 * context.rank + 1.0,
+                    dtype=xp.float64),
+        ])
+        lower, upper = context.exchange_halos(
+            halo_values, partition, tag=700)
+        if context.rank == 0:
+            assert lower is None
+        else:
+            np.testing.assert_array_equal(
+                asnumpy(lower),
+                np.full(args.elements, 10.0 * (context.rank - 1) + 1.0))
+        if context.rank == context.size - 1:
+            assert upper is None
+        else:
+            np.testing.assert_array_equal(
+                asnumpy(upper),
+                np.full(args.elements, 10.0 * (context.rank + 1)))
+
+        communicator.Barrier()
+        synchronize(xp)
+        started = MPI.Wtime()
+        for iteration in range(args.iterations):
+            lower, upper = context.exchange_halos(
+                halo_values, partition, tag=800 + 2 * iteration)
+        synchronize(xp)
+        halo_elapsed = communicator.allreduce(
+            MPI.Wtime() - started, op=MPI.MAX)
+
     placement = context.describe()
     placement["backend"] = device_name(xp)
     for item in communicator.gather(placement, root=0) or []:
@@ -105,7 +143,11 @@ def main():
             "allreduce_iterations": args.allreduce_iterations,
             "allreduce_latency_us": (
                 1e6 * max_allreduce_elapsed / args.allreduce_iterations),
+            "batched_halos": args.batched_halos,
         }
+        if halo_elapsed is not None:
+            summary["batched_halo_latency_us"] = (
+                1e6 * halo_elapsed / args.iterations)
         print("NDGPU_MPI_PROBE " + json.dumps(summary, sort_keys=True), flush=True)
 
 

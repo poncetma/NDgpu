@@ -26,6 +26,7 @@ steps="${NDGPU_STEPS:-5}"
 dt="${NDGPU_DT:-0.01}"
 check_every="${NDGPU_CHECK_EVERY:-1}"
 single_reduction="${NDGPU_SINGLE_REDUCTION:-0}"
+batched_halos="${NDGPU_BATCHED_HALOS:-0}"
 
 unset PMODULES_ENV
 module purge
@@ -40,13 +41,18 @@ export LD_LIBRARY_PATH="${mpi_root}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export SLURM_MPI_TYPE=pmix
 export PYTHONPATH="${repo}"
 
-printf 'NDgpu Phase 6 GH transient performance: ranks=%s mode=%s r=%s nz=%s steps=%s check_every=%s single_reduction=%s host=%s\n' \
+printf 'NDgpu Phase 6 GH transient performance: ranks=%s mode=%s r=%s nz=%s steps=%s check_every=%s single_reduction=%s batched_halos=%s host=%s\n' \
     "${SLURM_NTASKS}" "${communication}" "${refine}" "${nz}" \
-    "${steps}" "${check_every}" "${single_reduction}" "$(hostname)"
+    "${steps}" "${check_every}" "${single_reduction}" "${batched_halos}" \
+    "$(hostname)"
 nvidia-smi --query-gpu=name,uuid,memory.total --format=csv,noheader
 single_reduction_arg=()
 if [[ "${single_reduction}" == "1" ]]; then
     single_reduction_arg+=(--single-reduction)
+fi
+batched_halos_arg=()
+if [[ "${batched_halos}" == "1" ]]; then
+    batched_halos_arg+=(--batched-halos)
 fi
 srun --mpi=pmix --ntasks="${SLURM_NTASKS}" --kill-on-bad-exit=1 \
     --cpu-bind=cores --gpus-per-task=1 --gpu-bind=single:1 \
@@ -54,4 +60,5 @@ srun --mpi=pmix --ntasks="${SLURM_NTASKS}" --kill-on-bad-exit=1 \
     --device gpu --communication "${communication}" \
     --refine "${refine}" --nz "${nz}" --groups 11 \
     --steps "${steps}" --dt "${dt}" --tol-step 1e-8 \
-    --check-every "${check_every}" "${single_reduction_arg[@]}"
+    --check-every "${check_every}" "${single_reduction_arg[@]}" \
+    "${batched_halos_arg[@]}"

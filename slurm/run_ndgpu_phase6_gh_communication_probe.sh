@@ -23,6 +23,7 @@ communication="${NDGPU_MPI_COMMUNICATION:-host-staged}"
 elements="${NDGPU_PROBE_ELEMENTS:-1048576}"
 iterations="${NDGPU_PROBE_ITERATIONS:-100}"
 allreduce_iterations="${NDGPU_ALLREDUCE_ITERATIONS:-2000}"
+batched_halos="${NDGPU_BATCHED_HALOS:-0}"
 
 unset PMODULES_ENV
 module purge
@@ -40,9 +41,14 @@ export PYTHONPATH="${repo}"
 printf 'NDgpu Phase 6 GH communication probe: mode=%s host=%s\n' \
     "${communication}" "$(hostname)"
 nvidia-smi --query-gpu=name,uuid,memory.total --format=csv,noheader
+batched_halos_arg=()
+if [[ "${batched_halos}" == "1" ]]; then
+    batched_halos_arg+=(--batched-halos)
+fi
 srun --mpi=pmix --ntasks=2 --kill-on-bad-exit=1 --cpu-bind=cores \
     --gpus-per-task=1 --gpu-bind=single:1 \
     "${python_bin}" "${repo}/examples/mpi_environment_probe.py" \
     --device gpu --communication "${communication}" \
     --elements "${elements}" --iterations "${iterations}" \
-    --allreduce-iterations "${allreduce_iterations}"
+    --allreduce-iterations "${allreduce_iterations}" \
+    "${batched_halos_arg[@]}"

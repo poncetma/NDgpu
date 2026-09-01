@@ -35,6 +35,7 @@ def parse_args():
     parser.add_argument("--precond-degree", type=int, default=0)
     parser.add_argument("--check-every", type=int, default=1)
     parser.add_argument("--single-reduction", action="store_true")
+    parser.add_argument("--batched-halos", action="store_true")
     return parser.parse_args()
 
 
@@ -45,7 +46,8 @@ def main():
 
     communicator = MPI.COMM_WORLD
     context = DistributedContext.from_mpi(
-        communicator, device=args.device, communication=args.communication)
+        communicator, device=args.device, communication=args.communication,
+        batched_halos=args.batched_halos)
     three_d = args.nz > 0
     materials = (hpmr_endfb8_builtin(three_d=three_d)
                  if args.groups == "11" else None)
@@ -95,6 +97,7 @@ def main():
         linsolve_kwargs={
             "check_every": args.check_every,
             "single_reduction": args.single_reduction,
+            "batched_halos": args.batched_halos,
         },
         verbose=context.rank == 0)
     communicator.Barrier()
