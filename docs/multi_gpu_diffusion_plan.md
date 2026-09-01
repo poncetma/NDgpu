@@ -83,6 +83,28 @@ Fixed-point transient extension evidence (2026-09-01):
   `3.01e-15`. Both paths used 13 and 11 nonlinear sweeps and 6,577 total inner
   iterations.
 
+Extruded 3-D and 11-group evidence (2026-09-01):
+
+- Corrected physical eigen gate `202569` completed with exit `0:0` on two
+  distinct GH200s. The r4/nz10 HPMR prism mesh had shape `(75, 75, 2, 10)`,
+  52,800 active cells, and 1,500 polar-mixed drum cells split across both
+  ranks.
+- With reflective radial and vacuum axial boundaries, the two-GPU and
+  single-GPU 11-group eigenvalues differed by `1.92e-9`; normalized flux L2
+  differed by `5.37e-8`.
+- Moving-drum transient gate `202532` completed with exit `0:0`. At
+  `tol_step=1e-10`, both distributed and serial runs used 78 and 71 source
+  sweeps. Maximum power-history error was `1.93e-7`; final flux and precursor
+  relative L2 errors were `1.78e-7` and `2.47e-8`.
+- The stable fixed-point configuration combines whole-core rebalance with
+  plain Picard (`anderson_depth=1`). A diagnostic run showed that applying
+  Anderson to the rationally rebalanced map can destabilize a tightly
+  converged second step; the shared solver now enforces the documented
+  rebalance-only behavior.
+- Host-staged correctness is not yet a scaling win: the distributed transient
+  took 117.4 s versus 27.9 s for its single-GPU reference. Reducing global
+  collectives and replacing host staging remain performance work.
+
 ## Objective
 
 Add a production-quality multi-GPU execution path for standalone multigroup
@@ -113,6 +135,8 @@ Included in the first production release:
   MPI, clearly reported as a fallback rather than silently selected.
 - Fixed-step, fixed-point diffusion transients with global kinetics and
   time-varying material maps or volume-mixing maps.
+- Extruded triangular-prism transients with radial row decomposition and local
+  axial leakage.
 
 Explicitly deferred:
 
@@ -622,6 +646,8 @@ Acceptance:
 - Every rank owns only its row slab throughout the transient.
 - Unsupported adaptive, monolithic, feedback, and initial-state handoff modes
   fail before entering collective iterations.
+- The 11-group r4/nz10 extruded HPMR moving-drum gate passes on two GPUs with
+  mixed cells and active cells owned by both ranks.
 
 ### Phase 4: distributed setup and output
 

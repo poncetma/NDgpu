@@ -10,7 +10,8 @@ from mpi4py import MPI
 
 from ndgpu import (DistributedTriDiffusionEigenSolver,
                    TriDiffusionEigenSolver, asnumpy)
-from ndgpu.benchmarks import build_hpmr2d
+from ndgpu.benchmarks import build_hpmr2d, build_hpmr3d
+from ndgpu.benchmarks.hpmr_thermal import hpmr_endfb8_builtin
 from ndgpu.distributed import DistributedContext
 
 
@@ -22,6 +23,8 @@ def parse_args():
         choices=("auto", "cpu-mpi", "host-staged", "cuda-aware"),
         default="auto")
     parser.add_argument("--refine", type=int, default=4)
+    parser.add_argument("--nz", type=int, default=0)
+    parser.add_argument("--groups", choices=("2", "11"), default="2")
     parser.add_argument("--angle", type=float, default=120.0)
     return parser.parse_args()
 
@@ -39,10 +42,21 @@ def main():
     if context.size < 2:
         raise RuntimeError("triangular HPMR gate requires at least two MPI ranks")
 
-    problem = build_hpmr2d(
-        refine=args.refine, drum_angle_deg=args.angle, absorber="polar")
+    three_d = args.nz > 0
+    builder = build_hpmr3d if three_d else build_hpmr2d
+    build_kwargs = {
+        "refine": args.refine,
+        "drum_angle_deg": args.angle,
+        "absorber": "polar",
+        "materials": (hpmr_endfb8_builtin(three_d=three_d)
+                      if args.groups == "11" else None),
+    }
+    if three_d:
+        build_kwargs["nz"] = args.nz
+    problem = builder(**build_kwargs)
     solver = DistributedTriDiffusionEigenSolver(
         problem.grid, problem.materials, problem.material_map,
+        bc=problem.bc,
         active=problem.active, mask_bc=problem.mask_bc,
         mix_material=problem.mix_material, mix_weight=problem.mix_weight,
         context=context, decomposition="rows")
@@ -55,7 +69,7 @@ def main():
         raise AssertionError("a triangular cross-section field is not rank-local")
 
     result = solver.solve(
-        tol_k=1e-8, tol_source=1e-7, inner_rtol_floor=1e-10,
+        tol_k=1e-10, tol_source=1e-9, inner_rtol_floor=1e-12,
         verbose=context.rank == 0)
     gathered_flux = result.gather_flux(root=0)
     telemetry = communicator.gather({
@@ -78,30 +92,26 @@ def main():
         try:
             reference = TriDiffusionEigenSolver(
                 problem.grid, problem.materials, problem.material_map,
+                bc=problem.bc,
                 active=problem.active, mask_bc=problem.mask_bc,
                 mix_material=problem.mix_material,
                 mix_weight=problem.mix_weight,
                 device=args.device).solve(
-                    tol_k=1e-8, tol_source=1e-7,
-                    inner_rtol_floor=1e-10)
+                    tol_k=1e-10, tol_source=1e-9,
+                    inner_rtol_floor=1e-12)
             distributed_flux = normalized(np.asarray(asnumpy(gathered_flux)))
             serial_flux = normalized(np.asarray(asnumpy(reference.flux)))
             difference = distributed_flux - serial_flux
             k_error = abs(result.k_eff - reference.k_eff)
             flux_l2 = float(np.linalg.norm(difference.ravel()))
             flux_max = float(np.max(np.abs(difference)))
-            if not result.converged or not reference.converged:
-                raise AssertionError("distributed or serial HPMR solve did not converge")
-            if k_error > 2e-8:
-                raise AssertionError(f"eigenvalue difference {k_error} exceeds 2e-8")
-            if flux_l2 > 2e-7:
-                raise AssertionError(f"flux L2 difference {flux_l2} exceeds 2e-7")
-            summary = {
-                "status": "passed",
+            comparison = {
                 "mpi_size": context.size,
                 "device": args.device,
                 "communication_mode": context.communication_mode,
                 "refine": args.refine,
+                "nz": args.nz,
+                "groups": args.groups,
                 "drum_angle_deg": args.angle,
                 "global_shape": problem.grid.shape,
                 "distributed_k_eff": result.k_eff,
@@ -115,6 +125,15 @@ def main():
                 "serial_inner_iterations": reference.inner_iterations,
                 "rank_telemetry": telemetry,
             }
+            print("NDGPU_DISTRIBUTED_TRI_HPMR_COMPARISON " +
+                  json.dumps(comparison), flush=True)
+            if not result.converged or not reference.converged:
+                raise AssertionError("distributed or serial HPMR solve did not converge")
+            if k_error > 2e-8:
+                raise AssertionError(f"eigenvalue difference {k_error} exceeds 2e-8")
+            if flux_l2 > 2e-7:
+                raise AssertionError(f"flux L2 difference {flux_l2} exceeds 2e-7")
+            summary = {**comparison, "status": "passed"}
         except Exception as exc:
             passed = False
             failure = f"{type(exc).__name__}: {exc}"

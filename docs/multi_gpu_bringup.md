@@ -87,6 +87,8 @@ fixed-point stepping with global kinetics. Adaptive BDF, monolithic stepping,
 feedback callbacks, `xs_update_at`, and `initial_steady` handoff are rejected.
 Multi-rank triangular discontinuity factors are also deferred because their
 asymmetric partition-interface coefficients require a separate exchange.
+Whole-core rebalance uses plain Picard automatically; Anderson acceleration is
+disabled for that rational source map.
 
 Reproducible HPMR gates are:
 
@@ -96,6 +98,9 @@ Reproducible HPMR gates are:
   transient ranks.
 - `slurm/stage_and_submit_phase4_gh_transient_gate.sh` for a two-GH200 moving
   drum transient.
+- `slurm/stage_and_submit_phase5_gh_3d_transient_gate.sh` for the 11-group,
+  extruded 3-D eigenvalue and moving-drum transient gates. Pass `--eigen-only`
+  or `--skip-eigen` when repeating one half of the combined diagnostic.
 
 The retained Phase 1 size-one acceptance executable is
 `examples/distributed_size_one_gate.py`. The corresponding reproducible Slurm
@@ -119,6 +124,14 @@ Accepted triangular solves on 2026-09-01:
 - Polar volume-mixed r32 HPMR eigenvalue on two GH200s, job `202433`.
 - Polar volume-mixed r16 HPMR moving-drum transient on two GH200s, job
   `202439`.
+- Physical r4/nz10 11-group HPMR prism eigenvalue on two GH200s, job `202569`.
+- Physical r4/nz10 11-group HPMR prism moving-drum transient on two GH200s,
+  job `202532`.
+
+The 3-D host-staged transient is a correctness baseline, not a performance
+result: it took 117.4 s on two GPUs versus 27.9 s for the single-GPU reference.
+Do not claim multi-GPU speedup until collective/halo profiling and CUDA-aware
+communication improve this ratio.
 
 The generated GH module `openmpi/5.0.7-iw2c-GH200-gpu` currently references
 stale dependency module names. The gate therefore validates and uses the

@@ -377,14 +377,18 @@ def test_multi_rank_tri_solver_rejects_discontinuity_factors_early():
             object(), object(), context=context, df=object())
 
 
-def test_size_one_distributed_tri_transient_matches_drum_step_exactly():
-    from ndgpu.benchmarks import HPMR_KINETICS, build_hpmr2d
+@pytest.mark.parametrize("nz", [0, 10])
+def test_size_one_distributed_tri_transient_matches_drum_step_exactly(nz):
+    from ndgpu.benchmarks import (HPMR_KINETICS, build_hpmr2d,
+                                  build_hpmr3d)
     from ndgpu.transient import TransientSolver
 
-    initial = build_hpmr2d(
-        refine=1, drum_angle_deg=120.0, absorber="polar")
-    perturbed = build_hpmr2d(
-        refine=1, drum_angle_deg=110.0, absorber="polar")
+    builder = build_hpmr3d if nz else build_hpmr2d
+    build_kwargs = {"refine": 1, "absorber": "polar"}
+    if nz:
+        build_kwargs["nz"] = nz
+    initial = builder(drum_angle_deg=120.0, **build_kwargs)
+    perturbed = builder(drum_angle_deg=110.0, **build_kwargs)
 
     def problem_at(time):
         problem = initial if time == 0.0 else perturbed
@@ -397,11 +401,13 @@ def test_size_one_distributed_tri_transient_matches_drum_step_exactly():
         initial.grid, problem_at, HPMR_KINETICS, device="cpu",
         group_operator=TriGroupOperator,
         eig_solver=TriDiffusionEigenSolver, **common).solve(
-            t_end=0.01, dt=0.01, tol_step=1e-6, rebalance=True)
+            t_end=0.01, dt=0.01, tol_step=1e-6, rebalance=True,
+            anderson_depth=1)
     distributed = DistributedTriTransientSolver(
         initial.grid, problem_at, HPMR_KINETICS,
         context=DistributedContext.serial("cpu"), **common).solve(
-            t_end=0.01, dt=0.01, tol_step=1e-6, rebalance=True)
+            t_end=0.01, dt=0.01, tol_step=1e-6, rebalance=True,
+            anderson_depth=5)
 
     np.testing.assert_array_equal(distributed.power, reference.power)
     np.testing.assert_array_equal(distributed.local_flux, reference.flux)

@@ -488,9 +488,10 @@ class TransientSolver:
             rescaling the fission source (see the derivation at the call site).
             Removes the fundamental AMPLITUDE error, which is the slow mode
             near criticality: 4.5x fewer iterations than plain Picard at an
-            answer that agrees to 1.2e-6. Does NOT combine with Anderson -- the
+            answer that agrees to 1.2e-6. Does NOT combine with Anderson: the
             correction is a rational function of S, so the map stops being
-            affine and Anderson's premise fails.
+            affine and Anderson's premise fails. Enabling rebalance therefore
+            forces ``anderson_depth=1``.
         linsolve_kwargs : extra keyword arguments forwarded to every inner
             linear solve. The one that matters on GPU is ``check_every``: PCG's
             convergence test is a device->host reduction, i.e. a full pipeline
@@ -612,6 +613,13 @@ class TransientSolver:
         step_solver = str(step_solver).lower()
         if step_solver not in ("fixed-point", "monolithic"):
             raise ValueError("step_solver must be 'fixed-point' or 'monolithic'")
+        anderson_depth = int(anderson_depth)
+        if anderson_depth < 1:
+            raise ValueError("anderson_depth must be positive")
+        if rebalance and step_solver == "fixed-point":
+            # Rebalance makes the source map rational rather than affine, so
+            # Anderson's affine residual combination is invalid here.
+            anderson_depth = 1
         if reductions is not None and step_solver != "fixed-point":
             raise NotImplementedError(
                 "distributed transient reductions currently support only "
