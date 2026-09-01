@@ -295,6 +295,7 @@ class _PowerIterationSolver:
                  symmetric_operator: bool = True, hybrid_mask=None,
                  hybrid_confine: bool = False, xs_update=None):
         self.grid = grid
+        self._normalization_cell_count = grid.n_cells
         self.xp = xp = get_backend(device)
         self.device = device_name(xp)
         self.dtype = np.dtype(dtype)
@@ -540,7 +541,7 @@ class _PowerIterationSolver:
             dk = abs(k_new - k)
 
             # Normalize so the mean fission source stays at 1 (avoids drift).
-            scale = self.grid.n_cells / total_new
+            scale = self._normalization_cell_count / total_new
             for g in range(G):
                 state[g] *= scale
             if batch is not None:
@@ -567,7 +568,8 @@ class _PowerIterationSolver:
                 if len(hist) > anderson_depth:
                     hist.pop(0)
                 fsrc = _anderson_source(hist, g_fsrc, xp, reductions=reductions)
-                fsrc = fsrc * (self.grid.n_cells / float(reduce_sum(fsrc)))
+                fsrc = fsrc * (
+                    self._normalization_cell_count / float(reduce_sum(fsrc)))
             prev_src_err = src_err
             total = reduce_sum(fsrc)
 

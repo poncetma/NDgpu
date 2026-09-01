@@ -305,8 +305,8 @@ def test_size_one_distributed_tri_solver_matches_serial_result():
     np.testing.assert_array_equal(result.local_flux, reference.flux)
 
 
-def test_multi_rank_solver_rejects_before_field_construction():
+def test_multi_rank_tri_solver_rejects_before_field_construction():
     context, _ = _mirrored_context()
-    with pytest.raises(NotImplementedError, match="Phase 2/3 spatial operator"):
-        DistributedDiffusionEigenSolver(
+    with pytest.raises(NotImplementedError, match="Phase 3 row operator"):
+        DistributedTriDiffusionEigenSolver(
             object(), object(), context=context, decomposition="slab")
