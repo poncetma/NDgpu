@@ -152,8 +152,9 @@ throughput and solution-history gates are accepted.
 
 `DistributedContext.from_mpi(..., batched_halos=True)` is a second experimental
 control. It posts both slab-face receives and sends nonblocking, completes them
-together, and reduces the CUDA-aware path from two synchronization pairs per
-operator application to one. Unit tests cover both physical-boundary ranks;
+together, overlaps transfer with the owned-domain stencil, and reduces the
+CUDA-aware path from two synchronization pairs per operator application to
+one. Unit tests cover both physical-boundary ranks;
 production use still requires the real-MPI GH probe and transient timing gate.
 
 The generated GH module `openmpi/5.0.7-iw2c-GH200-gpu` currently references

@@ -124,9 +124,10 @@ class DistributedCartesianGroupOperator:
         """Apply the local stencil after exchanging the current flux halos."""
         if tuple(phi.shape) != self.shape:
             raise ValueError(f"local flux shape {phi.shape} != {self.shape}")
-        lower_phi, upper_phi = self.context.exchange_halos(
-            phi, self.partition, tag=self.communication_tag + 4)
-        out = self.local_operator.apply(phi, out=out)
+        (lower_phi, upper_phi), out = self.context.exchange_halos_while(
+            phi, self.partition,
+            lambda: self.local_operator.apply(phi, out=out),
+            tag=self.communication_tag + 4)
         axis = self.partition.axis
 
         if self._lower_diagonal is not None:
@@ -248,9 +249,10 @@ class DistributedTriGroupOperator:
         """Apply the owned triangular stencil after exchanging row halos."""
         if tuple(phi.shape) != self.shape:
             raise ValueError(f"local flux shape {phi.shape} != {self.shape}")
-        lower_phi, upper_phi = self.context.exchange_halos(
-            phi, self.partition, tag=self.communication_tag + 4)
-        out = self.local_operator.apply(phi, out=out)
+        (lower_phi, upper_phi), out = self.context.exchange_halos_while(
+            phi, self.partition,
+            lambda: self.local_operator.apply(phi, out=out),
+            tag=self.communication_tag + 4)
 
         if self._lower_diagonal is not None:
             local_out = _tri_component(out, 0, 0)

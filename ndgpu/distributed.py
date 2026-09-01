@@ -443,6 +443,26 @@ class DistributedContext:
     def _exchange_halos_batched(
             self, value, partition: SpatialPartition, *, tag: int = 0):
         """Exchange both slab faces with one nonblocking MPI completion."""
+        state = self._begin_halo_exchange(value, partition, tag=tag)
+        return self._finish_halo_exchange(state)
+
+    def exchange_halos_while(
+            self, value, partition: SpatialPartition, work, *, tag: int = 0):
+        """Exchange halos while executing independent owned-domain work."""
+        if not self.batched_halos or self.size == 1:
+            halos = self.exchange_halos(value, partition, tag=tag)
+            return halos, work()
+        if partition.rank != self.rank or partition.size != self.size:
+            raise ValueError("partition rank/size does not match the context")
+        if tuple(value.shape) != partition.local_shape:
+            raise ValueError(
+                f"local value shape {value.shape} != {partition.local_shape}")
+        state = self._begin_halo_exchange(value, partition, tag=tag)
+        result = work()
+        return self._finish_halo_exchange(state), result
+
+    def _begin_halo_exchange(
+            self, value, partition: SpatialPartition, *, tag: int):
         lower = partition.lower_rank
         upper = partition.upper_rank
 
@@ -487,9 +507,15 @@ class DistributedContext:
             requests.append(self.communicator.Isend(
                 upper_send, dest=upper, tag=tag))
             sends.append(upper_send)
-        self._mpi.Request.Waitall(requests)
+        post_seconds = time.perf_counter() - started
+        return (requests, sends, lower_buffer, upper_buffer, post_seconds)
 
+    def _finish_halo_exchange(self, state):
+        requests, sends, lower_buffer, upper_buffer, seconds = state
+        started = time.perf_counter()
+        self._mpi.Request.Waitall(requests)
         if self.communication_mode == "host-staged":
+            lower_receive = upper_receive = None
             if lower_buffer is not None:
                 lower_receive = self.xp.asarray(lower_buffer)
             if upper_buffer is not None:
@@ -500,7 +526,7 @@ class DistributedContext:
                 synchronize(self.xp)
         self._record_communication(
             "sendrecv", sum(send.nbytes for send in sends),
-            time.perf_counter() - started)
+            seconds + time.perf_counter() - started)
         return lower_receive, upper_receive
 
     def gather_spatial(self, value, partition: SpatialPartition, *, root: int = 0):
