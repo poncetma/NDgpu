@@ -52,6 +52,7 @@ class PCGWorkspace:
     p: object
     ap: object
     operator_out: bool = False
+    single_reduction_w: object | None = None
     fallback_start: object | None = None
     fallback_count: int = 0
     graph_scalars: dict = field(default_factory=dict)
@@ -78,6 +79,13 @@ class PCGWorkspace:
                 for name in ("rz", "rz_new", "pap", "alpha", "beta")}
         return self.graph_scalars
 
+    def single_reduction_work(self):
+        """Return persistent storage for ``A z`` in single-reduction PCG."""
+        if self.single_reduction_w is None:
+            xp = kernels.module_of(self.x)
+            self.single_reduction_w = xp.empty_like(self.x)
+        return self.single_reduction_w
+
     def clear_graph(self):
         self.graph_key = None
         self.graph = None
@@ -101,6 +109,13 @@ class PCGWorkspace:
                     or value.shape != template.shape
                     or value.dtype != template.dtype):
                 raise ValueError("PCG fallback workspace does not match the solve")
+        if self.single_reduction_w is not None:
+            value = self.single_reduction_w
+            if (kernels.module_of(value) is not xp
+                    or value.shape != template.shape
+                    or value.dtype != template.dtype):
+                raise ValueError(
+                    "PCG single-reduction workspace does not match the solve")
 
 
 @dataclass
@@ -289,7 +304,7 @@ def _pcg_graph_capable(xp, workspace, precond, vector_size):
 def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
         precond=None, check_every=1, raise_on_fail=True, workspace=None,
         residual_replace_every=0, fallback_precond=None, graph_block=0,
-        reductions=None):
+        reductions=None, single_reduction=False):
     """Solve A x = b with preconditioned CG.
 
     apply_A  : callable, x -> A x (A symmetric positive definite)
@@ -327,6 +342,10 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
                providers combine owned-cell dot products with a global sum;
                the default keeps the existing backend-local reduction. CUDA
                graph blocks are disabled when a distributed provider is used.
+    single_reduction : use the Chronopoulos-Gear PCG recurrence, which packs
+               all scalar products into one collective per iteration. This
+               adds one persistent work vector and is intended for distributed
+               solves where collective latency dominates.
 
     Returns (x, n_iterations).
     """
@@ -348,15 +367,17 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
         raise ValueError("graph_block must be non-negative")
     if graph_block and graph_block != check_every:
         raise ValueError("graph_block must equal check_every")
+    if single_reduction and graph_block:
+        raise ValueError("single_reduction cannot be combined with graph_block")
 
-    def apply_preconditioner(source, out=None):
+    def apply_preconditioner(source, out=None, scratch=None):
         if out is None:
             return M(source)
         if precond is None:
             xp.multiply(inv_diag, source, out=out)
             return out
         if getattr(precond, "ndgpu_out", False):
-            kwargs = ({"scratch": ap_buf}
+            kwargs = ({"scratch": ap_buf if scratch is None else scratch}
                       if getattr(precond, "ndgpu_scratch", False) else {})
             return precond(source, out=out, **kwargs)
         xp.copyto(out, precond(source))
@@ -394,10 +415,94 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
             check_every=check_every, raise_on_fail=raise_on_fail,
             workspace=workspace,
             residual_replace_every=residual_replace_every,
-            reductions=reductions)
+            reductions=reductions, single_reduction=single_reduction)
         return solved, iterations + fallback_iterations
 
     stop2 = max(rtol * float(xp.sqrt(dot(b, b))), atol) ** 2
+    tiny = np.finfo(b.dtype).tiny
+
+    if single_reduction:
+        dot_many = (reductions.dot_many if reductions is not None else
+                    lambda pairs: xp.stack([
+                        kernels.dot(xp, left, right)
+                        for left, right in pairs]))
+        z = apply_preconditioner(r, z_buf)
+        if workspace is None:
+            p = z.copy()
+            Ap = apply_A(p)
+            w_buf = None
+        else:
+            xp.copyto(p_buf, z)
+            p = p_buf
+            if workspace.operator_out:
+                apply_A(p, out=ap_buf)
+            else:
+                xp.copyto(ap_buf, apply_A(p))
+            Ap = ap_buf
+            w_buf = workspace.single_reduction_work()
+
+        initial_scalars = dot_many(
+            ((r, r), (r, z), (z, Ap)))
+        if float(initial_scalars[0]) <= stop2:
+            return x, 0
+        gamma = initial_scalars[1]
+        alpha = gamma / (initial_scalars[2] + tiny)
+
+        for it in range(1, maxiter + 1):
+            kernels.cg_update(xp, x, r, p, Ap, alpha)
+            replaced = (residual_replace_every > 0
+                        and it % residual_replace_every == 0)
+            if replaced:
+                if workspace is None:
+                    r = b - apply_A(x)
+                elif workspace.operator_out:
+                    apply_A(x, out=w_buf)
+                    xp.subtract(b, w_buf, out=r)
+                else:
+                    xp.copyto(w_buf, apply_A(x))
+                    xp.subtract(b, w_buf, out=r)
+
+            z = apply_preconditioner(r, z_buf, scratch=w_buf)
+            if workspace is None:
+                w = apply_A(z)
+            elif workspace.operator_out:
+                w = apply_A(z, out=w_buf)
+            else:
+                xp.copyto(w_buf, apply_A(z))
+                w = w_buf
+            scalars = dot_many(((r, r), (r, z), (z, w)))
+            residual2, gamma_new, delta_new = scalars
+            if it % check_every == 0:
+                checked = float(residual2)
+                if np.isfinite(checked) and checked <= stop2:
+                    return x, it
+                if not np.isfinite(checked):
+                    retried = retry_with_fallback(it)
+                    if retried is not None:
+                        return retried
+                    break
+
+            if replaced:
+                xp.copyto(p, z)
+                xp.copyto(Ap, w)
+                alpha = gamma_new / (delta_new + tiny)
+            else:
+                beta = gamma_new / (gamma + tiny)
+                denominator = delta_new - beta * gamma_new / (alpha + tiny)
+                alpha = gamma_new / (denominator + tiny)
+                kernels.cg_direction(xp, p, z, beta)
+                kernels.cg_direction(xp, Ap, w, beta)
+            gamma = gamma_new
+        retried = retry_with_fallback(it)
+        if retried is not None:
+            return retried
+        if raise_on_fail:
+            raise RuntimeError(
+                f"single-reduction PCG failed to converge in {maxiter} "
+                f"iterations (residual {float(xp.sqrt(dot(r, r))):.3e}, "
+                f"target {stop2**0.5:.3e})")
+        return x, it
+
     if float(dot(r, r)) <= stop2:
         return x, 0
 
@@ -408,8 +513,6 @@ def pcg(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
         xp.copyto(p_buf, z)
         p = p_buf
     rz = dot(r, z)
-    tiny = np.finfo(b.dtype).tiny
-
     distributed_reductions = bool(
         reductions is not None and getattr(reductions, "distributed", True))
     graph_active = bool(

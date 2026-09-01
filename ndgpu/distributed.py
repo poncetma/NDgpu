@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import math
 import os
 import socket
+import time
 from typing import Sequence
 
 import numpy as np
@@ -217,6 +218,15 @@ class DistributedContext:
     mpi_library_version: str | None = None
     _mpi: object | None = field(default=None, repr=False)
     _reductions: object | None = field(default=None, init=False, repr=False)
+    _communication_stats: dict = field(
+        default_factory=lambda: {
+            "allreduce_calls": 0,
+            "allreduce_bytes": 0,
+            "allreduce_seconds": 0.0,
+            "sendrecv_calls": 0,
+            "sendrecv_bytes": 0,
+            "sendrecv_seconds": 0.0,
+        }, init=False, repr=False)
 
     def __post_init__(self):
         if self.communication_mode not in _COMMUNICATION_MODES - {"auto"}:
@@ -322,6 +332,22 @@ class DistributedContext:
             "mpi_library_version": self.mpi_library_version,
         }
 
+    def reset_communication_stats(self):
+        for name in self._communication_stats:
+            self._communication_stats[name] = (
+                0.0 if name.endswith("_seconds") else 0)
+
+    def communication_stats(self) -> dict:
+        result = dict(self._communication_stats)
+        result["communication_seconds"] = (
+            result["allreduce_seconds"] + result["sendrecv_seconds"])
+        return result
+
+    def _record_communication(self, kind: str, nbytes: int, seconds: float):
+        self._communication_stats[f"{kind}_calls"] += 1
+        self._communication_stats[f"{kind}_bytes"] += int(nbytes)
+        self._communication_stats[f"{kind}_seconds"] += float(seconds)
+
     def allreduce_sum(self, value):
         return self._allreduce(value, "SUM")
 
@@ -335,38 +361,44 @@ class DistributedContext:
         if not local.flags.c_contiguous:
             local = self.xp.ascontiguousarray(local)
         mpi_operation = getattr(self._mpi, operation) if self._mpi is not None else None
+        started = time.perf_counter()
         if self.communication_mode == "host-staged":
             send = np.array(asnumpy(local), copy=True, order="C")
             receive = np.empty_like(send)
             self.communicator.Allreduce(send, receive, op=mpi_operation)
-            return self.xp.asarray(receive)
-
-        receive = self.xp.empty_like(local)
-        synchronize(self.xp)
-        self.communicator.Allreduce(local, receive, op=mpi_operation)
-        synchronize(self.xp)
-        return receive
+            result = self.xp.asarray(receive)
+        else:
+            result = self.xp.empty_like(local)
+            synchronize(self.xp)
+            self.communicator.Allreduce(local, result, op=mpi_operation)
+            synchronize(self.xp)
+        self._record_communication(
+            "allreduce", local.nbytes, time.perf_counter() - started)
+        return result
 
     def sendrecv(self, value, *, destination: int, source: int, tag: int = 0):
         """Exchange one contiguous array with explicit neighboring ranks."""
         if self.size == 1:
             return self.xp.array(value, copy=True)
         send = self.xp.ascontiguousarray(value)
+        started = time.perf_counter()
         if self.communication_mode == "host-staged":
             host_send = np.ascontiguousarray(asnumpy(send))
             host_receive = np.empty_like(host_send)
             self.communicator.Sendrecv(
                 host_send, dest=destination, sendtag=tag,
                 recvbuf=host_receive, source=source, recvtag=tag)
-            return self.xp.asarray(host_receive)
-
-        receive = self.xp.empty_like(send)
-        synchronize(self.xp)
-        self.communicator.Sendrecv(
-            send, dest=destination, sendtag=tag,
-            recvbuf=receive, source=source, recvtag=tag)
-        synchronize(self.xp)
-        return receive
+            result = self.xp.asarray(host_receive)
+        else:
+            result = self.xp.empty_like(send)
+            synchronize(self.xp)
+            self.communicator.Sendrecv(
+                send, dest=destination, sendtag=tag,
+                recvbuf=result, source=source, recvtag=tag)
+            synchronize(self.xp)
+        self._record_communication(
+            "sendrecv", send.nbytes, time.perf_counter() - started)
+        return result
 
     def exchange_halos(self, value, partition: SpatialPartition, *, tag: int = 0):
         """Return lower and upper neighbor planes for an owned slab.

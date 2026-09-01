@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from .distributed import (DistributedContext, DistributedTransientResult,
-                          TriRowPartition)
+from .distributed import (DistributedContext, DistributedResult,
+                          DistributedTransientResult, TriRowPartition)
 from .distributed_solver import (_local_array, _resolve_context,
                                  DistributedTriDiffusionEigenSolver)
 from .distributed_stencil import DistributedTriGroupOperator
 from .transient import TransientSolver
 from .tri import TriGrid
+from .solver import Result
 
 
 class DistributedTriTransientSolver(TransientSolver):
@@ -95,9 +96,29 @@ class DistributedTriTransientSolver(TransientSolver):
         if kwargs.get("adaptive_bdf") is not None:
             raise NotImplementedError(
                 "distributed adaptive BDF is not implemented")
-        if kwargs.get("initial_steady") is not None:
-            raise NotImplementedError(
-                "distributed initial_steady handoff is not implemented")
+        initial_steady = kwargs.get("initial_steady")
+        if isinstance(initial_steady, DistributedResult):
+            if initial_steady.context is not self.distributed_context:
+                raise ValueError(
+                    "initial_steady must use the transient solver's context")
+            if initial_steady.partition != self.partition:
+                raise ValueError(
+                    "initial_steady partition does not match the transient")
+            kwargs = dict(kwargs)
+            kwargs["initial_steady"] = Result(
+                k_eff=initial_steady.k_eff,
+                flux=initial_steady.local_flux,
+                converged=initial_steady.converged,
+                outer_iterations=initial_steady.outer_iterations,
+                inner_iterations=initial_steady.inner_iterations,
+                solve_seconds=initial_steady.solve_seconds,
+                device=initial_steady.device,
+                k_history=initial_steady.k_history,
+                source_error_history=initial_steady.source_error_history,
+            )
+        elif initial_steady is not None and self.distributed_context.size > 1:
+            raise TypeError(
+                "multi-rank initial_steady must be a DistributedResult")
         result = super().solve(*args, **kwargs)
         return DistributedTransientResult(
             result, self.partition, self.distributed_context)

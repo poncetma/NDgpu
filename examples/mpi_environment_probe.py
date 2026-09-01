@@ -26,12 +26,14 @@ def parse_args():
         default="auto")
     parser.add_argument("--elements", type=int, default=1 << 20)
     parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--allreduce-iterations", type=int, default=1000)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    if args.elements < 1 or args.iterations < 1:
+    if (args.elements < 1 or args.iterations < 1
+            or args.allreduce_iterations < 1):
         raise ValueError("elements and iterations must be positive")
 
     communicator = MPI.COMM_WORLD
@@ -72,6 +74,19 @@ def main():
     max_elapsed = communicator.allreduce(elapsed, op=MPI.MAX)
     bytes_transferred = values.nbytes * args.iterations
 
+    scalar = xp.asarray(float(context.rank), dtype=xp.float64)
+    communicator.Barrier()
+    synchronize(xp)
+    started = MPI.Wtime()
+    for _ in range(args.allreduce_iterations):
+        reduced = context.allreduce_sum(scalar)
+    synchronize(xp)
+    allreduce_elapsed = MPI.Wtime() - started
+    max_allreduce_elapsed = communicator.allreduce(
+        allreduce_elapsed, op=MPI.MAX)
+    if float(asnumpy(reduced)) != expected_sum:
+        raise RuntimeError("timed all-reduce returned an incorrect value")
+
     placement = context.describe()
     placement["backend"] = device_name(xp)
     for item in communicator.gather(placement, root=0) or []:
@@ -87,6 +102,9 @@ def main():
             "iterations": args.iterations,
             "max_elapsed_s": max_elapsed,
             "one_way_bandwidth_gb_s": bytes_transferred / max_elapsed / 1e9,
+            "allreduce_iterations": args.allreduce_iterations,
+            "allreduce_latency_us": (
+                1e6 * max_allreduce_elapsed / args.allreduce_iterations),
         }
         print("NDGPU_MPI_PROBE " + json.dumps(summary, sort_keys=True), flush=True)
 

@@ -88,6 +88,33 @@ def test_pcg_workspace_preserves_iterations_and_reuses_operator_output():
     assert residual <= 1.1e-11 * np.linalg.norm(b2)
 
 
+def test_single_reduction_pcg_matches_standard_and_reuses_work_vector():
+    op, b = _spd_stencil_system(n=9)
+    x0 = np.zeros_like(b)
+    reference, _ = pcg(
+        op.apply, b, x0, op.inv_diag, np, rtol=1e-10)
+    workspace = PCGWorkspace.like(x0, operator_out=True)
+
+    solved, iterations = pcg(
+        op.apply, b, x0, op.inv_diag, np, rtol=1e-10,
+        workspace=workspace, single_reduction=True)
+
+    assert solved is workspace.x
+    assert iterations > 0
+    assert workspace.single_reduction_w is not None
+    work_identity = id(workspace.single_reduction_w)
+    np.testing.assert_allclose(solved, reference, rtol=2e-10, atol=2e-11)
+
+    b2 = 1.001 * b
+    solved2, iterations2 = pcg(
+        op.apply, b2, solved, op.inv_diag, np, rtol=1e-10,
+        workspace=workspace, single_reduction=True)
+    assert iterations2 > 0
+    assert id(workspace.single_reduction_w) == work_identity
+    residual = np.linalg.norm(op.apply(solved2) - b2)
+    assert residual <= 1.1e-10 * np.linalg.norm(b2)
+
+
 def test_pcg_workspace_validates_shape_and_dtype():
     workspace = PCGWorkspace.like(np.zeros((3, 4)))
     with pytest.raises(ValueError, match="shape/dtype"):

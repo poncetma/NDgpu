@@ -133,6 +133,23 @@ result: it took 117.4 s on two GPUs versus 27.9 s for the single-GPU reference.
 Do not claim multi-GPU speedup until collective/halo profiling and CUDA-aware
 communication improve this ratio.
 
+Accepted GH200 communication probes on 2026-09-01:
+
+- Jobs `202735` (host-staged) and `202736` (CUDA-aware) both completed `0:0`
+  on two GH200s with OpenMPI 5.0.7.
+- An 8 MiB one-way exchange reached 1.10 GB/s with host staging and
+  14.69 GB/s with direct device buffers, a 13.4x bandwidth improvement.
+- Device-scalar all-reduce latency was 75.8 us host-staged and 72.1 us
+  CUDA-aware. The small change confirms that collective count, rather than
+  scalar payload bandwidth, is the next PCG bottleneck.
+
+The Phase 6 performance path adds communication counters, distributed
+steady-state reuse, and an opt-in Chronopoulos-Gear PCG recurrence through
+`linsolve_kwargs={"single_reduction": True}`. The recurrence combines its
+scalar products into one all-reduce per iteration and retains one additional
+persistent vector per energy-group workspace. Keep it opt-in until the HPMR
+throughput and solution-history gates are accepted.
+
 The generated GH module `openmpi/5.0.7-iw2c-GH200-gpu` currently references
 stale dependency module names. The gate therefore validates and uses the
 intact site installation prefix directly; its libraries retain full dependency
@@ -143,7 +160,8 @@ RPATHs. Remove this workaround once PSI regenerates the aarch64 module tree.
 - Run one MPI rank per allocated GPU.
 - Build or install `mpi4py` against the same MPI loaded when the job runs.
 - Keep CuPy matched to the CUDA toolkit and node architecture.
-- Use `host-staged` until the site MPI passes the direct device-buffer probe.
+- Use `cuda-aware` with the accepted GH200/OpenMPI 5.0.7 stack. Retain
+  `host-staged` as the explicit fallback for any other MPI installation.
 - Do not install an unrelated MPI wheel into the Grace-Hopper environment.
 
 The optional Python dependency is available as `ndgpu[mpi]`, but the site MPI
@@ -194,6 +212,13 @@ This passes contiguous CuPy buffers directly to `MPI.Sendrecv` and
 crash means the stack has not passed and production runs must remain
 host-staged. Selection is never automatic because handing a device pointer to
 an incompatible MPI can terminate the process rather than raise safely.
+
+The reproducible paired probe is
+`slurm/stage_and_submit_phase6_gh_communication_probes.sh`. Long-transient
+throughput comparisons use
+`slurm/stage_and_submit_phase6_gh_transient_performance.sh`; their timer starts
+after the initial distributed eigenstate is solved and reused, resets all
+communication counters, and does not gather global flux.
 
 ## Output
 

@@ -856,6 +856,14 @@ all-reduce latency can dominate even when halo exchange is small.
 Mitigation: measure first, pack reductions, use polynomial preconditioning only
 when profitable, then evaluate pipelined CG and a coarse preconditioner.
 
+Phase 6 status (2026-09-01): communication timing is instrumented and the
+GH200 stack has passed direct CUDA-buffer traffic. An opt-in
+Chronopoulos-Gear PCG recurrence now packs residual norm, preconditioned norm,
+and operator norm into one collective per iteration. Unit gates assert both
+the solution and the exact `iterations + 2` collective count. The next
+acceptance gate is unchanged transient history with lower wall time on 2 and 4
+GH200s; standard PCG remains the default until that gate passes.
+
 ### Jacobi-PCG iteration growth
 
 The current preconditioner is local and iteration count grows with refinement.

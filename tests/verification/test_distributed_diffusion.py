@@ -155,6 +155,15 @@ def test_cpu_mpi_context_reduces_and_exchanges_backend_arrays():
     np.testing.assert_array_equal(
         context.sendrecv(values, destination=1, source=1, tag=7), values)
     assert communicator.allreduce_calls == 3
+    stats = context.communication_stats()
+    assert stats["allreduce_calls"] == 3
+    assert stats["allreduce_bytes"] == 3 * values.dtype.itemsize
+    assert stats["sendrecv_calls"] == 1
+    assert stats["sendrecv_bytes"] == values.nbytes
+    assert stats["communication_seconds"] >= 0.0
+    context.reset_communication_stats()
+    assert context.communication_stats()["communication_seconds"] == 0.0
+    assert context.communication_stats()["allreduce_calls"] == 0
 
 
 @pytest.mark.parametrize("axis,size", [(0, 3), (1, 2), (2, 2)])
@@ -285,6 +294,29 @@ def test_pcg_uses_global_reductions_without_changing_recurrence():
     np.testing.assert_array_equal(solved, reference)
     assert iterations == reference_iterations
     assert communicator.allreduce_calls > iterations
+
+
+def test_single_reduction_pcg_uses_one_collective_per_iteration():
+    matrix = np.array([
+        [4.0, -1.0, 0.0],
+        [-1.0, 4.0, -1.0],
+        [0.0, -1.0, 3.0],
+    ])
+    rhs = np.array([15.0, 10.0, 10.0])
+    inverse_diagonal = 1.0 / np.diag(matrix)
+    context, communicator = _mirrored_context()
+
+    solved, iterations = pcg(
+        matrix.__matmul__, rhs, np.zeros_like(rhs), inverse_diagonal, np,
+        rtol=1e-13, reductions=context.reductions,
+        single_reduction=True)
+
+    np.testing.assert_allclose(
+        solved, np.linalg.solve(matrix, rhs), rtol=2e-13, atol=2e-13)
+    assert iterations > 0
+    # One norm before the recurrence, one packed initialization, then one
+    # packed reduction for each iteration.
+    assert communicator.allreduce_calls == iterations + 2
 
 
 def test_distributed_reductions_disable_pcg_graph_blocks():
@@ -418,12 +450,37 @@ def test_size_one_distributed_tri_transient_matches_drum_step_exactly(nz):
             reference.total_inner_iterations)
 
 
+def test_distributed_tri_transient_reuses_compatible_initial_eigenstate():
+    from ndgpu.benchmarks import HPMR_KINETICS, build_hpmr2d
+
+    problem = build_hpmr2d(
+        refine=1, drum_angle_deg=120.0, absorber="polar")
+    context = DistributedContext.serial("cpu")
+    common = dict(
+        bc=problem.bc, active=problem.active, mask_bc=problem.mask_bc,
+        mix_material=problem.mix_material, mix_weight=problem.mix_weight)
+    steady = DistributedTriDiffusionEigenSolver(
+        problem.grid, problem.materials, problem.material_map,
+        context=context, **common).solve(tol_k=1e-9, tol_source=1e-8)
+    transient = DistributedTriTransientSolver(
+        problem.grid,
+        lambda time: (problem.materials, problem.material_map,
+                      problem.mix_material, problem.mix_weight),
+        HPMR_KINETICS, context=context,
+        bc=problem.bc, active=problem.active,
+        mask_bc=problem.mask_bc).solve(
+            t_end=0.01, dt=0.01, initial_steady=steady,
+            tol_step=1e-6, rebalance=True)
+
+    assert transient.initial_state_reused
+    assert transient.k0 == steady.k_eff
+
+
 @pytest.mark.parametrize(
     "solve_kwargs, message",
     [
         ({"step_solver": "monolithic"}, "fixed-point"),
         ({"adaptive_bdf": {}}, "adaptive BDF"),
-        ({"initial_steady": object()}, "initial_steady"),
     ],
 )
 def test_distributed_tri_transient_rejects_unsupported_modes(
