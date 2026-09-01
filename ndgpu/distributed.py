@@ -367,6 +367,68 @@ class DistributedContext:
         synchronize(self.xp)
         return receive
 
+    def exchange_halos(self, value, partition: SpatialPartition, *, tag: int = 0):
+        """Return lower and upper neighbor planes for an owned slab.
+
+        Every rank performs the same two directional ``Sendrecv`` calls. A
+        physical boundary uses ``MPI.PROC_NULL`` and is returned as ``None``;
+        this remains safe for one-cell slabs where both owned planes coincide.
+        """
+        if partition.rank != self.rank or partition.size != self.size:
+            raise ValueError("partition rank/size does not match the context")
+        if tuple(value.shape) != partition.local_shape:
+            raise ValueError(
+                f"local value shape {value.shape} != {partition.local_shape}")
+        if self.size == 1:
+            return None, None
+
+        lower = partition.lower_rank
+        upper = partition.upper_rank
+        proc_null = self._mpi.PROC_NULL if self._mpi is not None else -1
+
+        def plane(index):
+            sl = [slice(None)] * value.ndim
+            sl[partition.axis] = index
+            return value[tuple(sl)]
+
+        lower_halo = self.sendrecv(
+            plane(-1), destination=upper if upper is not None else proc_null,
+            source=lower if lower is not None else proc_null, tag=tag)
+        upper_halo = self.sendrecv(
+            plane(0), destination=lower if lower is not None else proc_null,
+            source=upper if upper is not None else proc_null, tag=tag + 1)
+        return (None if lower is None else lower_halo,
+                None if upper is None else upper_halo)
+
+    def gather_spatial(self, value, partition: SpatialPartition, *, root: int = 0):
+        """Explicitly gather rank-local spatial slabs into one host array."""
+        if not 0 <= root < self.size:
+            raise ValueError(f"root {root} is outside communicator size {self.size}")
+        spatial_ndim = len(partition.local_shape)
+        if tuple(value.shape[-spatial_ndim:]) != partition.local_shape:
+            raise ValueError(
+                f"local value spatial shape {value.shape[-spatial_ndim:]} != "
+                f"{partition.local_shape}")
+        if partition.rank != self.rank or partition.size != self.size:
+            raise ValueError("partition rank/size does not match the context")
+        if self.size == 1:
+            return asnumpy(value) if self.rank == root else None
+
+        local = np.ascontiguousarray(asnumpy(value))
+        pieces = self.communicator.gather(
+            (partition.start, partition.stop, local), root=root)
+        if self.rank != root:
+            return None
+
+        prefix_shape = local.shape[:-spatial_ndim]
+        gathered = np.empty(prefix_shape + partition.global_shape,
+                            dtype=local.dtype)
+        for start, stop, piece in pieces:
+            sl = [slice(None)] * gathered.ndim
+            sl[len(prefix_shape) + partition.axis] = slice(start, stop)
+            gathered[tuple(sl)] = piece
+        return gathered
+
 
 @dataclass
 class DistributedResult:
@@ -416,10 +478,10 @@ class DistributedResult:
         """Collect the global flux explicitly; collective in multi-rank use."""
         if not 0 <= root < self.size:
             raise ValueError(f"root {root} is outside communicator size {self.size}")
-        if self.size != 1:
-            raise NotImplementedError(
-                "multi-rank flux gathering requires the Phase 2 spatial layout")
-        return self.local_flux if self.rank == root else None
+        if self.size == 1:
+            return self.local_flux if self.rank == root else None
+        return self.context.gather_spatial(
+            self.local_flux, self.partition, root=root)
 
     def __repr__(self):
         status = "converged" if self.converged else "NOT CONVERGED"

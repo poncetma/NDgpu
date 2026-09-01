@@ -1,6 +1,6 @@
 # Multi-GPU standalone diffusion development plan
 
-Status: Phase 1 accepted on Merlin CPU and Grace-Hopper GPU
+Status: Phase 1 accepted; Phase 2 Cartesian operator prototype in progress
 
 Date: 2026-08-20
 
@@ -15,6 +15,16 @@ Phase 1 acceptance evidence (2026-08-20):
   inner iterations, with `k_eff = 1.268919614519496` on CPU and the expected
   last-bit backend difference (`1.2689196145194954`) on GH200.
 - Both gates required array-equal serial/distributed flux on the same backend.
+
+Phase 2 operator evidence (2026-09-01):
+
+- Merlin CPU job `8756630`, two real Slurm/MPI ranks: passed with exit `0:0`.
+- An uneven Cartesian decomposition used local shapes `(6, 7, 5)` and
+  `(5, 7, 5)`; no rank constructed a full-domain solve array.
+- The gathered heterogeneous, active-mask operator and Jacobi diagonal agreed
+  with the serial stencil to a maximum absolute error of
+  `4.440892098500626e-16` across mixed boundary laws.
+- In-process gates also cover cuts along all three axes and one-cell slabs.
 
 ## Objective
 

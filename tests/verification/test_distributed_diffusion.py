@@ -4,12 +4,14 @@ import numpy as np
 import pytest
 
 from ndgpu import (DiffusionEigenSolver, DistributedDiffusionEigenSolver,
+                   DistributedCartesianGroupOperator,
                    DistributedTriDiffusionEigenSolver, Grid, PWR_TWO_GROUP,
                    TriDiffusionEigenSolver, TriGrid)
 from ndgpu.distributed import (CartesianSlabPartition, DistributedContext,
                                DistributedResult, SerialReductions,
                                TriRowPartition)
 from ndgpu.linalg import PCGWorkspace, pcg
+from ndgpu.stencil import GroupOperator
 
 
 class _MirroredCommunicator:
@@ -44,6 +46,31 @@ class _CountingReductions(SerialReductions):
     def dot_many(self, pairs):
         self.calls["dot_many"] += 1
         return super().dot_many(pairs)
+
+
+class _QueuedHaloContext(DistributedContext):
+    """Serve exact neighboring planes from queued global test arrays."""
+
+    def __init__(self, partition, global_values):
+        super().__init__(
+            object(), np, rank=partition.rank, size=partition.size,
+            local_rank=partition.rank, communication_mode="cpu-mpi",
+            hostname="in-process-test")
+        self.global_values = iter(global_values)
+
+    def exchange_halos(self, value, partition, *, tag=0):
+        del tag
+        global_value = next(self.global_values)
+        np.testing.assert_array_equal(value, global_value[partition.owned_slice])
+
+        def plane(index):
+            sl = [slice(None)] * global_value.ndim
+            sl[partition.axis] = index
+            return np.array(global_value[tuple(sl)], copy=True)
+
+        lower = None if partition.lower_rank is None else plane(partition.start - 1)
+        upper = None if partition.upper_rank is None else plane(partition.stop)
+        return lower, upper
 
 
 def _mirrored_context():
@@ -106,6 +133,72 @@ def test_cpu_mpi_context_reduces_and_exchanges_backend_arrays():
     np.testing.assert_array_equal(
         context.sendrecv(values, destination=1, source=1, tag=7), values)
     assert communicator.allreduce_calls == 3
+
+
+@pytest.mark.parametrize("axis,size", [(0, 3), (1, 2), (2, 2)])
+def test_cartesian_slab_operator_matches_serial_across_each_axis(axis, size):
+    shape = (6, 5, 2)
+    grid = Grid(shape=shape, size=(9.0, 11.0, 4.0))
+    rng = np.random.default_rng(481 + axis)
+    diffusion = 0.15 + rng.random(shape)
+    removal = 0.01 + 0.2 * rng.random(shape)
+    flux = rng.random(shape)
+    bc = (("vacuum", "zero-flux"),
+          ("reflective", 0.2),
+          ("zero-flux", "vacuum"))
+    reference = GroupOperator(
+        np, grid, diffusion.copy(), removal.copy(), bc=bc)
+    expected = reference.apply(flux)
+    gathered = np.empty_like(expected)
+    gathered_diag = np.empty_like(reference.diag)
+
+    for rank in range(size):
+        partition = CartesianSlabPartition.create(
+            shape, rank=rank, size=size, axis=axis)
+        owned = partition.owned_slice
+        context = _QueuedHaloContext(partition, [diffusion, flux])
+        operator = DistributedCartesianGroupOperator(
+            np, grid, np.array(diffusion[owned], copy=True),
+            np.array(removal[owned], copy=True), partition, context, bc=bc)
+        gathered[owned] = operator.apply(np.array(flux[owned], copy=True))
+        gathered_diag[owned] = operator.diag
+
+    np.testing.assert_allclose(gathered_diag, reference.diag, rtol=0.0, atol=1e-15)
+    np.testing.assert_allclose(gathered, expected, rtol=2e-15, atol=2e-15)
+
+
+def test_cartesian_slab_operator_preserves_mask_boundary_across_mpi_cut():
+    shape = (6, 4, 3)
+    grid = Grid(shape=shape, size=(12.0, 8.0, 6.0))
+    rng = np.random.default_rng(912)
+    diffusion = 0.2 + rng.random(shape)
+    removal = 0.03 + rng.random(shape)
+    flux = rng.random(shape)
+    active = np.ones(shape, dtype=bool)
+    active[2, 1, 1] = False
+    active[3, 2, 0] = False
+    reference = GroupOperator(
+        np, grid, diffusion.copy(), removal.copy(), active=active,
+        bc="vacuum", mask_bc="zero-flux")
+    expected = reference.apply(flux)
+    gathered = np.empty_like(expected)
+    gathered_diag = np.empty_like(reference.diag)
+
+    for rank in range(2):
+        partition = CartesianSlabPartition.create(
+            shape, rank=rank, size=2, axis=0)
+        owned = partition.owned_slice
+        context = _QueuedHaloContext(partition, [diffusion, active, flux])
+        operator = DistributedCartesianGroupOperator(
+            np, grid, np.array(diffusion[owned], copy=True),
+            np.array(removal[owned], copy=True), partition, context,
+            active=np.array(active[owned], copy=True), bc="vacuum",
+            mask_bc="zero-flux")
+        gathered[owned] = operator.apply(np.array(flux[owned], copy=True))
+        gathered_diag[owned] = operator.diag
+
+    np.testing.assert_allclose(gathered_diag, reference.diag, rtol=0.0, atol=1e-15)
+    np.testing.assert_allclose(gathered, expected, rtol=2e-15, atol=2e-15)
 
 
 def test_pcg_uses_global_reductions_without_changing_recurrence():
