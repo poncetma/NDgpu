@@ -7,9 +7,9 @@ cases and return a :class:`ReactorResult` that prints a transparent report
 
 * :class:`Model`       -- a rectangular Cartesian core, painted with boxes in cm
                           (diffusion or SP3; 1-D / 2-D / 3-D; forward or adjoint).
-* :class:`MeshModel`   -- an arbitrary unstructured mesh (a Gmsh file or an
-                          assembled :class:`~ndgpu.Mesh`), 2-D or 3-D, materials
-                          assigned by physical region or mesh tag.
+* :class:`MeshModel`   -- a restricted TPFA-compatible mesh (Gmsh 2.2 ASCII or
+                          an assembled :class:`~ndgpu.Mesh`), 2-D or 3-D,
+                          materials assigned by centroid region or cell tag.
 * :class:`HexLattice`  -- a hexagonal/prismatic geometry builder whose
                           :meth:`~HexLattice.build` returns a reusable
                           :class:`TriReactor` for steady, transient and coupled
@@ -493,15 +493,18 @@ class Model:
 # Unstructured mesh model
 # ---------------------------------------------------------------------------
 class MeshModel:
-    """An unstructured-mesh reactor: assign materials to the cells of a Gmsh mesh.
+    """A steady TPFA reactor model on a compatible unstructured mesh.
 
-    mesh : a path to a Gmsh ``.msh`` file, or an assembled :class:`~ndgpu.Mesh`
-           (2-D triangles/quads or 3-D tets/hexes/prisms).
+    mesh : a Gmsh 2.2 ASCII path, or an assembled :class:`~ndgpu.Mesh` of
+           first-order 2-D triangles/quads or 3-D tets/hexes/prisms. Imported
+           meshes must independently satisfy the TPFA geometry requirements;
+           this is not a general CAD-mesh solver.
 
     Assign with :meth:`fill` (all cells), then :meth:`assign` (by mesh tag or a
     boolean/callable selector) and :meth:`add_box` (by cell centroid), then
     :meth:`set_boundary` and :meth:`run`. Solves with the matrix-free
-    finite-volume diffusion solver on CPU or GPU.
+    finite-volume diffusion solver on one CPU process or one GPU. One boundary
+    condition is applied to every exterior face.
     """
 
     def __init__(self, mesh):
@@ -1019,11 +1022,23 @@ def _drum_absorber_mix(raster, pitch, drums, samples):
     ni, nj, _ = mmap.shape
     weight = np.zeros((ni, nj, 2))
     mix = np.full((ni, nj, 2), -1, dtype=np.int64)
+    owner = np.full((ni, nj, 2), -1, dtype=np.int32)
     centres = np.array([hex_site_xy(rc[0], rc[1], pitch) for d in drums for rc in (d["rc"],)])
     outers = np.array([d["outer"] for d in drums])
-    n = samples
-    bary = np.array([(i / n, j / n, (n - i - j) / n)
-                     for i in range(n + 1) for j in range(n + 1 - i)])   # (S, 3)
+    n = int(samples)
+    if n < 1:
+        raise ValueError("samples must be >= 1")
+    # Barycentres of n**2 equal-area sub-triangles. Equally weighting a point
+    # lattice over-represents the parent edges and biases thin annular arcs.
+    bary = []
+    for i in range(n):
+        for j in range(n - i):
+            u, v = (i + 1.0 / 3.0) / n, (j + 1.0 / 3.0) / n
+            bary.append((1.0 - u - v, u, v))
+            if i + j < n - 1:
+                u, v = (i + 2.0 / 3.0) / n, (j + 2.0 / 3.0) / n
+                bary.append((1.0 - u - v, u, v))
+    bary = np.asarray(bary)
     for a in range(ni):
         for b in range(nj):
             for t in (0, 1):
@@ -1037,6 +1052,7 @@ def _drum_absorber_mix(raster, pitch, drums, samples):
                 if d2[d] > reach * reach:
                     continue
                 dm = drums[d]
+                owner[a, b, t] = d
                 pts = bary @ V
                 dx, dy = pts[:, 0] - centres[d, 0], pts[:, 1] - centres[d, 1]
                 rr = np.hypot(dx, dy)
@@ -1046,6 +1062,26 @@ def _drum_absorber_mix(raster, pitch, drums, samples):
                 if f > 0.0:
                     weight[a, b, t] = f
                     mix[a, b, t] = dm["absorber_id"]
+
+    # Preserve each drum's analytic absorber inventory independently at every
+    # angle. The same correction is used by the HP-MR benchmark path.
+    cell_area = math.sqrt(3.0) / 4.0 * raster.side**2
+    for drum_index, drum in enumerate(drums):
+        selected = (owner == drum_index) & (weight > 0.0)
+        current = cell_area * float(np.sum(weight[selected]))
+        if current <= 0.0:
+            continue
+        target = drum["arc_half"] * (
+            drum["outer"]**2 - drum["inner"]**2)
+        delta = target - current
+        if delta <= 0.0:
+            weight[selected] *= target / current
+            continue
+        capacity = cell_area * float(np.sum(1.0 - weight[selected]))
+        if capacity > 0.0:
+            weight[selected] += min(delta / capacity, 1.0) * (
+                1.0 - weight[selected])
+    np.clip(weight, 0.0, 1.0, out=weight)
     return mix, weight
 
 

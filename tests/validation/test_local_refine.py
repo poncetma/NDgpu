@@ -9,11 +9,17 @@ would not. On top of that, refining the absorber band resolves the arc that a
 coarse raster misses, so the drum worth appears.
 """
 
+import math
+
 import numpy as np
 import pytest
 
 from ndgpu import k_infinite
-from ndgpu.benchmarks.hpmr import _placeholder_materials, hpmr_locally_refined_mesh
+from ndgpu.benchmarks.hpmr import (DRUM_ABSORBER_INNER, DRUM_ARC_HALF_DEG,
+                                   DRUM_RADIUS, _absorber_fraction_triangle,
+                                   _placeholder_materials,
+                                   build_hpmr2d_local,
+                                   hpmr_locally_refined_mesh)
 from ndgpu.mesh import UnstructuredDiffusionSolver
 
 
@@ -28,6 +34,19 @@ def test_nonconforming_reflective_is_kinf():
             refine=3, drum_angle_deg=90.0, refine_drums=refine_drums, materials=homog)
         res = UnstructuredDiffusionSolver(mesh, homog, cm, alpha_boundary=0.0).solve(tol_k=1e-9)
         assert res.k_eff == pytest.approx(kinf, abs=1e-7), (refine_drums, res.k_eff)
+
+    # The recursive interface path must remain conservative beyond one 2:1
+    # split; this is the path used by the effective-r16/r32/r64 drum meshes.
+    for levels in (2, 3):
+        problem = build_hpmr2d_local(
+            refine=2, drum_angle_deg=90.0, local_refinement=True,
+            drum_refine_levels=levels, materials=homog,
+            absorber="polar", samples=8)
+        res = UnstructuredDiffusionSolver(
+            problem.mesh, homog, problem.cell_material, alpha_boundary=0.0,
+            mix_material=problem.mix_material,
+            mix_weight=problem.mix_weight).solve(tol_k=1e-9)
+        assert res.k_eff == pytest.approx(kinf, abs=1e-7), (levels, res.k_eff)
 
 
 def test_local_refinement_adds_fine_cells_in_the_band():
@@ -77,3 +96,33 @@ def test_local_refine_gives_negative_drum_worth():
     k_in, k_out = k(0.0), k(180.0)
     assert k_out > k_in                             # arcs toward core remove reactivity
     assert (1 / k_in - 1 / k_out) * 1e5 > 500       # worth, positive by insertion
+
+
+def test_local_polar_mix_conserves_absorber_area():
+    problem = build_hpmr2d_local(
+        refine=3, drum_angle_deg=93.0, local_refinement=True,
+        absorber="polar", samples=0)
+    mixed_area = float(np.dot(problem.mesh.area, problem.mix_weight))
+    one_drum = (DRUM_ARC_HALF_DEG / 180.0 * np.pi
+                * (DRUM_RADIUS**2 - DRUM_ABSORBER_INNER**2))
+    exact_area = 12.0 * one_drum
+    assert mixed_area == pytest.approx(exact_area, rel=1e-12)
+    assert problem.drum_refine == 2 * problem.global_refine
+
+
+def test_exact_annular_sector_intersection():
+    half_angle = math.radians(15.0)
+    outer = 16.0
+    triangle = np.array([
+        [0.0, 0.0],
+        [outer * math.cos(-half_angle), outer * math.sin(-half_angle)],
+        [outer * math.cos(half_angle), outer * math.sin(half_angle)],
+    ])
+    area = 0.5 * abs(np.linalg.det(np.stack((triangle[1], triangle[2]))))
+    expected_intersection = half_angle * (
+        DRUM_RADIUS**2 - DRUM_ABSORBER_INNER**2)
+
+    fraction = _absorber_fraction_triangle(
+        triangle, np.zeros(2), arc_az=0.0, arc_half=half_angle)
+
+    assert fraction * area == pytest.approx(expected_intersection, rel=1e-12)

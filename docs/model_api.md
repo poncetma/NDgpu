@@ -7,8 +7,8 @@
 
 The `Model` family is a high-level front end for defining and running a reactor.
 The low-level solver classes (`DiffusionEigenSolver`, `SP3EigenSolver`, the
-triangular and unstructured solvers) are fully general but ask you to build a
-grid, hand-assemble a `material_map` array, and read a terse `Result`. The
+triangular and restricted unstructured solvers) ask you to build a grid,
+hand-assemble a `material_map` array, and read a terse `Result`. The
 builders here wrap the common cases: define a reactor in centimetres, paint it
 with named materials, set boundary conditions by name, and get a transparent,
 human-readable report.
@@ -18,7 +18,7 @@ Three builders share one report type (`ReactorResult`):
 | Builder | Geometry | Methods |
 |---|---|---|
 | [`Model`](#model--structured-cartesian) | structured Cartesian, 1-D / 2-D / 3-D | diffusion, SP3, adjoint, **transient** |
-| [`MeshModel`](#meshmodel--unstructured) | arbitrary unstructured mesh (Gmsh or assembled), 2-D / 3-D | diffusion |
+| [`MeshModel`](#meshmodel--unstructured) | restricted TPFA-compatible mesh (Gmsh 2.2 ASCII or assembled), 2-D / 3-D | steady diffusion |
 | [`HexLattice` → `TriReactor`](#hexlattice--trireactor) | hexagonal/prismatic cores on the triangular solver | diffusion/SPN/SDPN, adjoint, transient, thermal coupling |
 
 Materials are ordinary `ndgpu.Material` objects throughout, so defining cross
@@ -199,10 +199,17 @@ The report includes a power-vs-time sparkline:
 
 ## `MeshModel` — unstructured
 
-Runs the matrix-free finite-volume solver on an arbitrary mesh — a Gmsh `.msh`
-file, or a `Mesh` assembled with `assemble_mesh` / `assemble_mesh_3d` — in 2-D or
-3-D (triangles, quads, tets, hexes, prisms). Materials are assigned by physical
-region rather than by box only:
+Runs the matrix-free cell-centred TPFA solver on a compatible Gmsh 2.2 ASCII
+`.msh` file, or a `Mesh` assembled with `assemble_mesh` /
+`assemble_mesh_3d`. Supported first-order cells are 2-D triangles/quads and 3-D
+tets/hexes/prisms. This is not a general Gmsh/CAD solver: accurate TPFA requires
+orthogonal or near-orthogonal centre-to-face geometry, and the importer has a
+narrow format contract. Its main non-Cartesian production use is controlled
+2-D midpoint-based local refinement. See
+[unstructured_mesh_scope.md](unstructured_mesh_scope.md) before importing a new
+mesh family.
+
+Materials are assigned by volume tag or centroid selection:
 
 ```python
 mm = (
@@ -216,10 +223,14 @@ mm = (
 print(mm.run(device="auto"))
 ```
 
-`assign` takes either `tag=` (match the mesh's per-cell tag) or `where=` (a
-boolean mask over cells, or a callable receiving each cell centroid). The report
-is volume-weighted, so material fractions and the balance are correct on
-non-uniform meshes. `MeshModel` is diffusion-only (there is no SP3 mesh solver).
+`assign` takes either `tag=` (match the retained cell's first Gmsh tag) or
+`where=` (a boolean mask over cells, or a callable receiving each cell
+centroid). The report is volume-weighted, so material fractions and the balance
+are correct on non-uniform meshes. Centroid selection does not clip a curved
+material boundary.
+`MeshModel` is steady-forward-diffusion-only, applies one boundary condition to
+all exterior faces, and runs on one CPU process or one GPU. Gmsh boundary tags
+are not retained.
 
 ---
 

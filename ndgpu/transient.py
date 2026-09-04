@@ -360,7 +360,8 @@ class TransientSolver:
             active=self.active, mask_bc=self.mask_bc, **self._op_kwargs)
             for g in range(groups)]
         full = [neumann_preconditioner(
-            op.apply, op.inv_diag, self.precond_degree) for op in ops]
+            getattr(op, "preconditioner_apply", op.apply), op.inv_diag,
+            self.precond_degree) for op in ops]
         if self.precond_dtype is None:
             return ops, full, None, 0
 
@@ -379,8 +380,8 @@ class TransientSolver:
             # FP64 recurrence. Retain the physical preconditioner instead.
             return ops, full, None, 1
         mixed = [mixed_precision_preconditioner(
-            op.apply, op.inv_diag, self.precond_degree, self.dtype)
-            for op in low_ops]
+            getattr(op, "preconditioner_apply", op.apply), op.inv_diag,
+            self.precond_degree, self.dtype) for op in low_ops]
         return ops, mixed, full, 0
 
     def _group_batch(self, fields, phi, G):
@@ -620,10 +621,6 @@ class TransientSolver:
             # Rebalance makes the source map rational rather than affine, so
             # Anderson's affine residual combination is invalid here.
             anderson_depth = 1
-        if reductions is not None and step_solver != "fixed-point":
-            raise NotImplementedError(
-                "distributed transient reductions currently support only "
-                "step_solver='fixed-point'")
         if reductions is not None and adaptive_bdf is not None:
             raise NotImplementedError(
                 "distributed adaptive BDF error norms are not implemented")
@@ -657,7 +654,7 @@ class TransientSolver:
                       "inner_maxiter", "precond_degree", "rtol", "atol",
                       "restart", "maxiter", "coarse_correction",
                       "coarse_adjoint", "energy_anderson",
-                      "inner_fixed_relaxations"}
+                      "inner_fixed_relaxations", "inner_fixed_iterations"}
         unknown_mg = sorted(set(mg_kw) - allowed_mg)
         if unknown_mg:
             raise ValueError(f"unknown multigroup_kwargs: {unknown_mg}")
@@ -1123,8 +1120,18 @@ class TransientSolver:
             # with a thermal step coarser than the neutronics step the
             # temperature (and hence the cross sections) is unchanged for most
             # steps, and rebuilding G operators for identical data is pure cost.
+            def same_spec_object(left, right):
+                if left is right:
+                    return True
+                if (isinstance(left, (tuple, list))
+                        and isinstance(right, (tuple, list))
+                        and len(left) == len(right)):
+                    return all(a is b for a, b in zip(left, right))
+                return False
+
             fields_changed = (upd is not last_upd
-                              or any(a is not b for a, b in zip(spec, last)))
+                              or any(not same_spec_object(a, b)
+                                     for a, b in zip(spec, last)))
             if fields_changed:
                 phase = (nullcontext() if self.phase_context is None else
                          self.phase_context("operator_rebuild"))
@@ -1198,6 +1205,8 @@ class TransientSolver:
                                 "energy_anderson", 0)),
                             inner_fixed_relaxations=int(mg_kw.get(
                                 "inner_fixed_relaxations", 0)),
+                            inner_fixed_iterations=int(mg_kw.get(
+                                "inner_fixed_iterations", 0)),
                             precond_degree=int(mg_kw.get(
                                 "precond_degree", self.precond_degree)))
                         if monolithic_workspace is None:
@@ -1234,7 +1243,8 @@ class TransientSolver:
                         atol=float(mg_kw.get("atol", 0.0)),
                         restart=int(mg_kw.get("restart", 30)),
                         maxiter=int(mg_kw.get("maxiter", 300)),
-                        workspace=monolithic_workspace)
+                        workspace=monolithic_workspace,
+                        reductions=reductions)
                     for g in range(G):
                         phi[g][...] = solved[g]
                     S = fission_source(phi) / k0
@@ -1546,11 +1556,12 @@ class TransientSolver:
                         delta = G_S - S
 
                 if change < tol_step:
-                    if anderson_used and not confirming:
-                        # Anderson can make the change between mixed iterates
-                        # look converged while the stateful Gauss-Seidel map is
-                        # not. Confirm using a clean Picard sweep; if it fails,
-                        # the normal path below restarts from an empty history.
+                    if not confirming and (fields_changed or anderson_used):
+                        # Confirm with the now-small change driving a tight
+                        # group-solve tolerance. Besides rejecting Anderson's
+                        # mixed-iterate false positives, this prevents a warm
+                        # start on changed physics from appearing converged
+                        # after a first sweep at the initial loose PCG tolerance.
                         confirming = True
                         hist = []
                         S = G_S

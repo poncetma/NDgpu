@@ -1,11 +1,11 @@
-"""Unstructured finite-volume diffusion on a Gmsh mesh.
+"""Restricted unstructured finite-volume diffusion on a compatible mesh.
 
-Reads a Gmsh 2.2 ``.msh`` file -- 2D triangle/quad cells, or 3D tetrahedra,
-hexahedra and prisms -- and solves the multigroup k-eigenvalue diffusion problem
-on the arbitrary geometry it describes, the same job FEMFFUSION or GeN-Foam do
-from a mesh rather than from a structured lattice. This is the general-geometry
-escape hatch: where the structured Cartesian/hex operators need a lattice, this
-one needs only cells, their vertices, and per-cell materials.
+Reads first-order cells from a Gmsh 2.2 ASCII ``.msh`` file, or accepts an
+assembled :class:`Mesh`, and solves the steady multigroup diffusion
+k-eigenproblem. This is not a general Gmsh/CAD discretisation: the two-point
+flux approximation requires orthogonal or near-orthogonal cell-centre/face
+geometry for consistency. Its main nonconforming use is controlled 2-D local
+refinement by recursive midpoint bisection; 3-D meshes must be conforming.
 
 The scheme is a cell-centred two-point-flux finite volume: for a face shared by
 cells i and j, the coupling is D_face * A_face / d(centroid_i, centroid_j) with
@@ -20,9 +20,9 @@ to the maximum degree), and the apply reads each cell's neighbour fluxes and
 combines them with per-slot weights -- no scatter, hence no GPU atomics, and a
 coalesced write, the same access pattern that makes the structured stencils fast
 on CUDA. The single NumPy/CuPy code path runs on CPU or GPU and reuses the
-structured solvers' Jacobi/Neumann-PCG, putting the general-geometry track on the
-GPU alongside the structured lattices rather than the earlier SciPy sparse direct
-factorisation. Power iteration drives the outer fission source.
+structured solvers' Jacobi/Neumann-PCG. Power iteration drives the outer fission
+source. See ``docs/unstructured_mesh_scope.md`` for the complete support
+contract and validation limits.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .backend import asnumpy, device_name, get_backend, synchronize
+from .blend import MaterialBlend
 from .linalg import get_linear_solver, neumann_preconditioner
 
 
@@ -68,12 +69,13 @@ _GMSH_3D = {4: 4, 5: 8, 6: 6}                     # tetrahedron, hexahedron, pri
 
 
 def read_gmsh(path: str) -> Mesh:
-    """Parse a Gmsh 2.2 ASCII mesh and assemble a Mesh.
+    """Parse the supported subset of a Gmsh 2.2 ASCII mesh.
 
     Handles 2D meshes of triangles (type 2) / quads (type 3) and 3D meshes of
     tetrahedra (4) / hexahedra (5) / prisms (6). If any 3D volume element is
-    present the mesh is built in 3D (surface elements are ignored); otherwise the
-    2D path is used.
+    present the mesh is built in 3D (surface elements and their boundary tags
+    are ignored); otherwise the 2D path is used. Reading a mesh does not imply
+    that its geometry satisfies the TPFA consistency requirements.
     """
     lines = open(path).read().splitlines()
     ni = lines.index("$Nodes")
@@ -105,14 +107,12 @@ def assemble_mesh(coords, cells, tags) -> Mesh:
     tags   : one integer per cell (material/assembly id). A face is a boundary
     face when only one cell borders it.
 
-    Nonconforming (locally-refined) interfaces are supported: a one-cell edge
-    (i, j) whose midpoint is itself a mesh node m, with the half-edges (i, m)
-    and (m, j) each owned by another cell, is a coarse edge meeting two fine
-    cells across a 2:1 hanging node. It is split into two interior faces
-    coupling the coarse cell to each fine cell (each carrying its half-edge
-    length) -- the standard conservative two-point-flux treatment. Purely
-    conforming meshes are unaffected (their one-cell edges have no midpoint
-    node, so they stay boundary faces).
+    Nonconforming (locally-refined) interfaces are supported at any dyadic
+    depth. A one-cell coarse edge is recursively split at mesh-node midpoints
+    until the leaf edges owned by fine cells are found. Each leaf becomes one
+    interior face coupling the coarse cell to that fine cell and carrying its
+    own edge length. Face measure is therefore neither lost nor double counted.
+    Purely conforming meshes are unaffected.
     """
     coords = np.asarray(coords, dtype=float)
     cells = [tuple(c) for c in cells]
@@ -140,21 +140,35 @@ def assemble_mesh(coords, cells, tags) -> Mesh:
     def dist(a, b):
         return float(np.hypot(*(centroid[a] - centroid[b])))
 
+    def refined_leaves(edge):
+        """Fine one-cell edges that exactly tile ``edge``, or None."""
+        a, b = edge
+        mnode = node_at.get(key(0.5 * (coords[a] + coords[b])))
+        if mnode is None or mnode in (a, b):
+            return None
+        leaves = []
+        for half in (tuple(sorted((a, mnode))), tuple(sorted((mnode, b)))):
+            if half in one_cell:
+                leaves.append((half, one_cell[half]))
+                continue
+            nested = refined_leaves(half)
+            if nested is None:
+                return None
+            leaves.extend(nested)
+        return leaves
+
     faces, bfaces, consumed = [], [], set()
     for e, ci in one_cell.items():
         if e in consumed:
             continue
-        a, b = e
-        mnode = node_at.get(key(0.5 * (coords[a] + coords[b])))
-        if mnode is None or mnode in (a, b):
+        leaves = refined_leaves(e)
+        if leaves is None:
             continue
-        e1, e2 = tuple(sorted((a, mnode))), tuple(sorted((mnode, b)))
-        if e1 in one_cell and e2 in one_cell:      # coarse edge over two fine cells
-            for half in (e1, e2):
-                cj = one_cell[half]
-                L = float(np.hypot(*(coords[half[0]] - coords[half[1]])))
-                faces.append((ci, cj, L, dist(ci, cj)))
-            consumed.update((e, e1, e2))
+        for leaf, cj in leaves:
+            L = float(np.hypot(*(coords[leaf[0]] - coords[leaf[1]])))
+            faces.append((ci, cj, L, dist(ci, cj)))
+        consumed.add(e)
+        consumed.update(leaf for leaf, _ in leaves)
 
     for e, lst in edge_cells.items():
         if e in consumed:
@@ -340,7 +354,7 @@ class _MeshGroupOperator:
 
 
 class UnstructuredDiffusionSolver:
-    """Multigroup k-eigenvalue diffusion FV solver on an arbitrary Gmsh mesh.
+    """Steady multigroup TPFA k-eigenvalue solver on a compatible Mesh.
 
     materials      : list of Material (all same group count, up- or down-scatter).
     cell_material  : (n_cells,) index into `materials` for each cell.
@@ -350,13 +364,18 @@ class UnstructuredDiffusionSolver:
     precond_degree : Neumann-polynomial preconditioner degree for the inner CG
                      (0 = plain Jacobi, the default), as on the structured
                      solvers.
+    mix_material / mix_weight : optional second material and its volume
+                     fraction in each cell. Uses the same linear reaction-rate,
+                     harmonic diffusion, and fission-weighted spectrum rules as
+                     the structured solvers.
     linear_solver  : "cg" (default), "gmres", or "bicgstab", as on the
                      structured solvers.
     """
 
     def __init__(self, mesh: Mesh, materials, cell_material,
                  alpha_boundary=_VACUUM_ALPHA, device="auto",
-                 precond_degree=0, dtype=np.float64, linear_solver="cg"):
+                 precond_degree=0, dtype=np.float64, linear_solver="cg",
+                 mix_material=None, mix_weight=None):
         self.xp = xp = get_backend(device)
         self.device = device_name(xp)
         self.dtype = dtype
@@ -368,9 +387,22 @@ class UnstructuredDiffusionSolver:
         self.G = G = self.mats[0].n_groups
         n = mesh.n_cells
 
+        if cm.shape != (n,):
+            raise ValueError(f"cell_material shape {cm.shape} != ({n},)")
+        if (mix_material is None) != (mix_weight is None):
+            raise ValueError("mix_material and mix_weight must be supplied together")
+        blend = MaterialBlend(
+            np, (n,), cm, len(self.mats), dtype=dtype,
+            mix_material=mix_material, mix_weight=mix_weight)
+        linear, harmonic = blend.linear, blend.harmonic
+
+        def group_field(attr, group, lookup=linear):
+            table = np.array([getattr(mat, attr)[group] for mat in self.mats])
+            return np.asarray(lookup(table), dtype=dtype)
+
         area = np.asarray(mesh.area, dtype=dtype)
-        D = [np.array([self.mats[m].diffusion[g] for m in cm], dtype=dtype) for g in range(G)]
-        removal = [np.array([self.mats[m].removal[g] for m in cm], dtype=dtype) for g in range(G)]
+        D = [group_field("diffusion", g, harmonic) for g in range(G)]
+        removal = [group_field("removal", g) for g in range(G)]
 
         # Face and boundary connectivity as flat arrays (host; moved to device).
         fi = np.array([f[0] for f in mesh.faces], dtype=np.int64)
@@ -407,16 +439,18 @@ class UnstructuredDiffusionSolver:
 
         # Source data, device-resident.
         self.area = xp.asarray(area)
-        self.nsf = [xp.asarray(np.array([self.mats[m].nu_sigma_f[g] for m in cm], dtype=dtype))
-                    for g in range(G)]
-        self.chi = [xp.asarray(np.array([self.mats[m].chi[g] for m in cm], dtype=dtype))
+        self.nsf = [xp.asarray(group_field("nu_sigma_f", g)) for g in range(G)]
+        production = np.array([mat.nu_sigma_f.sum() for mat in self.mats])
+        self.chi = [xp.asarray(np.asarray(blend.fission_weighted(
+            np.array([mat.chi[g] for mat in self.mats]), production), dtype=dtype))
                     for g in range(G)]
         # scattering g'->g (both down- and up-scatter); lagged through the source.
         self.scat = {}
         for gf in range(G):
             for gt in range(G):
                 if gt != gf:
-                    col = np.array([self.mats[m].sigma_s[gf, gt] for m in cm], dtype=dtype)
+                    table = np.array([mat.sigma_s[gf, gt] for mat in self.mats])
+                    col = np.asarray(linear(table), dtype=dtype)
                     if np.any(col):
                         self.scat[(gf, gt)] = xp.asarray(col)
 

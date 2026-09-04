@@ -5,9 +5,13 @@ from __future__ import annotations
 import numpy as np
 
 from .distributed import (CartesianSlabPartition, DistributedContext,
-                          DistributedResult, TriRowPartition)
+                          DistributedResult, ExtrudedAxialPartition,
+                          TriRowPartition)
 from .distributed_stencil import (DistributedCartesianGroupOperator,
+                                  DistributedExtrudedMeshGroupOperator,
                                   DistributedTriGroupOperator)
+from .extruded_mesh import (ExtrudedMeshDiffusionEigenSolver,
+                            ExtrudedMeshGrid)
 from .grid import Grid
 from .solver import DiffusionEigenSolver
 from .tri import TriDiffusionEigenSolver, TriGrid
@@ -157,6 +161,69 @@ class DistributedTriDiffusionEigenSolver(TriDiffusionEigenSolver):
                 active=self.active, mask_bc=self.mask_bc,
                 communication_tag=500 + 10 * g)
             for g in range(self.n_groups)
+        ]
+
+    def solve(self, *args, **kwargs):
+        if "reductions" in kwargs:
+            raise TypeError("distributed solver owns its reduction provider")
+        result = super().solve(
+            *args, reductions=self.distributed_context.reductions, **kwargs)
+        return DistributedResult.from_local_result(
+            result, self.partition, self.distributed_context)
+
+
+class DistributedExtrudedMeshDiffusionEigenSolver(
+        ExtrudedMeshDiffusionEigenSolver):
+    """Extruded-mesh eigenvalue solve with axial layers divided over MPI."""
+
+    def __init__(self, grid, materials, material_map=None, *, communicator=None,
+                 context=None, active=None, mix_material=None, mix_weight=None,
+                 decomposition="auto", communication="auto", device="auto",
+                 **kwargs):
+        context, context_device = _resolve_context(
+            communicator, context, device, communication)
+        if not isinstance(grid, ExtrudedMeshGrid):
+            raise TypeError("grid must be an ExtrudedMeshGrid")
+        if decomposition not in ("auto", "axial"):
+            raise ValueError("decomposition must be 'auto' or 'axial'")
+
+        partition = ExtrudedAxialPartition.create(
+            grid.shape, context.rank, context.size)
+        local_nz = partition.stop - partition.start
+        local_grid = ExtrudedMeshGrid(
+            grid.mesh, height=grid.dz * local_nz, nz=local_nz)
+        self.distributed_context = context
+        self.partition = partition
+        self.global_grid = grid
+        self._distributed_active = _local_array(active, partition, "active")
+        local_material_map = _local_array(
+            material_map, partition, "material_map")
+        local_mix_material = _local_array(
+            mix_material, partition, "mix_material")
+        local_mix_weight = _local_array(
+            mix_weight, partition, "mix_weight")
+
+        super().__init__(
+            local_grid, materials, material_map=local_material_map,
+            device=context_device, active=self._distributed_active,
+            mix_material=local_mix_material, mix_weight=local_mix_weight,
+            **kwargs)
+        self._normalization_cell_count = grid.n_cells
+
+    def _build_operators(self, grid, diffusion, sigma_t, removal, bc):
+        del grid, sigma_t
+        if self.hybrid_mask is not None:
+            raise ValueError("hybrid_mask has no effect on diffusion")
+        if not self.symmetric_operator:
+            raise ValueError(
+                "distributed extruded diffusion requires symmetric_operator=True")
+        self.ops = [
+            DistributedExtrudedMeshGroupOperator(
+                self.xp, self.global_grid, diffusion[group], removal[group],
+                self.partition, self.distributed_context, bc=bc,
+                active=self.active, mask_bc=self.mask_bc,
+                communication_tag=1300 + 10 * group)
+            for group in range(self.n_groups)
         ]
 
     def solve(self, *args, **kwargs):

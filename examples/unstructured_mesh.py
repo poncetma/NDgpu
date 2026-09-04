@@ -1,11 +1,10 @@
-"""General-geometry reactor on an unstructured mesh via ndgpu.MeshModel.
+"""Steady TPFA reactor on a controlled unstructured mesh via ndgpu.MeshModel.
 
-MeshModel runs the matrix-free finite-volume solver on an arbitrary mesh -- a
-Gmsh ``.msh`` file, or a Mesh you assemble yourself -- in 2-D or 3-D. Materials
-are assigned by physical region: a centroid box, a mesh tag, or an arbitrary
-predicate on the cell centroid. Here we build a 3-D hex mesh in code and carve a
-*spherical* fuel region out of a reflector with a predicate, to show that the
-region need not be box-shaped.
+MeshModel runs the matrix-free two-point-flux solver on a compatible Gmsh 2.2
+ASCII mesh, or a controlled Mesh assembled in code. It is not a general
+CAD-mesh solver; see ``docs/unstructured_mesh_scope.md``. Here we build an
+orthogonal 3-D hex mesh and paint a spherical fuel region by cell centroid. The
+curved interface is therefore stair-stepped rather than geometrically clipped.
 
     m = ndgpu.MeshModel("core.msh")     # or MeshModel(mesh_object)
     m.fill(reflector).assign(fuel, tag=1).set_boundary("vacuum")

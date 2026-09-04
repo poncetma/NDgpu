@@ -837,7 +837,8 @@ def gmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0, maxiter=5000,
 
 
 def _fgmres_workspace_solve(apply_A, b, x0, xp, M, *, rtol, atol,
-                            maxiter, restart, raise_on_fail, workspace):
+                            maxiter, restart, raise_on_fail, workspace,
+                            reductions=None):
     """Allocation-stable FGMRES implementation used when storage is supplied."""
     workspace.validate(x0, restart)
     x, r, w = workspace.x, workspace.r, workspace.w
@@ -856,7 +857,9 @@ def _fgmres_workspace_solve(apply_A, b, x0, xp, M, *, rtol, atol,
         return out
 
     def norm(value):
-        return float(xp.sqrt(kernels.dot(xp, value, value)))
+        squared = (kernels.dot(xp, value, value) if reductions is None
+                   else reductions.dot(value, value))
+        return float(xp.sqrt(squared))
 
     xp.copyto(x, x0)
     stop = max(float(rtol) * norm(b), float(atol))
@@ -879,7 +882,24 @@ def _fgmres_workspace_solve(apply_A, b, x0, xp, M, *, rtol, atol,
             it += 1
             apply_preconditioner(V[j], Z[j])
             apply_operator(Z[j], w)
-            if kernels.is_cupy(xp):
+            if reductions is not None:
+                # CGS2 needs the first global projection before updating w;
+                # the correction and norm then share a second collective.
+                active_basis = V[:j + 1]
+                h1 = reductions.project(active_basis, w)
+                kernels.basis_accumulate(
+                    xp, w, V, h1, j + 1, alpha=-1.0)
+                h2_norm = reductions.project(
+                    active_basis, w, include_norm=True)
+                kernels.basis_accumulate(
+                    xp, w, V, h2_norm[:-1], j + 1, alpha=-1.0)
+                h_device = h1 + h2_norm[:-1]
+                packed = xp.concatenate(
+                    (h_device, xp.sqrt(h2_norm[-1:]).reshape(1)))
+                host = asnumpy(packed)
+                H[:j + 1, j] = host[:-1]
+                H[j + 1, j] = float(host[-1])
+            elif kernels.is_cupy(xp):
                 # Two-pass classical Gram--Schmidt (CGS2) retains MGS-level
                 # orthogonality, but both projection passes remain on device.
                 basis = V[:j + 1].reshape(j + 1, -1)
@@ -940,7 +960,7 @@ def _fgmres_workspace_solve(apply_A, b, x0, xp, M, *, rtol, atol,
 
 def fgmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0,
            maxiter=5000, precond=None, restart=30, raise_on_fail=True,
-           workspace=None):
+           workspace=None, reductions=None):
     """Solve a real non-symmetric system with flexible restarted GMRES.
 
     This has the same public signature and true-residual stopping rule as
@@ -956,8 +976,10 @@ def fgmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0,
     this also batches all Arnoldi projections into one host synchronization per
     iteration. Returns ``(x, n_iterations)``, counting operator applies.
     """
-    dot = lambda u, v: float(xp.sum(u * v))
-    norm = lambda u: float(xp.sqrt(xp.sum(u * u)))
+    dot_product = ((lambda u, v: xp.sum(u * v)) if reductions is None
+                   else reductions.dot)
+    dot = lambda u, v: float(dot_product(u, v))
+    norm = lambda u: float(xp.sqrt(dot_product(u, u)))
     M = precond if precond is not None else (lambda r: inv_diag * r)
 
     restart = int(restart)
@@ -967,7 +989,7 @@ def fgmres(apply_A, b, x0, inv_diag, xp, rtol=1e-6, atol=0.0,
         return _fgmres_workspace_solve(
             apply_A, b, x0, xp, M, rtol=rtol, atol=atol,
             maxiter=maxiter, restart=restart, raise_on_fail=raise_on_fail,
-            workspace=workspace)
+            workspace=workspace, reductions=reductions)
     x = x0.copy()
     stop = max(rtol * norm(b), atol)
     r = b - apply_A(x)

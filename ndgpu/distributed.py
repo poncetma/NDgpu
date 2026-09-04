@@ -141,6 +141,19 @@ class TriRowPartition(SpatialPartition):
         return cls(shape, 0, rank, size, start, stop)
 
 
+class ExtrudedAxialPartition(SpatialPartition):
+    """Axial-layer decomposition of ``(radial_cell, axial_layer)`` arrays."""
+
+    @classmethod
+    def create(cls, global_shape, rank: int, size: int):
+        shape = tuple(int(value) for value in global_shape)
+        if len(shape) != 2:
+            raise ValueError(
+                "extruded mesh shape must be (radial_cells, axial_layers)")
+        start, stop = _balanced_range(shape[1], rank, size)
+        return cls(shape, 1, rank, size, start, stop)
+
+
 class SerialReductions:
     """Backend-local reductions implementing the distributed reduction API."""
 
@@ -176,6 +189,16 @@ class SerialReductions:
         return self.xp.stack([
             self.xp.sum(left * right) for left, right in pairs])
 
+    def project(self, basis, value, *, include_norm=False):
+        """Project onto a stacked basis, optionally appending ``value`` norm2."""
+        rows = basis.reshape(basis.shape[0], -1)
+        flat = value.reshape(-1)
+        projected = rows @ flat
+        if include_norm:
+            projected = self.xp.concatenate(
+                (projected, kernels.dot(self.xp, value, value).reshape(1)))
+        return projected
+
 
 class DistributedReductions(SerialReductions):
     """Local array reductions followed by communicator-wide collectives."""
@@ -200,6 +223,10 @@ class DistributedReductions(SerialReductions):
 
     def dot_many(self, pairs):
         return self.context.allreduce_sum(super().dot_many(pairs))
+
+    def project(self, basis, value, *, include_norm=False):
+        return self.context.allreduce_sum(
+            super().project(basis, value, include_norm=include_norm))
 
 
 @dataclass
@@ -410,12 +437,16 @@ class DistributedContext:
         Every rank performs the same two directional ``Sendrecv`` calls. A
         physical boundary uses ``MPI.PROC_NULL`` and is returned as ``None``;
         this remains safe for one-cell slabs where both owned planes coincide.
+        Leading component dimensions are retained, allowing one exchange of a
+        stacked multigroup field.
         """
         if partition.rank != self.rank or partition.size != self.size:
             raise ValueError("partition rank/size does not match the context")
-        if tuple(value.shape) != partition.local_shape:
+        spatial_ndim = len(partition.local_shape)
+        if tuple(value.shape[-spatial_ndim:]) != partition.local_shape:
             raise ValueError(
-                f"local value shape {value.shape} != {partition.local_shape}")
+                f"local value spatial shape {value.shape[-spatial_ndim:]} != "
+                f"{partition.local_shape}")
         if self.size == 1:
             return None, None
 
@@ -426,9 +457,11 @@ class DistributedContext:
         upper = partition.upper_rank
         proc_null = self._mpi.PROC_NULL if self._mpi is not None else -1
 
+        value_axis = value.ndim - spatial_ndim + partition.axis
+
         def plane(index):
             sl = [slice(None)] * value.ndim
-            sl[partition.axis] = index
+            sl[value_axis] = index
             return value[tuple(sl)]
 
         lower_halo = self.sendrecv(
@@ -454,9 +487,11 @@ class DistributedContext:
             return halos, work()
         if partition.rank != self.rank or partition.size != self.size:
             raise ValueError("partition rank/size does not match the context")
-        if tuple(value.shape) != partition.local_shape:
+        spatial_ndim = len(partition.local_shape)
+        if tuple(value.shape[-spatial_ndim:]) != partition.local_shape:
             raise ValueError(
-                f"local value shape {value.shape} != {partition.local_shape}")
+                f"local value spatial shape {value.shape[-spatial_ndim:]} != "
+                f"{partition.local_shape}")
         state = self._begin_halo_exchange(value, partition, tag=tag)
         result = work()
         return self._finish_halo_exchange(state), result
@@ -465,10 +500,12 @@ class DistributedContext:
             self, value, partition: SpatialPartition, *, tag: int):
         lower = partition.lower_rank
         upper = partition.upper_rank
+        spatial_ndim = len(partition.local_shape)
+        value_axis = value.ndim - spatial_ndim + partition.axis
 
         def plane(index):
             sl = [slice(None)] * value.ndim
-            sl[partition.axis] = index
+            sl[value_axis] = index
             return self.xp.ascontiguousarray(value[tuple(sl)])
 
         sends = []

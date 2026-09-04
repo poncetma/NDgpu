@@ -26,6 +26,8 @@ def parse_args():
     parser.add_argument("--refine", type=int, default=4)
     parser.add_argument("--nz", type=int, default=10)
     parser.add_argument("--groups", choices=("2", "11"), default="11")
+    parser.add_argument("--samples", type=int, default=0,
+                        help="0 for exact curved drum-cell intersections")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--dt", type=float, default=0.01)
     parser.add_argument("--initial-angle", type=float, default=120.0)
@@ -56,6 +58,7 @@ def main():
     build_kwargs = {
         "refine": args.refine,
         "absorber": "polar",
+        "samples": args.samples,
         "materials": materials,
     }
     if three_d:
@@ -97,7 +100,6 @@ def main():
         linsolve_kwargs={
             "check_every": args.check_every,
             "single_reduction": args.single_reduction,
-            "batched_halos": args.batched_halos,
         },
         verbose=context.rank == 0)
     communicator.Barrier()
@@ -121,6 +123,7 @@ def main():
             "communication_mode": context.communication_mode,
             "global_shape": initial.grid.shape,
             "groups": args.groups,
+            "samples": args.samples,
             "steps": args.steps,
             "dt": args.dt,
             "tol_step": args.tol_step,

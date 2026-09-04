@@ -32,7 +32,7 @@ the ``materials`` argument, ordered as ``MATERIAL_NAMES``.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -288,21 +288,22 @@ def absorber_fraction_map(raster: TriRaster, drum_angle_deg, samples: int = 10):
     rotates. Feed the result as ``mix_weight`` with ``mix_material`` =
     DRUM_ABSORBER to volume-mix the absorber into the drum-body cells.
 
-    samples : barycentric sub-sampling order; (samples+1)(samples+2)/2 points
-    per cell (10 -> 66). Higher = finer area/rotation resolution.
+    samples : 0 selects exact triangle/annular-sector intersection. A positive
+    value retains equal-area sub-cell quadrature with samples^2 centroids
+    (10 -> 100) for comparison with historical results.
     """
     mmap = raster.material_map
     ni, nj, _ = mmap.shape
     frac = np.zeros((ni, nj, 2), dtype=float)
+    drum_owner = np.full((ni, nj, 2), -1, dtype=np.int16)
     drum_xy, arc_az = _drum_geometry(drum_angle_deg)
     drum_xy = np.asarray(drum_xy)
     arc_az = np.asarray(arc_az)
     arc_half = math.radians(DRUM_ARC_HALF_DEG)
     reach2 = (DRUM_RADIUS + raster.side) ** 2
 
-    n = samples
-    bary = np.array([(i / n, j / n, (n - i - j) / n)
-                     for i in range(n + 1) for j in range(n + 1 - i)])  # (S, 3)
+    exact = int(samples) == 0
+    bary = None if exact else _triangle_subcell_barycenters(samples)
 
     for a in range(ni):
         for b in range(nj):
@@ -315,41 +316,255 @@ def absorber_fraction_map(raster: TriRaster, drum_angle_deg, samples: int = 10):
                 d = int(d2.argmin())
                 if d2[d] > reach2:
                     continue
-                pts = bary @ V                              # (S, 2)
-                dx = pts[:, 0] - drum_xy[d, 0]
-                dy = pts[:, 1] - drum_xy[d, 1]
-                rr = np.hypot(dx, dy)
-                dphi = (np.arctan2(dy, dx) - arc_az[d] + np.pi) % (2 * np.pi) - np.pi
-                inside = ((rr > DRUM_ABSORBER_INNER) & (rr <= DRUM_RADIUS)
-                          & (np.abs(dphi) <= arc_half))
-                frac[a, b, t] = inside.mean()
-    return frac
+                drum_owner[a, b, t] = d
+                if exact:
+                    frac[a, b, t] = _absorber_fraction_triangle(
+                        V, drum_xy[d], arc_az[d], arc_half)
+                else:
+                    pts = bary @ V                          # (S, 2)
+                    dx = pts[:, 0] - drum_xy[d, 0]
+                    dy = pts[:, 1] - drum_xy[d, 1]
+                    rr = np.hypot(dx, dy)
+                    dphi = ((np.arctan2(dy, dx) - arc_az[d] + np.pi)
+                            % (2 * np.pi) - np.pi)
+                    inside = ((rr > DRUM_ABSORBER_INNER) & (rr <= DRUM_RADIUS)
+                              & (np.abs(dphi) <= arc_half))
+                    frac[a, b, t] = inside.mean()
+    cell_area = math.sqrt(3.0) / 4.0 * raster.side**2
+    return _conserve_absorber_area(frac, drum_owner, cell_area)
 
 
-def hpmr_locally_refined_mesh(refine: int = 3, drum_angle_deg=0.0,
-                              refine_drums: bool = True, band_margin: float = 1.5,
-                              materials=None):
-    """Locally-refined 2D HP-MR triangular finite-volume mesh.
+def _triangle_subcell_barycenters(order: int) -> np.ndarray:
+    """Barycentres of the ``order**2`` equal-area sub-triangles.
+
+    Sampling equal-area sub-cells avoids the boundary bias of an equally
+    weighted barycentric point lattice, which over-represents triangle edges
+    and can make a thin rotating annulus' volume fraction oscillate with mesh
+    orientation.
+    """
+    n = int(order)
+    if n < 1:
+        raise ValueError("samples must be >= 1")
+    bary = []
+    for i in range(n):
+        for j in range(n - i):
+            u, v = (i + 1.0 / 3.0) / n, (j + 1.0 / 3.0) / n
+            bary.append((1.0 - u - v, u, v))
+            if i + j < n - 1:
+                u, v = (i + 2.0 / 3.0) / n, (j + 2.0 / 3.0) / n
+                bary.append((1.0 - u - v, u, v))
+    return np.asarray(bary)
+
+
+def _clip_polygon_ray(poly, ray, keep_left):
+    """Clip a polygon to one side of a line through the origin."""
+    if len(poly) == 0:
+        return poly
+
+    def signed(point):
+        value = ray[0] * point[1] - ray[1] * point[0]
+        return value if keep_left else -value
+
+    output = []
+    start = poly[-1]
+    f_start = signed(start)
+    for end in poly:
+        f_end = signed(end)
+        inside_start, inside_end = f_start >= -1e-14, f_end >= -1e-14
+        if inside_start != inside_end:
+            t = f_start / (f_start - f_end)
+            output.append(start + t * (end - start))
+        if inside_end:
+            output.append(end)
+        start, f_start = end, f_end
+    return np.asarray(output)
+
+
+def _circle_polygon_area(poly, radius):
+    """Exact area of a polygon intersected with an origin-centred disk."""
+    if len(poly) < 3:
+        return 0.0
+    total = 0.0
+    radius2 = radius * radius
+    for a, b in zip(poly, np.roll(poly, -1, axis=0)):
+        delta = b - a
+        aa = float(np.dot(delta, delta))
+        bb = 2.0 * float(np.dot(a, delta))
+        cc = float(np.dot(a, a)) - radius2
+        cuts = [0.0, 1.0]
+        disc = bb * bb - 4.0 * aa * cc
+        if aa > 0.0 and disc > 0.0:
+            root = math.sqrt(disc)
+            for value in ((-bb - root) / (2.0 * aa),
+                          (-bb + root) / (2.0 * aa)):
+                if 1e-14 < value < 1.0 - 1e-14:
+                    cuts.append(value)
+        cuts.sort()
+        for left, right in zip(cuts[:-1], cuts[1:]):
+            p = a + left * delta
+            q = a + right * delta
+            middle = 0.5 * (p + q)
+            cross = float(p[0] * q[1] - p[1] * q[0])
+            if float(np.dot(middle, middle)) <= radius2 * (1.0 + 1e-14):
+                total += 0.5 * cross
+            else:
+                total += 0.5 * radius2 * math.atan2(cross, float(np.dot(p, q)))
+    return abs(total)
+
+
+def _absorber_fraction_triangle(vertices, drum_centre, arc_az, arc_half):
+    """Exact curved B4C area fraction inside one triangle."""
+    poly = np.asarray(vertices, dtype=float) - np.asarray(drum_centre)
+    lo = np.array([math.cos(arc_az - arc_half), math.sin(arc_az - arc_half)])
+    hi = np.array([math.cos(arc_az + arc_half), math.sin(arc_az + arc_half)])
+    poly = _clip_polygon_ray(poly, lo, keep_left=True)
+    poly = _clip_polygon_ray(poly, hi, keep_left=False)
+    if len(poly) < 3:
+        return 0.0
+    annular_area = (_circle_polygon_area(poly, DRUM_RADIUS)
+                    - _circle_polygon_area(poly, DRUM_ABSORBER_INNER))
+    vertices = np.asarray(vertices)
+    edge_a = vertices[1] - vertices[0]
+    edge_b = vertices[2] - vertices[0]
+    triangle_area = 0.5 * abs(float(
+        edge_a[0] * edge_b[1] - edge_a[1] * edge_b[0]))
+    return min(max(annular_area / triangle_area, 0.0), 1.0)
+
+
+def _conserve_absorber_area(frac, drum_owner, cell_area):
+    """Correct quadrature fractions to the exact annular-sector area.
+
+    The correction is applied independently to every drum and only over cells
+    where quadrature found absorber. It scales down excess area directly; for
+    a deficit it fills available partial-cell capacity, preserving ``0 <= w <=
+    1``. This removes angle-dependent absorber inventory without changing the
+    mesh or manufacturing absorber in unrelated drum cells.
+    """
+    frac = np.asarray(frac, dtype=float).copy()
+    owner = np.asarray(drum_owner)
+    area = np.broadcast_to(np.asarray(cell_area, dtype=float), frac.shape)
+    target = math.radians(DRUM_ARC_HALF_DEG) * (
+        DRUM_RADIUS**2 - DRUM_ABSORBER_INNER**2)
+    for drum in range(len(_DRUM_SITES)):
+        mask = (owner == drum) & (frac > 0.0)
+        current = float(np.sum(area[mask] * frac[mask]))
+        if current <= 0.0:
+            continue
+        delta = target - current
+        if delta <= 0.0:
+            frac[mask] *= target / current
+            continue
+        capacity = float(np.sum(area[mask] * (1.0 - frac[mask])))
+        if capacity > 0.0:
+            frac[mask] += min(delta / capacity, 1.0) * (1.0 - frac[mask])
+    return np.clip(frac, 0.0, 1.0)
+
+
+def absorber_fraction_mesh(mesh, cell_material, drum_angle_deg, samples: int = 0):
+    """B4C volume fraction on an arbitrary triangular HP-MR mesh."""
+    cm = np.asarray(cell_material)
+    if cm.shape != (mesh.n_cells,):
+        raise ValueError("cell_material must have one entry per mesh cell")
+    angles = np.broadcast_to(np.asarray(drum_angle_deg, dtype=float),
+                             (len(_DRUM_SITES),))
+    drum_xy, arc_az = _drum_geometry(angles)
+    drum_xy = np.asarray(drum_xy)
+    arc_az = np.asarray(arc_az)
+    arc_half = math.radians(DRUM_ARC_HALF_DEG)
+    exact = int(samples) == 0
+    bary = None if exact else _triangle_subcell_barycenters(samples)
+    frac = np.zeros(mesh.n_cells)
+    drum_owner = np.full(mesh.n_cells, -1, dtype=np.int16)
+
+    for c in np.flatnonzero(cm == DRUM_BE):
+        vertices = mesh.coords[list(mesh.cells[c])]
+        centre = vertices.mean(axis=0)
+        d2 = ((drum_xy - centre) ** 2).sum(axis=1)
+        drum = int(d2.argmin())
+        drum_owner[c] = drum
+        if exact:
+            frac[c] = _absorber_fraction_triangle(
+                vertices, drum_xy[drum], arc_az[drum], arc_half)
+        else:
+            pts = bary @ vertices
+            dx = pts[:, 0] - drum_xy[drum, 0]
+            dy = pts[:, 1] - drum_xy[drum, 1]
+            radius = np.hypot(dx, dy)
+            dphi = ((np.arctan2(dy, dx) - arc_az[drum] + np.pi)
+                    % (2.0 * np.pi) - np.pi)
+            inside = ((radius > DRUM_ABSORBER_INNER) & (radius <= DRUM_RADIUS)
+                      & (np.abs(dphi) <= arc_half))
+            frac[c] = inside.mean()
+    return _conserve_absorber_area(frac, drum_owner, mesh.area)
+
+
+@dataclass
+class HpmrMeshProblem:
+    """Unstructured 2D HP-MR problem with optional drum-local refinement."""
+
+    mesh: object
+    materials: list
+    cell_material: np.ndarray
+    alpha_boundary: float
+    mix_material: np.ndarray = None
+    mix_weight: np.ndarray = None
+    drum_angle_deg: np.ndarray = None
+    global_refine: int = 0
+    drum_refine: int = 0
+
+
+@dataclass
+class HpmrExtrudedMeshProblem:
+    """Axially extruded locally refined HP-MR diffusion problem."""
+
+    grid: object
+    materials: list
+    material_map: np.ndarray
+    active: np.ndarray
+    mask_bc: object
+    bc: object
+    kinetics: object
+    mix_material: np.ndarray = None
+    mix_weight: np.ndarray = None
+    drum_angle_deg: np.ndarray = None
+    global_refine: int = 0
+    drum_refine: int = 0
+
+
+def build_hpmr2d_local(refine: int = 3, drum_angle_deg=0.0,
+                       local_refinement: bool = True,
+                       drum_refine_levels: int = 1,
+                       band_margin: float = 1.5, materials=None,
+                       absorber: str = "polar", samples: int = 0):
+    """Build a globally coarse, drum-locally-refined 2D HP-MR problem.
 
     Coarse triangular lattice everywhere; each coarse cell whose centroid lies
     in the annular band the drum B4C arc occupies (radius in
     [DRUM_ABSORBER_INNER - band_margin, DRUM_RADIUS + band_margin] of any drum)
     is split one level into four sub-triangles, resolving the absorber directly
-    at the fine scale -- no volume mixing needed there -- at a fraction of the
-    cells a globally fine mesh would cost. The full radial band is refined (all
-    azimuths), so the same mesh serves any drum rotation. The coarse-to-fine
-    interface is a 2:1 hanging node, handled conservatively by
-    :func:`ndgpu.mesh.assemble_mesh`.
+    at effective radial refinement ``2**drum_refine_levels * refine`` at a
+    fraction of the cells a globally fine mesh would cost. The full radial band
+    is refined at every azimuth, so one mesh serves any drum rotation. Polar
+    volume mixing remains active on the refined cells: local refinement resolves
+    flux variation while mixing conserves the curved absorber area and keeps
+    rotation smooth.
 
-    Returns ``(mesh, cell_material, materials, alpha_boundary)`` for
-    :class:`ndgpu.mesh.UnstructuredDiffusionSolver`. With ``refine_drums=False``
-    the mesh is uniform (the coarse-baseline / global-fine reference).
+    The coarse-to-fine interface is a conservative 2:1 hanging node handled by
+    :func:`ndgpu.mesh.assemble_mesh`. Set ``local_refinement=False`` for an
+    unstructured uniform-mesh reference equivalent to the structured lattice.
     """
     from ..mesh import assemble_mesh
 
     angles = np.broadcast_to(np.asarray(drum_angle_deg, dtype=float),
                              (len(_DRUM_SITES),))
+    levels = int(drum_refine_levels) if local_refinement else 0
+    if levels < 0:
+        raise ValueError("drum_refine_levels must be >= 0")
     mats = _placeholder_materials() if materials is None else list(materials)
+    if len(mats) != len(MATERIAL_NAMES):
+        raise ValueError(f"expected {len(MATERIAL_NAMES)} materials")
+    if absorber not in ("raster", "polar"):
+        raise ValueError("absorber must be 'raster' or 'polar'")
     raster = hpmr_raster(refine, angles, paint_absorber=False)   # drums = DRUM_BE
     mm = raster.material_map
     drum_xy, arc_az = _drum_geometry(angles)
@@ -377,6 +592,20 @@ def hpmr_locally_refined_mesh(refine: int = 3, drum_angle_deg=0.0,
         return i
 
     cells, cmat = [], []
+
+    def append_triangle(vertices, material_at, levels_left):
+        if levels_left == 0:
+            cells.append(tuple(node(p) for p in vertices))
+            cmat.append(material_at(np.mean(vertices, axis=0)))
+            return
+        mids = [(vertices[i] + vertices[(i + 1) % 3]) / 2.0 for i in range(3)]
+        children = ((vertices[0], mids[0], mids[2]),
+                    (mids[0], vertices[1], mids[1]),
+                    (mids[2], mids[1], vertices[2]),
+                    (mids[0], mids[1], mids[2]))
+        for child in children:
+            append_triangle(np.asarray(child), material_at, levels_left - 1)
+
     ni, nj, _ = mm.shape
     for a in range(ni):
         for b in range(nj):
@@ -389,22 +618,127 @@ def hpmr_locally_refined_mesh(refine: int = 3, drum_angle_deg=0.0,
                 # material by centroid: absorber arc overlaid on drum-body cells,
                 # everything else its lattice material (raster). Refinement only
                 # changes the *resolution* at which this is sampled.
-                mat_of = (lambda p: absorber_material(p)) if base == DRUM_BE \
-                    else (lambda p: base)
-                rmin = math.sqrt(float(((drum_xy - cc) ** 2).sum(1).min()))
-                if refine_drums and lo <= rmin <= hi:
-                    M = [(V[i] + V[(i + 1) % 3]) / 2 for i in range(3)]
-                    subs = [(V[0], M[0], M[2]), (M[0], V[1], M[1]),
-                            (M[2], M[1], V[2]), (M[0], M[1], M[2])]
-                    for tri in subs:
-                        cells.append(tuple(node(p) for p in tri))
-                        cmat.append(mat_of(np.mean(tri, 0)))
+                if absorber == "raster" and base == DRUM_BE:
+                    mat_of = lambda p: absorber_material(p)
                 else:
-                    cells.append(tuple(node(p) for p in V))
-                    cmat.append(mat_of(cc))
+                    mat_of = lambda p: base
+                rmin = math.sqrt(float(((drum_xy - cc) ** 2).sum(1).min()))
+                append_triangle(V, mat_of, levels if lo <= rmin <= hi else 0)
 
     mesh = assemble_mesh(np.array(coords), cells, cmat)
-    return mesh, np.array(cmat), mats, 0.5
+    cmat = np.asarray(cmat)
+    mix_material = mix_weight = None
+    if absorber == "polar":
+        mix_weight = absorber_fraction_mesh(mesh, cmat, angles, samples=samples)
+        mix_material = np.where(
+            mix_weight > 0.0, DRUM_ABSORBER, -1).astype(np.int64)
+    return HpmrMeshProblem(
+        mesh=mesh, materials=mats, cell_material=cmat, alpha_boundary=0.5,
+        mix_material=mix_material, mix_weight=mix_weight,
+        drum_angle_deg=np.array(angles), global_refine=int(refine),
+        drum_refine=int(refine) * 2**levels)
+
+
+def build_hpmr3d_local(refine: int = 8, nz: int = 10,
+                       drum_angle_deg=0.0, *, drum_refine_levels: int = 3,
+                       band_margin: float = 1.5, materials=None,
+                       absorber: str = "polar", samples: int = 0):
+    """Build the 3-D HP-MR on a locally refined extruded radial mesh.
+
+    The validated 2-D mesh is retained as a tensor-product radial plane rather
+    than converted into a general prism mesh. This preserves every recursive
+    midpoint interface exactly and permits axial slab decomposition without a
+    3-D graph partitioner. The radial topology is fixed while the polar volume
+    fractions rotate.
+
+    ``nz`` must align the 20 cm axial reflector interfaces with layer faces.
+    The preferred production geometry is global ``refine=8`` with three local
+    drum-band levels; smaller values are intended for verification only.
+    """
+    from ..extruded_mesh import ExtrudedMeshGrid
+
+    if not isinstance(nz, (int, np.integer)) or nz < 1 or not np.isclose(
+            AXIAL_REFLECTOR_HEIGHT / (TOTAL_HEIGHT / nz),
+            round(AXIAL_REFLECTOR_HEIGHT / (TOTAL_HEIGHT / nz))):
+        raise ValueError(
+            "nz must place layer boundaries at the 20 cm axial reflectors")
+    mats = _placeholder_materials(three_d=True) if materials is None \
+        else list(materials)
+    if len(mats) != len(MATERIAL_NAMES_3D):
+        raise ValueError(f"expected {len(MATERIAL_NAMES_3D)} materials "
+                         f"({', '.join(MATERIAL_NAMES_3D)}), got {len(mats)}")
+
+    radial = build_hpmr2d_local(
+        refine=refine, drum_angle_deg=drum_angle_deg,
+        local_refinement=True, drum_refine_levels=drum_refine_levels,
+        band_margin=band_margin, absorber=absorber, samples=samples)
+    grid = ExtrudedMeshGrid(radial.mesh, height=TOTAL_HEIGHT, nz=int(nz))
+    material_map = np.repeat(radial.cell_material[:, None], nz, axis=1)
+
+    z_centres = (np.arange(nz) + 0.5) * grid.dz
+    reflector = ((z_centres < AXIAL_REFLECTOR_HEIGHT)
+                 | (z_centres > TOTAL_HEIGHT - AXIAL_REFLECTOR_HEIGHT))
+    fuelish = ((material_map == FUEL) | (material_map == CENTRAL))
+    material_map[fuelish & reflector[None, :]] = AXIAL_REFLECTOR
+
+    def extrude(values):
+        if values is None:
+            return None
+        return np.repeat(np.asarray(values)[:, None], nz, axis=1)
+
+    return HpmrExtrudedMeshProblem(
+        grid=grid, materials=mats, material_map=material_map,
+        active=np.ones(grid.shape, dtype=bool), mask_bc="vacuum",
+        bc=("reflective", "reflective", "vacuum"),
+        kinetics=HPMR_KINETICS,
+        mix_material=extrude(radial.mix_material),
+        mix_weight=extrude(radial.mix_weight),
+        drum_angle_deg=np.array(radial.drum_angle_deg),
+        global_refine=radial.global_refine,
+        drum_refine=radial.drum_refine)
+
+
+def with_hpmr3d_local_drum_angle(problem: HpmrExtrudedMeshProblem,
+                                 drum_angle_deg, *, samples: int = 0):
+    """Reuse an extruded local mesh at a new polar-mixed drum angle.
+
+    Local drum-band refinement covers every azimuth, so rotating the polar
+    absorber changes only its volume fractions. Geometry, axial material map,
+    materials, and boundary metadata are shared with ``problem``.
+    """
+    if not isinstance(problem, HpmrExtrudedMeshProblem):
+        raise TypeError("problem must be an HpmrExtrudedMeshProblem")
+    if problem.mix_material is None or problem.mix_weight is None:
+        raise ValueError("drum-angle reuse requires polar volume mixing")
+
+    grid = problem.grid
+    radial_material = np.asarray(problem.material_map)[:, grid.nz // 2]
+    angles = np.broadcast_to(np.asarray(drum_angle_deg, dtype=float),
+                             (len(_DRUM_SITES),))
+    radial_weight = absorber_fraction_mesh(
+        grid.mesh, radial_material, angles, samples=samples)
+    mix_weight = np.repeat(radial_weight[:, None], grid.nz, axis=1)
+    mix_material = np.where(
+        mix_weight > 0.0, DRUM_ABSORBER, -1).astype(np.int64)
+    return replace(
+        problem, mix_material=mix_material, mix_weight=mix_weight,
+        drum_angle_deg=np.array(angles))
+
+
+def hpmr_locally_refined_mesh(refine: int = 3, drum_angle_deg=0.0,
+                              refine_drums: bool = True, band_margin: float = 1.5,
+                              materials=None):
+    """Legacy centroid-painted local mesh tuple.
+
+    New work should use :func:`build_hpmr2d_local`, which combines the same
+    conservative 2:1 refinement with polar volume mixing.
+    """
+    problem = build_hpmr2d_local(
+        refine=refine, drum_angle_deg=drum_angle_deg,
+        local_refinement=refine_drums, band_margin=band_margin,
+        materials=materials, absorber="raster")
+    return (problem.mesh, problem.cell_material, problem.materials,
+            problem.alpha_boundary)
 
 
 @dataclass

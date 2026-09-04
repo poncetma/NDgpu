@@ -5,14 +5,24 @@ import pytest
 
 from ndgpu import (DiffusionEigenSolver, DistributedDiffusionEigenSolver,
                    DistributedCartesianGroupOperator,
+                   DistributedExtrudedMeshDiffusionEigenSolver,
+                   DistributedExtrudedMeshGroupOperator,
+                   DistributedExtrudedMeshTransientSolver,
                    DistributedTriGroupOperator,
                    DistributedTriDiffusionEigenSolver,
                    DistributedTriTransientSolver, Grid, PWR_TWO_GROUP,
                    TriDiffusionEigenSolver, TriGrid)
 from ndgpu.distributed import (CartesianSlabPartition, DistributedContext,
-                               DistributedResult, SerialReductions,
+                               DistributedResult, ExtrudedAxialPartition,
+                               SerialReductions,
                                TriRowPartition, _cuda_device_identity)
-from ndgpu.linalg import PCGWorkspace, pcg
+from ndgpu.extruded_mesh import (ExtrudedMeshDiffusionEigenSolver,
+                                 ExtrudedMeshGrid, ExtrudedMeshGroupOperator,
+                                 ExtrudedMeshTransientSolver)
+from ndgpu.linalg import FGMRESWorkspace, PCGWorkspace, fgmres, pcg
+from ndgpu.mesh import assemble_mesh
+from ndgpu.multigroup import (EnergyGroupGaussSeidelPreconditioner,
+                              MultigroupStepOperator)
 from ndgpu.stencil import GroupOperator
 from ndgpu.tri import TriGroupOperator
 
@@ -85,15 +95,19 @@ class _QueuedHaloContext(DistributedContext):
             local_rank=partition.rank, communication_mode="cpu-mpi",
             hostname="in-process-test")
         self.global_values = iter(global_values)
+        self.exchange_calls = 0
 
     def exchange_halos(self, value, partition, *, tag=0):
         del tag
+        self.exchange_calls += 1
         global_value = next(self.global_values)
-        np.testing.assert_array_equal(value, global_value[partition.owned_slice])
+        prefix = value.ndim - len(partition.local_shape)
+        owned = (slice(None),) * prefix + partition.owned_slice
+        np.testing.assert_array_equal(value, global_value[owned])
 
         def plane(index):
             sl = [slice(None)] * global_value.ndim
-            sl[partition.axis] = index
+            sl[prefix + partition.axis] = index
             return np.array(global_value[tuple(sl)], copy=True)
 
         lower = None if partition.lower_rank is None else plane(partition.start - 1)
@@ -137,6 +151,22 @@ def test_tri_partition_owns_complete_rows_and_rejects_empty_ranks():
         TriRowPartition.create((2, 7, 2), rank=0, size=3)
 
 
+def test_extruded_partition_owns_complete_radial_planes():
+    partitions = [
+        ExtrudedAxialPartition.create((17, 10), rank, 4)
+        for rank in range(4)
+    ]
+    assert [(part.start, part.stop) for part in partitions] == [
+        (0, 3), (3, 6), (6, 8), (8, 10)]
+    assert partitions[1].local_shape == (17, 3)
+    assert partitions[1].owned_slice == (slice(None), slice(3, 6))
+    assert partitions[1].axis == 1
+    with pytest.raises(ValueError, match="extruded mesh shape"):
+        ExtrudedAxialPartition.create((17, 10, 2), rank=0, size=2)
+    with pytest.raises(ValueError, match="non-empty ranks"):
+        ExtrudedAxialPartition.create((17, 2), rank=0, size=3)
+
+
 def test_serial_context_and_reductions_do_not_require_mpi():
     context = DistributedContext.serial("cpu")
     values = np.arange(6.0)
@@ -149,6 +179,12 @@ def test_serial_context_and_reductions_do_not_require_mpi():
     np.testing.assert_array_equal(
         context.reductions.dot_many(((values, values), (values, values + 1))),
         np.asarray([55.0, 70.0]))
+    basis = np.stack((values, values + 1.0))
+    np.testing.assert_array_equal(
+        context.reductions.project(basis, values), np.asarray([55.0, 70.0]))
+    np.testing.assert_array_equal(
+        context.reductions.project(basis, values, include_norm=True),
+        np.asarray([55.0, 70.0, 55.0]))
     assert isinstance(context.reductions, SerialReductions)
 
 
@@ -250,8 +286,15 @@ def test_cartesian_slab_operator_matches_serial_across_each_axis(axis, size):
         operator = DistributedCartesianGroupOperator(
             np, grid, np.array(diffusion[owned], copy=True),
             np.array(removal[owned], copy=True), partition, context, bc=bc)
-        gathered[owned] = operator.apply(np.array(flux[owned], copy=True))
+        local_flux = np.array(flux[owned], copy=True)
+        gathered[owned] = operator.apply(local_flux)
         gathered_diag[owned] = operator.diag
+
+        principal_flux = np.zeros_like(flux)
+        principal_flux[owned] = local_flux
+        np.testing.assert_allclose(
+            operator.preconditioner_apply(local_flux),
+            reference.apply(principal_flux)[owned], rtol=2e-15, atol=2e-15)
 
     np.testing.assert_allclose(gathered_diag, reference.diag, rtol=0.0, atol=1e-15)
     np.testing.assert_allclose(gathered, expected, rtol=2e-15, atol=2e-15)
@@ -327,11 +370,150 @@ def test_tri_row_operator_matches_serial_across_active_partition(extruded):
                 ("reflective", "reflective"),
                 ("vacuum", "zero-flux")),
             mask_bc="vacuum")
-        gathered[owned] = operator.apply(np.array(flux[owned], copy=True))
+        local_flux = np.array(flux[owned], copy=True)
+        gathered[owned] = operator.apply(local_flux)
         gathered_diag[owned] = operator.diag
+
+        principal_flux = np.zeros_like(flux)
+        principal_flux[owned] = local_flux
+        np.testing.assert_allclose(
+            operator.preconditioner_apply(local_flux),
+            reference.apply(principal_flux)[owned], rtol=2e-15, atol=2e-15)
 
     np.testing.assert_allclose(gathered_diag, reference.diag, rtol=0.0, atol=1e-15)
     np.testing.assert_allclose(gathered, expected, rtol=2e-15, atol=2e-15)
+
+
+def test_extruded_axial_operator_matches_serial_across_partition():
+    coords = np.array([
+        [0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0],
+    ])
+    base = assemble_mesh(coords, [(0, 1, 2), (0, 2, 3)], [0, 0])
+    grid = ExtrudedMeshGrid(base, height=10.0, nz=5)
+    rng = np.random.default_rng(1607)
+    diffusion = 0.2 + rng.random(grid.shape)
+    removal = 0.01 + 0.2 * rng.random(grid.shape)
+    flux = rng.random(grid.shape)
+    bc = ("reflective", "reflective", ("zero-flux", "vacuum"))
+    reference = ExtrudedMeshGroupOperator(
+        np, grid, diffusion.copy(), removal.copy(), bc=bc,
+        mask_bc="vacuum")
+    expected = reference.apply(flux)
+    gathered = np.empty_like(expected)
+    gathered_diagonal = np.empty_like(reference.diag)
+
+    for rank in range(2):
+        partition = ExtrudedAxialPartition.create(
+            grid.shape, rank=rank, size=2)
+        owned = partition.owned_slice
+        context = _QueuedHaloContext(partition, [diffusion, flux])
+        operator = DistributedExtrudedMeshGroupOperator(
+            np, grid, np.array(diffusion[owned], copy=True),
+            np.array(removal[owned], copy=True), partition, context,
+            bc=bc, mask_bc="vacuum")
+        local_flux = np.array(flux[owned], copy=True)
+        gathered[owned] = operator.apply(local_flux)
+        gathered_diagonal[owned] = operator.diag
+
+        principal_flux = np.zeros_like(flux)
+        principal_flux[owned] = local_flux
+        expected_principal = reference.apply(principal_flux)[owned]
+        principal = np.empty_like(local_flux)
+        returned = operator.preconditioner_apply(local_flux, out=principal)
+        assert returned is principal
+        np.testing.assert_allclose(
+            principal, expected_principal, rtol=2e-15, atol=2e-15)
+
+    np.testing.assert_allclose(
+        gathered_diagonal, reference.diag, rtol=2e-15, atol=2e-15)
+    np.testing.assert_allclose(gathered, expected, rtol=2e-15, atol=2e-15)
+
+
+def test_extruded_multigroup_block_batches_one_state_halo_exchange():
+    coords = np.array([
+        [0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0],
+    ])
+    base = assemble_mesh(coords, [(0, 1, 2), (0, 2, 3)], [0, 0])
+    grid = ExtrudedMeshGrid(base, height=10.0, nz=5)
+    rng = np.random.default_rng(2601)
+    diffusion = [0.2 + rng.random(grid.shape) for _ in range(2)]
+    removal = [0.01 + 0.2 * rng.random(grid.shape) for _ in range(2)]
+    state = rng.random((2,) + grid.shape)
+    sigma_s = [[None, 0.01 * np.ones(grid.shape)],
+               [0.02 * np.ones(grid.shape), None]]
+    nu_sigma_f = [0.03 * np.ones(grid.shape),
+                  0.04 * np.ones(grid.shape)]
+    emission = [0.8 * np.ones(grid.shape),
+                0.2 * np.ones(grid.shape)]
+    serial_ops = [ExtrudedMeshGroupOperator(
+        np, grid, diffusion[g], removal[g], bc="vacuum") for g in range(2)]
+    reference = MultigroupStepOperator(
+        serial_ops, sigma_s, nu_sigma_f, emission, 1.05,
+        rhs_weight=serial_ops[0].rhs_weight).apply(state)
+    gathered = np.empty_like(reference)
+
+    for rank in range(2):
+        partition = ExtrudedAxialPartition.create(
+            grid.shape, rank=rank, size=2)
+        owned = partition.owned_slice
+        prefixed_owned = (slice(None),) + owned
+        context = _QueuedHaloContext(
+            partition, [diffusion[0], diffusion[1], state])
+        operators = [DistributedExtrudedMeshGroupOperator(
+            np, grid, np.array(diffusion[g][owned], copy=True),
+            np.array(removal[g][owned], copy=True), partition, context,
+            bc="vacuum") for g in range(2)]
+        block = MultigroupStepOperator(
+            operators,
+            [[None, sigma_s[0][1][owned]],
+             [sigma_s[1][0][owned], None]],
+            [value[owned] for value in nu_sigma_f],
+            [value[owned] for value in emission], 1.05,
+            rhs_weight=operators[0].rhs_weight)
+
+        gathered[prefixed_owned] = block.apply(state[prefixed_owned])
+        assert context.exchange_calls == 3
+
+    np.testing.assert_allclose(gathered, reference, rtol=3e-15, atol=3e-15)
+
+
+def test_extruded_domain_block_jacobi_group_solves_are_communication_free():
+    coords = np.array([
+        [0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0],
+    ])
+    base = assemble_mesh(coords, [(0, 1, 2), (0, 2, 3)], [0, 0])
+    grid = ExtrudedMeshGrid(base, height=10.0, nz=5)
+    rng = np.random.default_rng(2602)
+    diffusion = [0.2 + rng.random(grid.shape) for _ in range(2)]
+    removal = [0.01 + 0.2 * rng.random(grid.shape) for _ in range(2)]
+    sigma_s = [[None, 0.01 * np.ones(grid.shape)],
+               [0.02 * np.ones(grid.shape), None]]
+
+    for rank in range(2):
+        partition = ExtrudedAxialPartition.create(
+            grid.shape, rank=rank, size=2)
+        owned = partition.owned_slice
+        # Construction consumes the two coefficient exchanges. No state is
+        # queued, so a communicating inner operator application would fail.
+        context = _QueuedHaloContext(partition, diffusion)
+        operators = [DistributedExtrudedMeshGroupOperator(
+            np, grid, np.array(diffusion[g][owned], copy=True),
+            np.array(removal[g][owned], copy=True), partition, context,
+            bc="vacuum") for g in range(2)]
+        zeros = [np.zeros(partition.local_shape) for _ in range(2)]
+        block = MultigroupStepOperator(
+            operators,
+            [[None, sigma_s[0][1][owned]],
+             [sigma_s[1][0][owned], None]],
+            zeros, zeros, 1.0, rhs_weight=operators[0].rhs_weight)
+        preconditioner = EnergyGroupGaussSeidelPreconditioner(
+            block, scatter_sweeps=2, inner_fixed_relaxations=2,
+            precond_degree=1)
+
+        correction = preconditioner(rng.random(block.shape))
+
+        assert np.all(np.isfinite(correction))
+        assert context.exchange_calls == 2
 
 
 def test_pcg_uses_global_reductions_without_changing_recurrence():
@@ -376,6 +558,35 @@ def test_single_reduction_pcg_uses_one_collective_per_iteration():
     # One norm before the recurrence, one packed initialization, then one
     # packed reduction for each iteration.
     assert communicator.allreduce_calls == iterations + 2
+
+
+def test_fgmres_uses_global_reductions_with_workspace():
+    matrix = np.array([
+        [4.0, -1.0, 0.0],
+        [2.0, 5.0, -1.0],
+        [0.0, -1.0, 3.0],
+    ])
+    rhs = np.array([15.0, 10.0, 10.0])
+    inverse_diagonal = 1.0 / np.diag(matrix)
+    context, communicator = _mirrored_context()
+    workspace = FGMRESWorkspace.like(rhs, restart=3, operator_out=True)
+
+    def apply(value, out=None):
+        result = matrix @ value
+        if out is None:
+            return result
+        out[...] = result
+        return out
+
+    solved, iterations = fgmres(
+        apply, rhs, np.zeros_like(rhs), inverse_diagonal, np,
+        rtol=1e-13, restart=3, workspace=workspace,
+        reductions=context.reductions)
+
+    np.testing.assert_allclose(
+        solved, np.linalg.solve(matrix, rhs), rtol=2e-13, atol=2e-13)
+    assert iterations > 0
+    assert communicator.allreduce_calls >= 2 * iterations
 
 
 def test_distributed_reductions_disable_pcg_graph_blocks():
@@ -459,6 +670,78 @@ def test_size_one_distributed_tri_solver_matches_serial_result():
     assert result.outer_iterations == reference.outer_iterations
     assert result.inner_iterations == reference.inner_iterations
     np.testing.assert_array_equal(result.local_flux, reference.flux)
+
+
+def test_size_one_distributed_extruded_solver_matches_serial_result():
+    coords = np.array([
+        [0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0],
+    ])
+    base = assemble_mesh(coords, [(0, 1, 2), (0, 2, 3)], [0, 0])
+    grid = ExtrudedMeshGrid(base, height=6.0, nz=3)
+    material_map = np.zeros(grid.shape, dtype=np.int64)
+    common = dict(bc="vacuum", mask_bc="vacuum")
+    reference = ExtrudedMeshDiffusionEigenSolver(
+        grid, [PWR_TWO_GROUP], material_map, device="cpu", **common).solve(
+            tol_k=1e-9, tol_source=1e-8)
+    distributed = DistributedExtrudedMeshDiffusionEigenSolver(
+        grid, [PWR_TWO_GROUP], material_map,
+        context=DistributedContext.serial("cpu"), **common).solve(
+            tol_k=1e-9, tol_source=1e-8)
+
+    assert isinstance(distributed.partition, ExtrudedAxialPartition)
+    assert distributed.k_eff == reference.k_eff
+    assert distributed.k_history == reference.k_history
+    assert distributed.source_error_history == reference.source_error_history
+    assert distributed.outer_iterations == reference.outer_iterations
+    assert distributed.inner_iterations == reference.inner_iterations
+    np.testing.assert_array_equal(distributed.local_flux, reference.flux)
+
+
+@pytest.mark.parametrize("step_solver", ["fixed-point", "monolithic"])
+def test_size_one_distributed_extruded_transient_matches_serial_result(
+        step_solver):
+    from ndgpu.benchmarks.hpmr import build_hpmr3d_local
+
+    problem = build_hpmr3d_local(
+        refine=1, nz=10, drum_angle_deg=90.0,
+        drum_refine_levels=0, absorber="polar", samples=0)
+
+    def problem_at(time):
+        del time
+        return (problem.materials, problem.material_map,
+                problem.mix_material, problem.mix_weight)
+
+    common = dict(
+        bc=problem.bc, active=problem.active, mask_bc=problem.mask_bc)
+    solve = dict(
+        t_end=0.01, dt=0.01, tol_step=1e-7, rebalance=True,
+        steady_kwargs={"tol_k": 1e-8, "tol_source": 1e-7})
+    if step_solver == "monolithic":
+        solve.update(
+            step_solver="monolithic",
+            multigroup_kwargs={"rtol": 1e-8, "inner_rtol": 1e-3})
+    reference = ExtrudedMeshTransientSolver(
+        problem.grid, problem_at, problem.kinetics,
+        device="cpu", **common).solve(**solve)
+    distributed = DistributedExtrudedMeshTransientSolver(
+        problem.grid, problem_at, problem.kinetics,
+        context=DistributedContext.serial("cpu"), **common).solve(**solve)
+
+    if step_solver == "fixed-point":
+        np.testing.assert_array_equal(distributed.power, reference.power)
+        np.testing.assert_array_equal(distributed.local_flux, reference.flux)
+        np.testing.assert_array_equal(
+            distributed.local_precursors, reference.precursors)
+    else:
+        np.testing.assert_allclose(
+            distributed.power, reference.power, rtol=2e-9, atol=2e-11)
+        np.testing.assert_allclose(
+            distributed.local_flux, reference.flux, rtol=2e-8, atol=2e-10)
+        np.testing.assert_allclose(
+            distributed.local_precursors, reference.precursors,
+            rtol=2e-8, atol=2e-10)
+    assert distributed.step_iterations == reference.step_iterations
+    assert distributed.total_inner_iterations == reference.total_inner_iterations
 
 
 def test_multi_rank_tri_solver_rejects_discontinuity_factors_early():
@@ -575,10 +858,7 @@ def test_single_reduction_pcg_preserves_distributed_transient_history():
 
 @pytest.mark.parametrize(
     "solve_kwargs, message",
-    [
-        ({"step_solver": "monolithic"}, "fixed-point"),
-        ({"adaptive_bdf": {}}, "adaptive BDF"),
-    ],
+    [({"adaptive_bdf": {}}, "adaptive BDF")],
 )
 def test_distributed_tri_transient_rejects_unsupported_modes(
         solve_kwargs, message):

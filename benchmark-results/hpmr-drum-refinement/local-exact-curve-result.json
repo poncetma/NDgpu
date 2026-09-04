@@ -1,0 +1,147 @@
+{
+  "status": "completed",
+  "mode": "local",
+  "device": "gpu",
+  "groups": 11,
+  "angles_deg": [
+    85.0,
+    87.0,
+    89.0,
+    90.0,
+    90.25,
+    90.5,
+    91.0,
+    93.0,
+    95.0
+  ],
+  "samples": 0,
+  "exact_absorber_area_cm2": 240.33183799961918,
+  "cases": [
+    {
+      "global_refine": 4,
+      "local_level": 3,
+      "effective_drum_refine": 32,
+      "solves": [
+        {
+          "angle_deg": 85.0,
+          "k_eff": 1.1149944991473753,
+          "cells": 43836,
+          "unknowns": 482196,
+          "build_seconds": 4.619860489037819,
+          "solve_seconds": 10.424698941991664,
+          "outer_iterations": 287,
+          "inner_iterations": 15377,
+          "absorber_area_cm2": 240.33183799961913
+        },
+        {
+          "angle_deg": 87.0,
+          "k_eff": 1.1164700631688522,
+          "cells": 43836,
+          "unknowns": 482196,
+          "build_seconds": 4.637473447015509,
+          "solve_seconds": 8.591269682976417,
+          "outer_iterations": 257,
+          "inner_iterations": 13572,
+          "absorber_area_cm2": 240.33183799961895
+        },
+        {
+          "angle_deg": 89.0,
+          "k_eff": 1.118184628811723,
+          "cells": 43836,
+          "unknowns": 482196,
+          "build_seconds": 4.637611309997737,
+          "solve_seconds": 8.886185438022949,
+          "outer_iterations": 261,
+          "inner_iterations": 14202,
+          "absorber_area_cm2": 240.3318379996191
+        },
+        {
+          "angle_deg": 90.0,
+          "k_eff": 1.1181233065116079,
+          "cells": 43836,
+          "unknowns": 482196,
+          "build_seconds": 4.656977599021047,
+          "solve_seconds": 8.71734638698399,
+          "outer_iterations": 261,
+          "inner_iterations": 14061,
+          "absorber_area_cm2": 240.33183799961898
+        },
+        {
+          "angle_deg": 90.25,
+          "k_eff": 1.117854057445369,
+          "cells": 43836,
+          "unknowns": 482196,
+          "build_seconds": 4.632271663984284,
+          "solve_seconds": 8.393948576063849,
+          "outer_iterations": 215,
+          "inner_iterations": 14035,
+          "absorber_area_cm2": 240.33183799961904
+        },
+        {
+          "angle_deg": 90.5,
+          "k_eff": 1.1184118477664433,
+          "cells": 43836,
+          "unknowns": 482196,
+          "build_seconds": 4.641490501002409,
+          "solve_seconds": 10.285514071001671,
+          "outer_iterations": 303,
+          "inner_iterations": 16481,
+          "absorber_area_cm2": 240.33183799961915
+        },
+        {
+          "angle_deg": 91.0,
+          "k_eff": 1.1192053657728203,
+          "cells": 43836,
+          "unknowns": 482196,
+          "build_seconds": 4.60930723301135,
+          "solve_seconds": 8.328178963973187,
+          "outer_iterations": 219,
+          "inner_iterations": 13790,
+          "absorber_area_cm2": 240.33183799961915
+        },
+        {
+          "angle_deg": 93.0,
+          "k_eff": 1.119686948544918,
+          "cells": 43836,
+          "unknowns": 482196,
+          "build_seconds": 4.644987610983662,
+          "solve_seconds": 9.21366464102175,
+          "outer_iterations": 261,
+          "inner_iterations": 14818,
+          "absorber_area_cm2": 240.33183799961927
+        },
+        {
+          "angle_deg": 95.0,
+          "k_eff": 1.1214690323397274,
+          "cells": 43836,
+          "unknowns": 482196,
+          "build_seconds": 4.609822476981208,
+          "solve_seconds": 8.616817632922903,
+          "outer_iterations": 238,
+          "inner_iterations": 14218,
+          "absorber_area_cm2": 240.33183799961935
+        }
+      ],
+      "worth_pcm": {
+        "87.0": 118.53271991600911,
+        "89.0": 255.871604704605,
+        "90.0": 250.96687342516245,
+        "90.25": 229.42520195659012,
+        "90.5": 274.0405317313788,
+        "91.0": 337.4341066590514,
+        "93.0": 375.86358973682457,
+        "95.0": 517.7837913173389
+      },
+      "worth_increment_pcm": {
+        "87.0": null,
+        "89.0": null,
+        "90.0": null,
+        "90.25": null,
+        "90.5": null,
+        "91.0": null,
+        "93.0": null,
+        "95.0": null
+      }
+    }
+  ]
+}

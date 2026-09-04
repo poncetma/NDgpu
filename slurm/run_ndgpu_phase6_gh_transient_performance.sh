@@ -24,6 +24,7 @@ refine="${NDGPU_REFINE:-8}"
 nz="${NDGPU_NZ:-10}"
 steps="${NDGPU_STEPS:-5}"
 dt="${NDGPU_DT:-0.01}"
+samples="${NDGPU_SAMPLES:-0}"
 check_every="${NDGPU_CHECK_EVERY:-1}"
 single_reduction="${NDGPU_SINGLE_REDUCTION:-0}"
 batched_halos="${NDGPU_BATCHED_HALOS:-0}"
@@ -41,9 +42,9 @@ export LD_LIBRARY_PATH="${mpi_root}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export SLURM_MPI_TYPE=pmix
 export PYTHONPATH="${repo}"
 
-printf 'NDgpu Phase 6 GH transient performance: ranks=%s mode=%s r=%s nz=%s steps=%s check_every=%s single_reduction=%s batched_halos=%s host=%s\n' \
+printf 'NDgpu Phase 6 GH transient performance: ranks=%s mode=%s r=%s nz=%s samples=%s steps=%s check_every=%s single_reduction=%s batched_halos=%s host=%s\n' \
     "${SLURM_NTASKS}" "${communication}" "${refine}" "${nz}" \
-    "${steps}" "${check_every}" "${single_reduction}" "${batched_halos}" \
+    "${samples}" "${steps}" "${check_every}" "${single_reduction}" "${batched_halos}" \
     "$(hostname)"
 nvidia-smi --query-gpu=name,uuid,memory.total --format=csv,noheader
 single_reduction_arg=()
@@ -59,6 +60,7 @@ srun --mpi=pmix --ntasks="${SLURM_NTASKS}" --kill-on-bad-exit=1 \
     "${python_bin}" "${repo}/examples/distributed_tri_hpmr_transient_performance.py" \
     --device gpu --communication "${communication}" \
     --refine "${refine}" --nz "${nz}" --groups 11 \
+    --samples "${samples}" \
     --steps "${steps}" --dt "${dt}" --tol-step 1e-8 \
     --check-every "${check_every}" "${single_reduction_arg[@]}" \
     "${batched_halos_arg[@]}"

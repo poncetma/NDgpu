@@ -1,0 +1,147 @@
+{
+  "status": "completed",
+  "mode": "local",
+  "device": "gpu",
+  "groups": 11,
+  "angles_deg": [
+    85.0,
+    87.0,
+    89.0,
+    90.0,
+    90.25,
+    90.5,
+    91.0,
+    93.0,
+    95.0
+  ],
+  "samples": 0,
+  "exact_absorber_area_cm2": 240.33183799961918,
+  "cases": [
+    {
+      "global_refine": 16,
+      "local_level": 2,
+      "effective_drum_refine": 64,
+      "solves": [
+        {
+          "angle_deg": 85.0,
+          "k_eff": 1.1131074862966663,
+          "cells": 218400,
+          "unknowns": 2402400,
+          "build_seconds": 19.06257572292816,
+          "solve_seconds": 20.717743979999796,
+          "outer_iterations": 218,
+          "inner_iterations": 42093,
+          "absorber_area_cm2": 240.33183799961807
+        },
+        {
+          "angle_deg": 87.0,
+          "k_eff": 1.114466862628106,
+          "cells": 218400,
+          "unknowns": 2402400,
+          "build_seconds": 19.34998882492073,
+          "solve_seconds": 23.502385611995123,
+          "outer_iterations": 216,
+          "inner_iterations": 45856,
+          "absorber_area_cm2": 240.3318379996189
+        },
+        {
+          "angle_deg": 89.0,
+          "k_eff": 1.1156046491426252,
+          "cells": 218400,
+          "unknowns": 2402400,
+          "build_seconds": 21.08656141499523,
+          "solve_seconds": 21.215320570976473,
+          "outer_iterations": 207,
+          "inner_iterations": 42118,
+          "absorber_area_cm2": 240.33183799961859
+        },
+        {
+          "angle_deg": 90.0,
+          "k_eff": 1.1163890757499664,
+          "cells": 218400,
+          "unknowns": 2402400,
+          "build_seconds": 20.846628963947296,
+          "solve_seconds": 22.152233575936407,
+          "outer_iterations": 219,
+          "inner_iterations": 43315,
+          "absorber_area_cm2": 240.33183799961935
+        },
+        {
+          "angle_deg": 90.25,
+          "k_eff": 1.116489220828576,
+          "cells": 218400,
+          "unknowns": 2402400,
+          "build_seconds": 20.5684514780296,
+          "solve_seconds": 21.222031295998022,
+          "outer_iterations": 210,
+          "inner_iterations": 42118,
+          "absorber_area_cm2": 240.33183799961898
+        },
+        {
+          "angle_deg": 90.5,
+          "k_eff": 1.1165699429481177,
+          "cells": 218400,
+          "unknowns": 2402400,
+          "build_seconds": 20.42067576001864,
+          "solve_seconds": 22.707977322977968,
+          "outer_iterations": 221,
+          "inner_iterations": 45790,
+          "absorber_area_cm2": 240.33183799961904
+        },
+        {
+          "angle_deg": 91.0,
+          "k_eff": 1.1171833572036933,
+          "cells": 218400,
+          "unknowns": 2402400,
+          "build_seconds": 21.043127191020176,
+          "solve_seconds": 21.908653756952845,
+          "outer_iterations": 218,
+          "inner_iterations": 43509,
+          "absorber_area_cm2": 240.33183799961887
+        },
+        {
+          "angle_deg": 93.0,
+          "k_eff": 1.118243351672151,
+          "cells": 218400,
+          "unknowns": 2402400,
+          "build_seconds": 21.217879500007257,
+          "solve_seconds": 21.959601388894953,
+          "outer_iterations": 216,
+          "inner_iterations": 42021,
+          "absorber_area_cm2": 240.33183799961813
+        },
+        {
+          "angle_deg": 95.0,
+          "k_eff": 1.1196828337056635,
+          "cells": 218400,
+          "unknowns": 2402400,
+          "build_seconds": 20.80947675195057,
+          "solve_seconds": 18.773730000015348,
+          "outer_iterations": 197,
+          "inner_iterations": 38604,
+          "absorber_area_cm2": 240.33183799961938
+        }
+      ],
+      "worth_pcm": {
+        "87.0": 109.58104573207672,
+        "89.0": 201.09415405709098,
+        "90.0": 264.07760067956866,
+        "90.25": 272.1121125948245,
+        "90.5": 278.5872962290048,
+        "91.0": 327.76219498481527,
+        "93.0": 412.61043079087176,
+        "95.0": 527.5778821785759
+      },
+      "worth_increment_pcm": {
+        "87.0": null,
+        "89.0": null,
+        "90.0": null,
+        "90.25": null,
+        "90.5": null,
+        "91.0": null,
+        "93.0": null,
+        "95.0": null
+      }
+    }
+  ]
+}

@@ -313,12 +313,18 @@ def test_monolithic_energy_anderson_is_opt_in_and_preserves_solution():
                                      "scatter_sweeps": 4,
                                      "energy_anderson": 1,
                                      "inner_fixed_relaxations": 1})
+    fixed_pcg_result = TransientSolver(GRID, prob, KIN, device="cpu").solve(
+        **common, multigroup_kwargs={"rtol": 1e-11,
+                                     "scatter_sweeps": 3,
+                                     "inner_fixed_iterations": 2})
     np.testing.assert_allclose(
         accelerated.power, plain.power, rtol=2e-9, atol=2e-12)
     np.testing.assert_allclose(
         accelerated.flux_numpy, plain.flux_numpy, rtol=2e-9, atol=2e-12)
     np.testing.assert_allclose(
         reduction_free.power, plain.power, rtol=2e-9, atol=2e-12)
+    np.testing.assert_allclose(
+        fixed_pcg_result.power, plain.power, rtol=2e-9, atol=2e-12)
 
 
 def test_monolithic_step_options_fail_fast():

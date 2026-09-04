@@ -250,6 +250,63 @@ def tri_stencil_apply(xp, phi, diag, a_hyp, b_hyp, a_v, b_v, a_h, b_h, wz,
 
 
 # --------------------------------------------------------------------------
+# Extruded unstructured ELLPACK stencil
+# --------------------------------------------------------------------------
+_EXTRUDED_ELL_SRC = """
+    const int z = i % nz;
+    const int cell = i / nz;
+    T value = diag[i] * phi[i];
+    for (int slot = 0; slot < degree; ++slot) {
+        const int edge = slot * n_radial + cell;
+        value -= radial_weight[edge * nz + z]
+                 * phi[nbr[edge] * nz + z];
+    }
+"""
+
+_EXTRUDED_ELL_Z_SRC = """
+    const int axial = cell * (nz - 1);
+    if (z > 0)
+        value -= axial_weight[axial + z - 1] * phi[i - 1];
+    if (z < nz - 1)
+        value -= axial_weight[axial + z] * phi[i + 1];
+"""
+
+
+def _extruded_ell_stencil(axial: bool):
+    key = ("extruded_ell", axial)
+    if key not in _kernels:
+        import cupy
+
+        params = ("raw T phi, raw T diag, raw int32 nbr, "
+                  "raw T radial_weight, int32 n_radial, int32 nz, "
+                  "int32 degree")
+        source = _EXTRUDED_ELL_SRC
+        if axial:
+            params += ", raw T axial_weight"
+            source += _EXTRUDED_ELL_Z_SRC
+        _kernels[key] = cupy.ElementwiseKernel(
+            params, "T out", source + "    out = value;\n",
+            f"ndgpu_extruded_ell{'_z' if axial else ''}")
+    return _kernels[key]
+
+
+def extruded_ell_apply(xp, phi, diag, nbr, radial_weight, axial_weight,
+                       out=None):
+    """Apply the extruded ELLPACK TPFA stencil in one GPU kernel."""
+    if not use_fused(xp, "stencil"):
+        return None
+    if out is None:
+        out = xp.empty_like(phi)
+    n_radial, nz = phi.shape
+    args = [phi, diag, nbr, radial_weight, np.int32(n_radial), np.int32(nz),
+            np.int32(nbr.shape[0])]
+    if axial_weight is not None:
+        args.append(axial_weight)
+    _extruded_ell_stencil(axial_weight is not None)(*args, out)
+    return out
+
+
+# --------------------------------------------------------------------------
 # Krylov vector kernels
 # --------------------------------------------------------------------------
 # Three reductions and three vector updates per CG iteration; written the

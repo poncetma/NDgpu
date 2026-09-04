@@ -1,0 +1,185 @@
+{
+  "date": "2026-09-04",
+  "problem": {
+    "name": "HPMR 3-D drum-step and linear-ramp diffusion transients",
+    "groups": 11,
+    "global_refine": 8,
+    "local_drum_levels": 3,
+    "effective_drum_refine": 64,
+    "radial_cells": 169674,
+    "drum_angle_degrees": [90.0, 93.88],
+    "dt_seconds": 0.01,
+    "step_tolerance": 1e-7
+  },
+  "method": {
+    "outer": "matrix-free flexible GMRES",
+    "right_preconditioner": "non-overlapping axial domain block Jacobi",
+    "group_preconditioner_degree": 1,
+    "batched_group_halos": true,
+    "inner_group_solve": "local PCG",
+    "inner_rtol": 0.1,
+    "energy_scatter_sweeps": 3,
+    "energy_anderson_depth": 1
+  },
+  "correctness_gates": [
+    {
+      "job": 8783384,
+      "hardware": "Merlin CPU",
+      "ranks": 2,
+      "groups": 2,
+      "final_flux_relative_l2_error": 7.584892335475482e-13,
+      "halo_calls_per_rank": 36,
+      "seconds": 0.07283185597043484,
+      "status": "passed"
+    },
+    {
+      "job": 203493,
+      "hardware": "GH200",
+      "ranks": 2,
+      "groups": 11,
+      "final_flux_relative_l2_error": 3.072908767823535e-8,
+      "maximum_power_error": 3.355514754943556e-8,
+      "maximum_halo_calls_per_rank": 78,
+      "seconds": 1.899322152021341,
+      "status": "passed"
+    }
+  ],
+  "gh200_one_step": [
+    {
+      "jobs": [203496, 203497, 203498],
+      "nz": 10,
+      "unknowns": 18664140,
+      "inner_rtol": 0.001,
+      "energy_anderson_depth": 0,
+      "gpus": [1, 2, 4],
+      "seconds": [12.649565949919634, 15.59535719489213, 16.864917821018025],
+      "outer_applications": [29, 30, 43],
+      "speedup": [1.0, 0.811112355, 0.750057969]
+    },
+    {
+      "jobs": [203539, 203540, 203541],
+      "nz": 20,
+      "unknowns": 37328280,
+      "inner_rtol": 0.1,
+      "energy_anderson_depth": 1,
+      "gpus": [1, 2, 4],
+      "seconds": [12.56181910505984, 8.79379516094923, 8.854730035061948],
+      "outer_applications": [45, 48, 53],
+      "speedup": [1.0, 1.428493507, 1.418656369]
+    }
+  ],
+  "gh200_five_step": {
+    "jobs": [203549, 203550],
+    "nz": 20,
+    "unknowns": 37328280,
+    "gpus": [1, 2],
+    "setup_seconds": [14.337090276065283, 15.518145049922168],
+    "steady_seconds": [36.713778023957275, 51.60995203000493],
+    "transient_seconds": [38.71626710402779, 25.68541005300358],
+    "seconds_per_step": [7.743253420805559, 5.137082010600716],
+    "transient_speedup": [1.0, 1.507325249],
+    "end_to_end_seconds": [89.76713540405235, 92.81350713293068],
+    "estimated_end_to_end_crossover_steps": 7,
+    "step_iterations": [[45, 32, 32, 30, 30], [48, 34, 34, 32, 32]],
+    "final_power": [1.497519952165832, 1.4975198527395381],
+    "final_power_absolute_difference": 9.942629386694656e-8
+  },
+  "gh200_sustained_50_step": {
+    "jobs": [203653, 203654],
+    "nodes": ["gpu002", "gpu001"],
+    "nz": 20,
+    "unknowns": 37328280,
+    "steps": 50,
+    "gpus": [1, 2],
+    "setup_seconds": [14.093587938928977, 15.023601630004123],
+    "steady_seconds": [36.874917262932286, 63.68294411501847],
+    "transient_seconds": [295.536844820017, 210.28579534601886],
+    "seconds_per_step": [5.91073689640034, 4.2057159069203776],
+    "transient_speedup": [1.0, 1.40540565],
+    "end_to_end_seconds": [346.50535002187826, 288.99234109104145],
+    "end_to_end_speedup": [1.0, 1.199012225],
+    "parallel_efficiency": 0.702702825,
+    "final_power": [1.6989096961434709, 1.698909545167798],
+    "final_power_absolute_difference": 1.5097567285238256e-7,
+    "caveat": "The one- and two-GPU jobs ran on different GH200 nodes; use this as a sustained-throughput consistency gate rather than a precision hardware comparison."
+  },
+  "gh200_linear_ramp_10_step": {
+    "jobs": [203657, 203658],
+    "node": "gpu002",
+    "drum_motion": "linear-ramp",
+    "angles_degrees": [90.0, 93.88],
+    "nz": 20,
+    "unknowns": 37328280,
+    "steps": 10,
+    "gpus": [1, 2],
+    "setup_seconds": [10.448410498094745, 12.029674045043066],
+    "steady_seconds": [36.18608881509863, 63.704062554985285],
+    "transient_seconds": [124.17360603692941, 111.2174295799341],
+    "seconds_per_step": [12.417360603692941, 11.12174295799341],
+    "problem_update_calls_per_rank": [10, 10],
+    "maximum_problem_update_seconds": [37.76664047501981, 40.30882508691866],
+    "transient_speedup": [1.0, 1.116494119],
+    "solve_excluding_problem_updates_speedup": [1.0, 1.21856813],
+    "end_to_end_seconds": [170.8081053501228, 186.95116617996246],
+    "end_to_end_speedup": [1.0, 0.913650922],
+    "final_power": [1.4246802497469728, 1.424680136844605],
+    "final_power_absolute_difference": 1.129023678991814e-7
+  },
+  "a100_host_staged_cross_checks": [
+    {
+      "jobs": [203499, 203502, 203503],
+      "nz": 10,
+      "inner_rtol": 0.001,
+      "gpus": [1, 2, 4],
+      "seconds": [29.1057768559549, 17.673133013071492, 39.572671647998504]
+    },
+    {
+      "jobs": [203505, 203506, 203507],
+      "nz": 20,
+      "inner_rtol": 0.001,
+      "gpus": [1, 2, 4],
+      "seconds": [38.93187845405191, 25.78171193203889, 22.940385884954594]
+    },
+    {
+      "jobs": [203536, 203537, 203538],
+      "nz": 10,
+      "inner_rtol": 0.1,
+      "energy_anderson_depth": 1,
+      "gpus": [1, 2, 4],
+      "seconds": [15.82900351996068, 11.508690048009157, 12.309045618050732]
+    },
+    {
+      "jobs": [203542, 203543, 203544],
+      "nz": 20,
+      "steps": 5,
+      "inner_rtol": 0.1,
+      "energy_anderson_depth": 1,
+      "gpus": [1, 2, 4],
+      "transient_seconds": [77.63515268010087, 49.652346587972715, 35.32343251898419],
+      "seconds_per_step": [15.527030536020174, 9.930469317594543, 7.064686503796838],
+      "transient_speedup": [1.0, 1.563574695, 2.197837162],
+      "final_power": [1.4975188514995126, 1.4975171310475455, 1.4975197607716777]
+    }
+  ],
+  "rejected_variants": [
+    {
+      "jobs": [203511, 203521, 203522, 203523],
+      "variant": "one or four fixed polynomial relaxations",
+      "reason": "failed to reach the outer true-residual target in 300 applications"
+    },
+    {
+      "job": 203529,
+      "variant": "four fixed inner PCG iterations",
+      "seconds": 42.04222527903039,
+      "outer_applications": 247,
+      "reason": "converged but slower than tolerance-based local PCG"
+    }
+  ],
+  "current_decision": {
+    "nz10": "Use one GH200.",
+    "nz20_fixed_operator": "Use two GH200s for pure-diffusion transients longer than the approximately seven-step startup crossover; the 50-step gate sustained 1.41x transient and 1.20x end-to-end speedup.",
+    "nz20_continuously_rotating_drums": "Use one GH200 by default. Replicated exact volume-mixing updates reduced two-GPU transient speedup to 1.12x and made the ten-step end-to-end run slower.",
+    "four_gpu": "Do not use four GH200s for the tested production meshes; four provided no additional one-step speedup over two.",
+    "next_bottleneck": "Optimize or tabulate radial exact volume fractions before further MPI preconditioner work."
+  }
+}

@@ -9,17 +9,24 @@ from .analytic import (geometric_buckling_box, k_bare_box, k_bare_box_sp3,
 from .backend import asnumpy, device_name, get_backend
 from .distributed import (CartesianSlabPartition, DistributedContext,
                           DistributedReductions, DistributedResult,
-                          SerialReductions, SpatialPartition, TriRowPartition)
+                          ExtrudedAxialPartition, SerialReductions,
+                          SpatialPartition, TriRowPartition)
 from .distributed_stencil import (DistributedCartesianGroupOperator,
+                                  DistributedExtrudedMeshGroupOperator,
                                   DistributedTriGroupOperator)
 from .distributed_solver import (DistributedDiffusionEigenSolver,
+                                 DistributedExtrudedMeshDiffusionEigenSolver,
                                  DistributedTriDiffusionEigenSolver)
-from .distributed_transient import DistributedTriTransientSolver
+from .distributed_transient import (DistributedExtrudedMeshTransientSolver,
+                                    DistributedTriTransientSolver)
 from .femffusion import read_material_xml, read_xsec
 from .griffin_xs import (read_library as read_griffin_library,
                         read_material as read_griffin_material,
                         volume_homogenize)
 from .grid import Grid
+from .extruded_mesh import (ExtrudedMeshDiffusionEigenSolver,
+                            ExtrudedMeshGrid, ExtrudedMeshGroupOperator,
+                            ExtrudedMeshTransientSolver)
 from .hex import HexDiffusionEigenSolver, HexGrid, offset_to_axial
 from .materials import Kinetics, Material, ONE_GROUP_DEMO, PWR_TWO_GROUP
 from .mesh import (Mesh, MeshResult, UnstructuredDiffusionSolver, assemble_mesh,
@@ -117,6 +124,10 @@ __all__ = [
     "NoiseResult",
     "zero_power_transfer_function",
     "Grid",
+    "ExtrudedMeshGrid",
+    "ExtrudedMeshGroupOperator",
+    "ExtrudedMeshDiffusionEigenSolver",
+    "ExtrudedMeshTransientSolver",
     "HexGrid",
     "offset_to_axial",
     "Material",
@@ -133,14 +144,18 @@ __all__ = [
     "DistributedResult",
     "DistributedDiffusionEigenSolver",
     "DistributedTriDiffusionEigenSolver",
+    "DistributedExtrudedMeshDiffusionEigenSolver",
     "DistributedTriTransientSolver",
+    "DistributedExtrudedMeshTransientSolver",
     "DistributedCartesianGroupOperator",
     "DistributedTriGroupOperator",
+    "DistributedExtrudedMeshGroupOperator",
     "SerialReductions",
     "DistributedReductions",
     "SpatialPartition",
     "CartesianSlabPartition",
     "TriRowPartition",
+    "ExtrudedAxialPartition",
     "geometric_buckling_box",
     "k_bare_box",
     "k_from_buckling",

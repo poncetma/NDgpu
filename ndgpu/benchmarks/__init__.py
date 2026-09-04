@@ -5,9 +5,10 @@ from .c5g7_td import (C5G7TD_CHI_DELAYED, C5G7TD_DECAY, CASES as C5G7TD_CASES,
                       build_c5g7_td)
 from .femffusion_noise import NoiseBenchmark, build_femffusion_1d_noise
 from .hpmr import (HPMR_BE_SITES, HPMR_DRUM_SITES, HPMR_FUEL_SITES,
-                  HPMR_KINETICS, build_hpmr2d, build_hpmr3d,
+                  HPMR_KINETICS, build_hpmr2d, build_hpmr2d_local,
+                  build_hpmr3d, build_hpmr3d_local,
                   hpmr_endfb8_materials, hpmr_placeholder_materials,
-                  hpmr_transport_mask)
+                  hpmr_transport_mask, with_hpmr3d_local_drum_angle)
 from .iaea import build_iaea
 from .langenbuch import LANGENBUCH_KINETICS, build_langenbuch
 from .lra import (LRA_KINETICS, build_lra2d, lra2d_static_keff,
@@ -20,7 +21,10 @@ from .vver440 import VVER_KINETICS, build_vver440
 __all__ = ["K_REFERENCE_2D", "build_anl8a1", "build_biblis", "build_c5g7_2d",
            "build_c5g7_td", "C5G7TD_CASES", "C5G7TD_DECAY", "C5G7TD_CHI_DELAYED",
            "build_hpmr2d",
-           "build_hpmr3d", "hpmr_endfb8_materials", "hpmr_transport_mask",
+           "build_hpmr2d_local",
+           "build_hpmr3d", "build_hpmr3d_local",
+           "with_hpmr3d_local_drum_angle", "hpmr_endfb8_materials",
+           "hpmr_transport_mask",
            "hpmr_placeholder_materials", "HPMR_FUEL_SITES", "HPMR_BE_SITES",
            "HPMR_DRUM_SITES",
            "build_iaea", "build_langenbuch", "build_lra2d",

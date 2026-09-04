@@ -112,6 +112,32 @@ def test_unstructured_matches_tri_on_hpmr_staircase():
         assert k_tri == pytest.approx(k_mesh, abs=1e-6), (angle, k_tri, k_mesh)
 
 
+def test_unstructured_matches_tri_with_polar_volume_mixing():
+    from ndgpu.benchmarks.hpmr import build_hpmr2d, build_hpmr2d_local
+    from ndgpu.tri import TriDiffusionEigenSolver
+
+    for angle in (90.0, 95.0):
+        structured = build_hpmr2d(
+            refine=3, drum_angle_deg=angle, absorber="polar", samples=0)
+        k_tri = TriDiffusionEigenSolver(
+            structured.grid, structured.materials, structured.material_map,
+            active=structured.active, mask_bc=structured.mask_bc,
+            mix_material=structured.mix_material,
+            mix_weight=structured.mix_weight, device="cpu").solve(
+                tol_k=1e-9, tol_source=1e-8).k_eff
+
+        local = build_hpmr2d_local(
+            refine=3, drum_angle_deg=angle, local_refinement=False,
+            absorber="polar", samples=0)
+        k_mesh = UnstructuredDiffusionSolver(
+            local.mesh, local.materials, local.cell_material,
+            local.alpha_boundary, mix_material=local.mix_material,
+            mix_weight=local.mix_weight, device="cpu").solve(
+                tol_k=1e-9, tol_source=1e-8).k_eff
+
+        assert k_mesh == pytest.approx(k_tri, abs=2e-6), (angle, k_tri, k_mesh)
+
+
 def _dense_operator(mesh, cm, mats, alpha):
     """The within-group group-0 operator as an explicit dense matrix, assembled
     straight from the face/boundary lists (an independent reference for the

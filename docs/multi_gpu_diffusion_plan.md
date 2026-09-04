@@ -1,9 +1,22 @@
 # Multi-GPU standalone diffusion development plan
 
-Status: Phase 3 triangular multi-GPU decomposition and fixed-point transient
-extension accepted
+Status: development concluded and branch frozen on 2026-09-04. Phase 7
+extruded local-mesh decomposition and the two-GPU diffusion kernel are
+accepted; the continuously rotating HPMR end-to-end gate rejects multi-GPU as
+the production default.
 
-Date: 2026-08-20
+Date: 2026-09-04
+
+Final disposition:
+
+- Retain the MPI implementation and domain block-Jacobi path as validated
+  research capability.
+- Use one GH200 for continuously rotating, exact-volume-mixed HPMR transients.
+- Two GH200s are useful only for sufficiently long `nz=20` runs that reuse the
+  spatial operator; four are not justified for the tested meshes.
+- No further phases are planned on this branch. If work resumes elsewhere,
+  optimize or tabulate radial absorber fractions before revisiting MPI
+  preconditioning.
 
 Phase 1 acceptance evidence (2026-08-20):
 
@@ -133,15 +146,15 @@ Included in the first production release:
 - Single-node and multi-node NVIDIA GPU execution under Slurm.
 - A host-staging communication fallback for installations without CUDA-aware
   MPI, clearly reported as a fallback rather than silently selected.
-- Fixed-step, fixed-point diffusion transients with global kinetics and
-  time-varying material maps or volume-mixing maps.
-- Extruded triangular-prism transients with radial row decomposition and local
-  axial leakage.
+- Fixed-step fixed-point and matrix-free monolithic diffusion transients with
+  global kinetics and time-varying material maps or volume-mixing maps.
+- Locally refined 2-D meshes tensor-producted with axial layers and decomposed
+  by complete radial planes.
 
 Explicitly deferred:
 
-- Adaptive-BDF and monolithic transient stepping; IQS, thermal feedback,
-  noise, S_N, SP3, SDPN, and hybrid methods.
+- Distributed adaptive BDF; IQS, thermal feedback, noise, S_N, SP3, SDPN, and
+  hybrid methods.
 - Distributed mesh adaptation or dynamic repartitioning.
 - Multi-GPU execution from one Python process.
 - Fault tolerance and checkpoint/restart during an eigenvalue solve.
@@ -858,11 +871,36 @@ when profitable, then evaluate pipelined CG and a coarse preconditioner.
 
 Phase 6 status (2026-09-01): communication timing is instrumented and the
 GH200 stack has passed direct CUDA-buffer traffic. An opt-in
-Chronopoulos-Gear PCG recurrence now packs residual norm, preconditioned norm,
-and operator norm into one collective per iteration. Unit gates assert both
-the solution and the exact `iterations + 2` collective count. The next
-acceptance gate is unchanged transient history with lower wall time on 2 and 4
-GH200s; standard PCG remains the default until that gate passes.
+Chronopoulos-Gear PCG recurrence packs residual norm, preconditioned norm, and
+operator norm into one collective per iteration. Unit gates assert both the
+solution and the exact `iterations + 2` collective count. The production
+transient path now obtains the larger communication reduction from the Phase 7
+domain block-Jacobi preconditioner instead of globally reducing inside each
+inner group solve.
+
+Phase 7 update (2026-09-04): monolithic FGMRES now uses a non-overlapping
+domain block-Jacobi right preconditioner. Inner group PCGs apply only each
+rank's principal axial block; the outer multigroup operator stacks all energy
+groups into one halo exchange. The strict two-GH200 gate passed and reduced
+halo calls from thousands to tens. This repairs communication complexity, but
+r8+3/nz10 strong scaling is still negative at 12.65/15.60/16.86 s on
+one/two/four GH200s. On r8+3/nz20, the accepted inexact block solve reduced a
+five-step transient from 38.72 to 25.69 s on two GH200s (1.51x); four GPUs gave
+no one-step improvement over two. The slower distributed steady solve makes
+the end-to-end crossover approximately seven transient steps. A subsequent
+50-step gate sustained 1.41x transient speedup and 1.20x end-to-end speedup.
+Use one GH200 for `nz=10`, two for long `nz=20` pure-diffusion transients, and
+do not use four for the tested production meshes unless memory capacity
+requires it.
+
+The distinction between a repeated diffusion solve and a full drum trajectory
+is material. Jobs `203657` and `203658` recomputed exact polar volume fractions
+at each of ten linearly ramped drum positions. This replicated host work took
+37.77/40.31 s on one/two ranks, reducing transient speedup to 1.12x; the
+end-to-end run was 170.81 s on one GPU and 186.95 s on two. Continuously
+rotating HPMR cases therefore default to one GH200. If development resumes,
+optimize or tabulate the radial fraction update before repeating this
+end-to-end gate or pursuing another MPI preconditioner.
 
 ### Jacobi-PCG iteration growth
 

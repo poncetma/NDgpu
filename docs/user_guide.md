@@ -18,7 +18,7 @@ integration, see [coupling.md](coupling.md).
 |---|---|---|
 | Hexagonal/prismatic full-core models | `HexLattice.build()` → `TriReactor` | 2-D triangular and extruded 3-D triangular-prism grids |
 | Cartesian models | `Model` | 1-D, 2-D, or 3-D structured grids |
-| General meshes | `MeshModel` | Gmsh or assembled 2-D/3-D finite-volume meshes |
+| Restricted unstructured meshes | `MeshModel` | TPFA-compatible Gmsh 2.2 ASCII or assembled 2-D/3-D meshes; steady diffusion only |
 | Criticality | `steady()` / `run()` | Diffusion; SP1/3/5/7 and SDP1/2/3 on the tri-grid |
 | Importance | `steady(adjoint=True)` | Adjoint k-eigenvalue calculation |
 | Neutron kinetics | `transient()` | Multigroup diffusion with delayed-neutron families |
@@ -43,7 +43,7 @@ intended for SPH-corrected coupled transients.
 |---|---|---|
 | Hexagonal assembly lattice or microreactor | `HexLattice` | The design maps naturally to hex sites and triangular cells |
 | Rectangular benchmark or Cartesian core | `Model` | Regions can be painted as axis-aligned boxes |
-| Existing CAD-derived/Gmsh mesh | `MeshModel` | An unstructured diffusion calculation is required |
+| Controlled unstructured/local-refinement mesh | `MeshModel` | The mesh meets the documented TPFA geometry and importer restrictions |
 | Custom discretization or research method | Solver classes | You need direct access to operators, arrays, or an experimental method |
 
 NDgpu is a homogenized diffusion-family solver, not a general CAD or
@@ -610,7 +610,8 @@ box = (
 print(box.run(method="diffusion", device="auto"))
 ```
 
-For an existing Gmsh model, assign material by physical tag or centroid:
+For a compatible Gmsh 2.2 ASCII model, assign material by retained cell tag or
+centroid:
 
 ```python
 mesh_model = (
@@ -623,8 +624,20 @@ mesh_model = (
 mesh_solution = mesh_model.run(device="auto")
 ```
 
-`MeshModel` currently provides steady diffusion. Use `TriReactor` for the
-complete SPN/SDPN, transient, and coupled workflow.
+`MeshModel` is not a general CAD-mesh interface. Its cell-centred two-point-flux
+operator requires orthogonal or near-orthogonal cell-centre/face geometry. The
+reader supports only first-order triangles/quads or tets/hexes/prisms, discards
+boundary tags, and applies one boundary condition to all exterior faces. Only
+recursive midpoint nonconformity in 2-D is supported; 3-D meshes must conform.
+The intended advanced use is controlled local refinement, such as the HP-MR
+drum bands, rather than arbitrary Gmsh output. Read the complete
+[unstructured mesh scope and limitations](unstructured_mesh_scope.md) and run a
+mesh-convergence comparison before adopting a new mesh family.
+
+`MeshModel` currently provides steady forward diffusion on one CPU process or
+one GPU. Use `TriReactor` for the complete SPN/SDPN, transient, and coupled
+workflow. The developing MPI path targets the structured tri-grid solvers, not
+`MeshModel`.
 
 ## Accuracy and validation checklist
 

@@ -108,6 +108,8 @@ pip install -e .[cuda12]        # + CuPy for CUDA 12.x GPUs
   apply SPH constants, and run steady, transient, and coupled GPU calculations.
 - **[Model API reference](docs/model_api.md)** — builder details, result fields,
   boundaries, control drums, and the validated TWIGL workflow.
+- **[Unstructured mesh scope](docs/unstructured_mesh_scope.md)** — TPFA geometry,
+  Gmsh reader, local-refinement, physics, and validation limitations.
 - **[Coupling guide](docs/coupling.md)** — in-process and external thermal-code
   coupling interfaces and performance considerations.
 - **[Latest GPU Colab](notebooks/colab_coupled_transient_gpu_latest.ipynb)** —
@@ -185,7 +187,7 @@ Two sibling builders reach the other geometry backends with the same report:
 | Builder | Geometry | Examples |
 |---|---|---|
 | `ndgpu.Model` | structured Cartesian (1/2/3-D), diffusion/SPN/SDPN, adjoint | `bare_reactor.py`, `reflected_core.py`, `sdpn_brantley_larsen_2d.py` |
-| `ndgpu.MeshModel` | arbitrary unstructured mesh (Gmsh or assembled), 2/3-D | `unstructured_mesh.py` |
+| `ndgpu.MeshModel` | restricted TPFA-compatible mesh (Gmsh 2.2 ASCII or assembled), 2/3-D steady diffusion | `unstructured_mesh.py`, [scope and limitations](docs/unstructured_mesh_scope.md) |
 | `ndgpu.HexLattice.build()` → `TriReactor` | reusable 2-D/3-D triangular core; diffusion/SPN/SDPN steady solves, transient and thermal coupling | `custom_tri_reactor.py`, `hex_lattice.py` |
 
 ```python

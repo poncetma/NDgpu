@@ -340,8 +340,9 @@ class _PowerIterationSolver:
         # isotropic source must carry the same per-cell metric factor
         # (None on Cartesian grids -- the source is used as-is).
         self._src_weight = getattr(self.ops[0], "rhs_weight", None)
-        self.preconds = [neumann_preconditioner(op.apply, op.inv_diag,
-                                                int(precond_degree))
+        self.preconds = [neumann_preconditioner(
+            getattr(op, "preconditioner_apply", op.apply), op.inv_diag,
+            int(precond_degree))
                          for op in self.ops]
 
     # ---- hooks implemented by the angular approximation -------------------

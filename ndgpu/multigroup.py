@@ -131,6 +131,38 @@ class MultigroupStepOperator:
             source = source + self.nu_sigma_f[g] * value[g]
         return source / self.k_eff
 
+    def _apply_group_loss(self, value, out):
+        """Apply all within-group operators, batching compatible halos."""
+        first = self.operators[0]
+        context = getattr(first, "context", None)
+        partition = getattr(first, "partition", None)
+        batchable = (
+            context is not None and partition is not None
+            and all(getattr(op, "context", None) is context
+                    and getattr(op, "partition", None) == partition
+                    and hasattr(op, "apply_local")
+                    and hasattr(op, "finish_halo_apply")
+                    for op in self.operators))
+        if not batchable:
+            for g, op in enumerate(self.operators):
+                op.apply(value[g], out=out[g])
+            return out
+
+        def apply_owned():
+            for g, op in enumerate(self.operators):
+                op.apply_local(value[g], out=out[g])
+            return out
+
+        (lower, upper), out = context.exchange_halos_while(
+            value, partition, apply_owned,
+            tag=int(getattr(first, "communication_tag", 0)) + 2)
+        for g, op in enumerate(self.operators):
+            op.finish_halo_apply(
+                value[g], out[g],
+                lower_phi=None if lower is None else lower[g],
+                upper_phi=None if upper is None else upper[g])
+        return out
+
     def apply(self, value, out=None):
         """Return the coupled block product, optionally writing into ``out``."""
         self._check_state(value)
@@ -139,9 +171,9 @@ class MultigroupStepOperator:
         else:
             self._check_state(out)
         fission = self.fission_source(value)
+        self._apply_group_loss(value, out)
         if self._group_batch is not None:
-            for g, op in enumerate(self.operators):
-                op.apply(value[g], out=out[g])
+            for g in range(self.groups):
                 kernels.product_accumulate(
                     self.xp, out[g], self._emission_rows[g], fission, -1.0)
                 if self.rhs_weight is None:
@@ -156,8 +188,7 @@ class MultigroupStepOperator:
                     kernels.product_accumulate(
                         self.xp, out[g], self.rhs_weight, scatter, -1.0)
             return out
-        for g, op in enumerate(self.operators):
-            op.apply(value[g], out=out[g])
+        for g in range(self.groups):
             coupled = self.emission_weights[g] * fission
             for gf in range(self.groups):
                 scatter = self.sigma_s[gf][g]
@@ -428,6 +459,13 @@ class EnergyGroupGaussSeidelPreconditioner:
     leaving it off lets outer FGMRES resolve fission globally and is usually
     safer near the critical pole.
 
+    For distributed operators each group solve uses the rank-local principal
+    block, including interface contributions on the diagonal but omitting
+    off-rank unknowns.  This is a non-overlapping domain block-Jacobi (additive
+    Schwarz) right preconditioner: its inner PCGs require no communication,
+    while outer FGMRES applies the globally coupled operator and repairs the
+    subdomain-interface error.
+
     The group PCG tolerance is deliberately inexact.  FGMRES stores each
     resulting correction separately, so changing inner iteration counts do not
     violate its Krylov recurrence.
@@ -480,9 +518,12 @@ class EnergyGroupGaussSeidelPreconditioner:
         if (not np.isfinite(self.relaxation)
                 or not 0.0 < self.relaxation < 2.0):
             raise ValueError("energy-sweep relaxation must lie between 0 and 2")
-        self.group_preconditioners = tuple(neumann_preconditioner(
-            op.apply, op.inv_diag, int(precond_degree))
+        self.group_applies = tuple(
+            getattr(op, "preconditioner_apply", op.apply)
             for op in block.operators)
+        self.group_preconditioners = tuple(neumann_preconditioner(
+            apply, op.inv_diag, int(precond_degree))
+            for apply, op in zip(self.group_applies, block.operators))
         templates = [self.xp.zeros(block.cell_shape,
                                    dtype=block.operators[0].inv_diag.dtype)
                      for _ in range(block.groups)]
@@ -526,6 +567,7 @@ class EnergyGroupGaussSeidelPreconditioner:
                            if reverse else range(self.block.groups))
             for g in group_order:
                 op = self.block.operators[g]
+                apply_inner = self.group_applies[g]
                 q = residual[g].copy()
                 if self.block._group_batch is not None:
                     if self.block.rhs_weight is None:
@@ -555,7 +597,7 @@ class EnergyGroupGaussSeidelPreconditioner:
                 if self.inner_fixed_relaxations:
                     work = self.workspaces[g]
                     for _ in range(self.inner_fixed_relaxations):
-                        op.apply(z[g], out=work.ap)
+                        apply_inner(z[g], out=work.ap)
                         self.xp.subtract(q, work.ap, out=work.r)
                         self.group_preconditioners[g](
                             work.r, out=work.z, scratch=work.ap)
@@ -564,13 +606,13 @@ class EnergyGroupGaussSeidelPreconditioner:
                     iterations = self.inner_fixed_relaxations
                 elif self.inner_fixed_iterations:
                     solved, iterations = fixed_pcg(
-                        op.apply, q, z[g], op.inv_diag, self.xp,
+                        apply_inner, q, z[g], op.inv_diag, self.xp,
                         iterations=self.inner_fixed_iterations,
                         precond=self.group_preconditioners[g],
                         workspace=self.workspaces[g])
                 else:
                     solved, iterations = pcg(
-                        op.apply, q, z[g], op.inv_diag, self.xp,
+                        apply_inner, q, z[g], op.inv_diag, self.xp,
                         rtol=self.inner_rtols[g], atol=self.inner_atol,
                         maxiter=self.inner_maxiter,
                         precond=self.group_preconditioners[g],

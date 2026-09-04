@@ -377,10 +377,12 @@ def hpmr_drum_worth(angle_from, angles, *, refine: int = 4, nz: int = 0,
     written in degrees is not a fixed reactivity.
 
     **DIFFERENTIAL worth needs a converged mesh -- more than k_eff does.**
-    Measured for 90 -> 95 deg on the 2-group set:
+    The old globally refined ladder remains non-monotonic even after exact
+    per-drum area conservation (16 equal-area subcells, 90 -> 95 deg,
+    2-group set):
 
         refine    2      3      4      6      8
-        pcm    +66.9 +204.7  +88.4 +137.4  +96.9
+        pcm    +42.4 +169.5  +52.0 +141.9 +100.4
 
     while the absolute k over the same meshes climbs smoothly (1.014214 ->
     1.017409). Each k is converging; their *difference* is not, because the two
@@ -391,9 +393,13 @@ def hpmr_drum_worth(angle_from, angles, *, refine: int = 4, nz: int = 0,
     absorber thinner than a cell.
 
     So treat values from a coarse mesh as internally consistent -- fine for
-    driving a transient, or for checking kinetics against theory, where the same
-    number appears on both sides -- but do not quote them as the reactor's drum
-    worth without a mesh-convergence study.
+    checking kinetics against theory, where the same number appears on both
+    sides -- but do not quote them as the reactor's drum worth or use them to
+    choose a realistic transient insertion. The accepted 11-group study uses
+    ``build_hpmr2d_local(refine=8, drum_refine_levels=3, samples=0)`` for the
+    working mesh and ``refine=16, drum_refine_levels=2`` for verification. Both
+    give effective-r64 resolution in the drum band; see
+    ``docs/hpmr_drum_refinement.md``.
     """
     from ..tri import TriDiffusionEigenSolver
     from .hpmr import build_hpmr2d, build_hpmr3d

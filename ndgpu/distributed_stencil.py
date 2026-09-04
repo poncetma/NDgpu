@@ -5,7 +5,8 @@ from __future__ import annotations
 import math
 
 from .distributed import (CartesianSlabPartition, DistributedContext,
-                          TriRowPartition)
+                          ExtrudedAxialPartition, TriRowPartition)
+from .extruded_mesh import ExtrudedMeshGrid, ExtrudedMeshGroupOperator
 from .grid import Grid
 from .stencil import (BC_REFLECTIVE, BC_VACUUM, GroupOperator, face_alpha,
                       harmonic_mean, normalize_bc, robin_face_term)
@@ -142,6 +143,18 @@ class DistributedCartesianGroupOperator:
             local_out -= self._upper_coupling * upper_phi
         return out
 
+    def preconditioner_apply(self, phi, out=None):
+        """Apply the communication-free principal diagonal block."""
+        out = self.local_operator.apply(phi, out=out)
+        axis = self.partition.axis
+        if self._lower_diagonal is not None:
+            _plane(out, axis, 0)[...] += (
+                self._lower_diagonal * _plane(phi, axis, 0))
+        if self._upper_diagonal is not None:
+            _plane(out, axis, -1)[...] += (
+                self._upper_diagonal * _plane(phi, axis, -1))
+        return out
+
 
 def _tri_component(value, row, orientation):
     sl = [slice(None)] * value.ndim
@@ -267,3 +280,107 @@ class DistributedTriGroupOperator:
             local_out += self._upper_diagonal * local_flux
             local_out -= self._upper_coupling * remote_flux
         return out
+
+    def preconditioner_apply(self, phi, out=None):
+        """Apply the communication-free principal diagonal block."""
+        out = self.local_operator.apply(phi, out=out)
+        if self._lower_diagonal is not None:
+            local_out = _tri_component(out, 0, 0)
+            local_flux = _tri_component(phi, 0, 0)
+            local_out += self._lower_diagonal * local_flux
+        if self._upper_diagonal is not None:
+            local_out = _tri_component(out, -1, 1)
+            local_flux = _tri_component(phi, -1, 1)
+            local_out += self._upper_diagonal * local_flux
+        return out
+
+
+class DistributedExtrudedMeshGroupOperator:
+    """Extruded-mesh TPFA operator over MPI-owned axial layers."""
+
+    supports_out = True
+
+    def __init__(self, xp, grid, D, removal, partition, context, *,
+                 bc=BC_VACUUM, active=None, mask_bc=BC_VACUUM,
+                 communication_tag=1300):
+        if not isinstance(grid, ExtrudedMeshGrid):
+            raise TypeError("grid must be an ExtrudedMeshGrid")
+        if not isinstance(partition, ExtrudedAxialPartition):
+            raise TypeError("partition must be an ExtrudedAxialPartition")
+        if not isinstance(context, DistributedContext):
+            raise TypeError("context must be a DistributedContext")
+        if grid.shape != partition.global_shape:
+            raise ValueError("grid shape does not match the global partition")
+        if tuple(D.shape) != partition.local_shape:
+            raise ValueError(f"local D shape {D.shape} != {partition.local_shape}")
+        if tuple(removal.shape) != partition.local_shape:
+            raise ValueError(
+                f"local removal shape {removal.shape} != {partition.local_shape}")
+        if context.xp is not xp:
+            raise ValueError("operator backend does not match distributed context")
+
+        self.xp = xp
+        self.shape = partition.local_shape
+        self.partition = partition
+        self.context = context
+        self.communication_tag = int(communication_tag)
+
+        local_nz = partition.stop - partition.start
+        local_grid = ExtrudedMeshGrid(
+            grid.mesh, height=grid.dz * local_nz, nz=local_nz)
+        interfaces = (
+            partition.lower_rank is not None,
+            partition.upper_rank is not None)
+        self.local_operator = ExtrudedMeshGroupOperator(
+            xp, local_grid, D, removal, bc=bc, active=active,
+            mask_bc=mask_bc, partition_interfaces=interfaces)
+        self.rhs_weight = self.local_operator.rhs_weight
+
+        lower_D, upper_D = context.exchange_halos(
+            D, partition, tag=self.communication_tag)
+        area = xp.asarray(grid.mesh.area, dtype=D.dtype)
+        self._lower_coupling = (
+            None if lower_D is None else
+            harmonic_mean(D[:, 0], lower_D) * area / grid.dz)
+        self._upper_coupling = (
+            None if upper_D is None else
+            harmonic_mean(D[:, -1], upper_D) * area / grid.dz)
+
+        self.diag = xp.array(self.local_operator.diag, copy=True)
+        if self._lower_coupling is not None:
+            self.diag[:, 0] += self._lower_coupling
+        if self._upper_coupling is not None:
+            self.diag[:, -1] += self._upper_coupling
+        self.inv_diag = 1.0 / self.diag
+
+    def apply(self, phi, out=None):
+        if tuple(phi.shape) != self.shape:
+            raise ValueError(f"local flux shape {phi.shape} != {self.shape}")
+        (lower_phi, upper_phi), out = self.context.exchange_halos_while(
+            phi, self.partition,
+            lambda: self.apply_local(phi, out=out),
+            tag=self.communication_tag + 2)
+        return self.finish_halo_apply(
+            phi, out, lower_phi=lower_phi, upper_phi=upper_phi)
+
+    def apply_local(self, phi, out=None):
+        """Apply the owned principal block without exchanging halos."""
+        out = self.local_operator.apply(phi, out=out)
+        if self._lower_coupling is not None:
+            out[:, 0] += self._lower_coupling * phi[:, 0]
+        if self._upper_coupling is not None:
+            out[:, -1] += self._upper_coupling * phi[:, -1]
+        return out
+
+    def finish_halo_apply(self, phi, out, *, lower_phi, upper_phi):
+        """Add off-rank couplings to an owned principal-block product."""
+        del phi
+        if self._lower_coupling is not None:
+            out[:, 0] -= self._lower_coupling * lower_phi
+        if self._upper_coupling is not None:
+            out[:, -1] -= self._upper_coupling * upper_phi
+        return out
+
+    def preconditioner_apply(self, phi, out=None):
+        """Apply the communication-free principal diagonal block."""
+        return self.apply_local(phi, out=out)
